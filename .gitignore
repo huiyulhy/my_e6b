@@ -1,0 +1,21 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+
+# Source data for the build scripts, not the build output. The raw FAA NASR
+# cycle is ~1 GB and is reissued every 28 days; `data/aero/airports.sqlite`
+# is the 3 MB artefact built from it and *is* committed, since that is what
+# the app ships with offline.
+.cache/
+data/nasr/

@@ -1,0 +1,676 @@
+"""FastAPI development server.
+
+**This is a dev convenience and is never shipped.** It exists so the browser
+UI can reach the engine over HTTP while developing on a Linux desktop. In the
+packaged PWA the same `ui/` files call the same engine functions through
+Pyodide, with no server involved.
+
+That is why the API surface here is kept deliberately narrow and thin: every
+endpoint is a direct translation of an engine call, with no logic of its own.
+Anything that starts to look like a decision belongs in `engine/`, or the two
+run modes will drift apart. See docs/ARCHITECTURE.md section 2.
+"""
+
+from __future__ import annotations
+
+from datetime import date
+from pathlib import Path
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+
+from engine import airports as apt
+from engine import atmosphere as atm
+from engine import consistency as consistency_checks
+from engine import currency as cur
+from engine import magnetic as mag
+from engine import navlog as nl
+from engine import preflight as pf
+from engine import weight_balance as wb
+from engine.geo import LatLon
+from engine.magnetic import AtGeographicPole, OutsideModelValidity
+
+ROOT = Path(__file__).resolve().parent.parent
+UI_DIR = ROOT / "ui"
+DATA_DIR = ROOT / "data"
+
+app = FastAPI(title="my_e6b", description="Offline VFR cross-country planner")
+
+
+# --- request and response models -----------------------------------------
+
+
+class WaypointIn(BaseModel):
+    name: str
+    lat: float
+    lon: float
+    kind: str = "waypoint"
+    elevation_ft: float | None = None
+    # An intermediate airport the flight lands at rather than overflies.
+    is_landing: bool = False
+    # Identifier to look runways up by, for the go/no-go check. Sent
+    # separately from `name` because a waypoint may have been renamed.
+    ident: str | None = None
+    # Cross this waypoint at this altitude instead of the cruise altitude,
+    # typically to stay clear of airspace. Null means no constraint, and in
+    # user-driven mode lets the altitude be computed from performance.
+    altitude_ft: float | None = None
+    # What the leg *arriving* here does: climb | cruise | descent | automatic.
+    # Required to be concrete in user-driven mode; "automatic" asks the planner.
+    segment_type: str = "automatic"
+    # True for a TOC/TOD the planner inserted. Sent back so a later request can
+    # be told which points to discard before re-planning.
+    generated: bool = False
+    # Field weather at an airport, which sets the density altitude the
+    # takeoff and landing distances are read at. Null falls back to the
+    # route-wide altimeter setting and ISA deviation.
+    altimeter_inhg: float | None = None
+    oat_c: float | None = None
+
+
+class LegOverrideIn(BaseModel):
+    """A manually entered value for one navlog row."""
+
+    row: int  # index into the returned legs
+    wind_from_deg: float | None = None
+    wind_speed_kt: float | None = None
+    tas_kt: float | None = None
+    # Level rows at or above 3000 ft pressure altitude only; see
+    # navlog.LegOverride. Anything else comes back as ok:false with a reason.
+    cruise_rpm: float | None = None
+    # The altitude this leg ends at. Carries forward to every row after it.
+    altitude_ft: float | None = None
+    # Temperature at this row's altitude, off an FD forecast. Unlike the rest
+    # it describes the air rather than the row, so it also lapses into the
+    # rows around it; see navlog.LegOverride.
+    oat_c: float | None = None
+    # The pressure altitude this row's air is read at, replacing what the
+    # route-wide altimeter setting implies. Density altitude follows from it
+    # and the row's temperature; so do the charts the row reads. Stops at this
+    # row, and cannot move a climb's published time and fuel -- a climb row
+    # carrying one comes back with a warning saying so.
+    pressure_altitude_ft: float | None = None
+
+
+class PlanRequest(BaseModel):
+    waypoints: list[WaypointIn]
+    # "manual" -- the default -- takes the profile from each waypoint's
+    # segment_type; "auto" lets the planner place TOC/TOD against
+    # cruise_altitude_ft instead.
+    planning_mode: str = "manual"
+    cruise_altitude_ft: float = 6500
+    cruise_rpm: float = 2400
+    weight_lb: float = 2550
+    fuel_on_board_gal: float = 50
+    altimeter_inhg: float = 29.92
+    isa_deviation_c: float = 0.0
+    night: bool = False
+    flight_date: date | None = None
+    overrides: list[LegOverrideIn] = Field(default_factory=list)
+    # Fractions: 0.20 means "require 20% more than the book distance".
+    runway_margin: float = pf.DEFAULT_RUNWAY_MARGIN
+    fuel_margin: float = pf.DEFAULT_FUEL_MARGIN
+
+
+class StationIn(BaseModel):
+    """One row of the loading form. Pounds and inches aft of the datum."""
+
+    name: str = ""
+    weight_lb: float
+    arm_in: float
+
+
+class WeightBalanceRequest(BaseModel):
+    stations: list[StationIn]
+
+
+# --- airport lookup ------------------------------------------------------
+
+
+def _airport_json(airport: apt.Airport) -> dict:
+    return {
+        "ident": airport.ident,
+        "name": airport.name,
+        "kind": airport.kind,
+        "lat": airport.position.lat,
+        "lon": airport.position.lon,
+        "elevation_ft": airport.elevation_ft,
+        "municipality": airport.municipality,
+        "region": airport.region,
+        "longest_runway_ft": airport.longest_runway_ft,
+        "label": airport.label,
+    }
+
+
+def _vfr_waypoint_json(waypoint: apt.VfrWaypoint) -> dict:
+    """Shaped like an airport so the UI can treat search results uniformly.
+
+    `elevation_ft` is deliberately null rather than zero: a VFR waypoint has
+    no elevation, and a route cannot depart from or land at one. The navlog
+    refuses a route whose endpoints lack elevation, which is the correct
+    behaviour and depends on this staying null.
+    """
+    return {
+        "ident": waypoint.ident,
+        "name": "VFR checkpoint",
+        "kind": "vfr_waypoint",
+        "lat": waypoint.position.lat,
+        "lon": waypoint.position.lon,
+        "elevation_ft": None,
+        "municipality": None,
+        "region": f"US-{waypoint.state}" if waypoint.state else None,
+        "longest_runway_ft": None,
+        "label": waypoint.label,
+    }
+
+
+@app.get("/api/vfr-waypoints/bbox")
+def vfr_waypoints_in_view(
+    south: float, west: float, north: float, east: float, limit: int = 400
+) -> list[dict]:
+    """VFR waypoints in the visible map area."""
+    return [
+        _vfr_waypoint_json(w)
+        for w in apt.vfr_waypoints_in_bounding_box(
+            south, west, north, east, limit=limit
+        )
+    ]
+
+
+@app.get("/api/airports/search")
+def search_airports(q: str, limit: int = 15) -> list[dict]:
+    """Search airports and published VFR waypoints together.
+
+    One box rather than two, because a pilot picking the next point on a route
+    does not first decide which kind of thing it is. Airports rank above
+    waypoints on an equal match, since they are what a route usually starts
+    and ends with.
+    """
+    airports = [_airport_json(a) for a in apt.search(q, limit=limit)]
+    waypoints = [
+        _vfr_waypoint_json(w)
+        for w in apt.search_vfr_waypoints(q, limit=max(2, limit // 3))
+    ]
+    return (airports + waypoints)[:limit]
+
+
+@app.get("/api/airports/bbox")
+def airports_in_view(
+    south: float,
+    west: float,
+    north: float,
+    east: float,
+    limit: int = 1500,
+    min_runway_ft: float | None = None,
+) -> list[dict]:
+    """Airports in the visible map area.
+
+    `min_runway_ft` lets the UI thin the display when zoomed out, where
+    fifteen thousand markers would be unreadable anyway.
+    """
+    return [
+        _airport_json(a)
+        for a in apt.in_bounding_box(
+            south, west, north, east, limit=limit, min_runway_ft=min_runway_ft
+        )
+    ]
+
+
+@app.get("/api/airports/{ident}")
+def get_airport(ident: str) -> dict:
+    airport = apt.find(ident)
+    if airport is None:
+        raise HTTPException(404, f"no airport with identifier {ident!r}")
+    return _airport_json(airport)
+
+
+# --- planning ------------------------------------------------------------
+
+
+def _waypoint_json(waypoint: nl.Waypoint, conditions: nl.Conditions) -> dict:
+    """One resolved waypoint, in the shape the UI sends waypoints back in.
+
+    Plus the air at it. The `field_*` keys are derived, never sent back: they
+    are what the elevation and altimeter setting on this waypoint work out to,
+    shown beside the boxes they came from so that typing a setting has a
+    visible consequence instead of disappearing into the plan. Null where the
+    waypoint has no elevation to read them at.
+    """
+    air = nl.field_weather(waypoint, conditions)
+    return {
+        "name": waypoint.name,
+        "lat": waypoint.position.lat,
+        "lon": waypoint.position.lon,
+        "kind": waypoint.kind,
+        "elevation_ft": waypoint.elevation_ft,
+        "is_landing": waypoint.is_landing,
+        "altitude_ft": waypoint.altitude_ft,
+        "segment_type": waypoint.segment_type,
+        "generated": waypoint.generated,
+        "altimeter_inhg": waypoint.altimeter_inhg,
+        "oat_c": waypoint.oat_c,
+        # The setting and temperature actually used, which is the waypoint's
+        # own where it has one and the route's where it does not.
+        "field_altimeter_inhg": None if air is None else air.altimeter_inhg,
+        "field_oat_c": None if air is None else air.oat_c,
+        "field_pressure_altitude_ft": (
+            None if air is None else air.pressure_altitude_ft
+        ),
+        "field_density_altitude_ft": (
+            None if air is None else air.density_altitude_ft
+        ),
+    }
+
+
+def _build_from_request(request: PlanRequest):
+    """Turn a request into the engine objects a plan is built from.
+
+    Shared by `/api/plan` and `/api/consistency` so the two can never disagree
+    about what the plan being described actually is.
+    """
+    waypoints = [
+        nl.Waypoint(
+            name=w.name,
+            position=LatLon(w.lat, w.lon),
+            kind=w.kind,
+            elevation_ft=w.elevation_ft,
+            is_landing=w.is_landing,
+            altitude_ft=w.altitude_ft,
+            segment_type=w.segment_type,
+            generated=w.generated,
+            altimeter_inhg=w.altimeter_inhg,
+            oat_c=w.oat_c,
+            runways=_runways_for(w),
+        )
+        for w in request.waypoints
+    ]
+    # No route-wide winds or temperatures aloft: an FD level is one number for
+    # a quarter of a state, and the wind on the coast is not the wind over the
+    # valley. Wind is entered per navlog row instead, where it belongs to the
+    # leg it was forecast for, and temperature comes from the fields plus any
+    # row the pilot typed one on. Calm here is what a row with no wind on it
+    # means, not a claim about the day.
+    conditions = nl.Conditions(
+        altimeter_inhg=request.altimeter_inhg,
+        isa_deviation_c=request.isa_deviation_c,
+        flight_date=request.flight_date,
+        night=request.night,
+    )
+    aircraft = nl.Aircraft(
+        weight_lb=request.weight_lb,
+        cruise_rpm=request.cruise_rpm,
+        fuel_on_board_gal=request.fuel_on_board_gal,
+    )
+    overrides = {
+        o.row: nl.LegOverride(
+            wind_from_deg=o.wind_from_deg,
+            wind_speed_kt=o.wind_speed_kt,
+            tas_kt=o.tas_kt,
+            cruise_rpm=o.cruise_rpm,
+            altitude_ft=o.altitude_ft,
+            oat_c=o.oat_c,
+            pressure_altitude_ft=o.pressure_altitude_ft,
+        )
+        for o in request.overrides
+    }
+    margins = pf.Margins(runway=request.runway_margin, fuel=request.fuel_margin)
+    log = nl.build_navlog(
+        waypoints,
+        request.cruise_altitude_ft,
+        aircraft,
+        conditions,
+        overrides=overrides,
+        margins=margins,
+        planning_mode=request.planning_mode,
+    )
+    return log, aircraft, conditions
+
+
+@app.post("/api/consistency")
+def consistency(request: PlanRequest) -> dict:
+    """Check a finished navlog for internal contradictions.
+
+    Its own endpoint rather than part of `/api/plan`, which runs on every
+    keystroke: this is a deliberate act by the pilot, and reads as one.
+    """
+    if len(request.waypoints) < 2:
+        return {"ok": False, "error": "Add a departure and a destination."}
+    try:
+        log, aircraft, conditions = _build_from_request(request)
+    except (nl.RouteError, OutsideModelValidity) as exc:
+        return {"ok": False, "error": str(exc)}
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+
+    report = consistency_checks.check_navlog_consistency(
+        log, aircraft=aircraft, conditions=conditions
+    )
+    return {
+        "ok": True,
+        "is_consistent": report.is_consistent,
+        "findings": [
+            {
+                "severity": f.severity,
+                "code": f.code,
+                "message": f.message,
+                "row": f.row,
+            }
+            for f in report.findings
+        ],
+        "text": consistency_checks.format_report(report),
+    }
+
+
+@app.post("/api/plan")
+def plan(request: PlanRequest) -> dict:
+    """Build a navigation log for a route.
+
+    Engine errors are returned as a structured payload rather than an HTTP
+    error, so the UI can show "cruise altitude is below the destination"
+    beside the form instead of a stack trace. Only genuinely unexpected
+    failures become 500s.
+    """
+    if len(request.waypoints) < 2:
+        return {"ok": False, "error": "Add a departure and a destination."}
+
+    try:
+        log, _aircraft, conditions = _build_from_request(request)
+    except (nl.RouteError, OutsideModelValidity) as exc:
+        return {"ok": False, "error": str(exc)}
+    except ValueError as exc:
+        # Includes OutsidePOHEnvelope and AboveModelCeiling -- a refusal to
+        # invent numbers is a real answer, so it reads as one.
+        return {"ok": False, "error": str(exc)}
+
+    return {
+        "ok": True,
+        "legs": [
+            {
+                "from": leg.from_name,
+                "to": leg.to_name,
+                "phase": leg.phase,
+                # False for the taxi and traffic-pattern rows, which burn time
+                # and fuel at one point and have no course or heading to show.
+                "covers_ground": leg.covers_ground,
+                "altitude_ft": leg.altitude_ft,
+                "from_lat": leg.from_position.lat,
+                "from_lon": leg.from_position.lon,
+                "to_lat": leg.to_position.lat,
+                "to_lon": leg.to_position.lon,
+                "true_course_deg": leg.true_course_deg,
+                "variation_deg": leg.variation_deg,
+                "magnetic_course_deg": leg.magnetic_course_deg,
+                "wind_correction_angle_deg": leg.wind_correction_angle_deg,
+                "true_heading_deg": leg.true_heading_deg,
+                "magnetic_heading_deg": leg.magnetic_heading_deg,
+                "wind_from_deg": leg.wind_from_deg,
+                "wind_speed_kt": leg.wind_speed_kt,
+                "headwind_kt": leg.headwind_kt,
+                "tas_kt": leg.tas_kt,
+                "ground_speed_kt": leg.ground_speed_kt,
+                "distance_nm": leg.distance_nm,
+                "cumulative_distance_nm": leg.cumulative_distance_nm,
+                "ete_min": leg.ete_min,
+                "cumulative_ete_min": leg.cumulative_ete_min,
+                "fuel_gal": leg.fuel_gal,
+                "fuel_remaining_gal": leg.fuel_remaining_gal,
+                "overridden": list(leg.overridden),
+                "cruise_rpm": leg.cruise_rpm,
+                "flight_index": leg.flight_index,
+                "segment_type": leg.segment_type,
+                "entry_altitude_ft": leg.entry_altitude_ft,
+                "exit_altitude_ft": leg.exit_altitude_ft,
+                # The air this row was flown through, at its altitude. Every
+                # performance figure on the row was read at this density
+                # altitude.
+                "oat_c": leg.oat_c,
+                "pressure_altitude_ft": leg.pressure_altitude_ft,
+                "density_altitude_ft": leg.density_altitude_ft,
+                # "TOC" / "TOD" beside the name, never replacing it.
+                "start_role": leg.start_role,
+                "end_role": leg.end_role,
+            }
+            for leg in log.legs
+        ],
+        "checklist": _checklist_json(log.checklist),
+        # The route the rows were built from. In automatic mode this has the
+        # TOC/TOD the planner inserted, so the UI can show them in the waypoint
+        # list and let the pilot take them over.
+        "planning_mode": log.planning_mode,
+        # Read off the log's own conditions, not the request's: the
+        # temperature profile is folded in while the log is built, so this is
+        # the only object that knows what the air was actually taken to be.
+        "resolved_waypoints": [
+            _waypoint_json(w, log.conditions or conditions)
+            for w in log.resolved_waypoints
+        ],
+        "totals": {
+            "distance_nm": log.total_distance_nm,
+            "time_min": log.total_time_min,
+            "fuel_gal": log.total_fuel_gal,
+            "fuel_remaining_gal": log.fuel_remaining_gal,
+            "reserve_required_gal": log.reserve_required_gal,
+            "legal_on_fuel": log.is_legal_on_fuel,
+        },
+        "warnings": list(log.warnings),
+        "text": nl.format_navlog(log),
+    }
+
+
+def _runways_for(waypoint: WaypointIn) -> tuple[pf.Runway, ...]:
+    """Runways for a waypoint, if it is an airport we know about."""
+    ident = waypoint.ident or waypoint.name
+    if waypoint.kind != "airport":
+        return ()
+    try:
+        return tuple(apt.runways(ident))
+    except apt.AirportDatabaseMissing:
+        return ()
+
+
+def _checklist_json(checklist: pf.GoNoGo | None) -> dict | None:
+    if checklist is None:
+        return None
+    return {
+        "is_go": checklist.is_go,
+        "blockers": list(checklist.blockers),
+        "unknowns": list(checklist.unknowns),
+        "airports": [
+            {
+                "airport": check.airport,
+                "operation": check.operation,
+                "elevation_ft": check.elevation_ft,
+                "pressure_altitude_ft": check.pressure_altitude_ft,
+                "density_altitude_ft": check.density_altitude_ft,
+                "oat_c": check.oat_c,
+                "weight_lb": check.weight_lb,
+                "margin": check.margin,
+                "passes": check.passes,
+                "runways": [
+                    {
+                        "runway": runway.runway,
+                        "surface": runway.surface,
+                        "dry_grass_applied": runway.dry_grass_applied,
+                        "runway_available_ft": runway.runway_available_ft,
+                        "ground_roll_ft": runway.ground_roll_ft,
+                        "over_50ft_ft": runway.over_50ft_ft,
+                        "required_ft": runway.required_ft,
+                        "spare_ft": runway.spare_ft,
+                        "passes": runway.passes,
+                        "outside_envelope": runway.outside_envelope,
+                        "note": runway.note,
+                    }
+                    for runway in check.runways
+                ],
+            }
+            for check in checklist.airports
+        ],
+        "fuel": {
+            "fuel_on_board_gal": checklist.fuel.fuel_on_board_gal,
+            "burn_gal": checklist.fuel.burn_gal,
+            "landing_with_gal": checklist.fuel.landing_with_gal,
+            "reserve_minutes": checklist.fuel.reserve_minutes,
+            "reserve_required_gal": checklist.fuel.reserve_required_gal,
+            "required_with_margin_gal": checklist.fuel.required_with_margin_gal,
+            "margin": checklist.fuel.margin,
+            "night": checklist.fuel.night,
+            "spare_gal": checklist.fuel.spare_gal,
+            "spare_minutes": checklist.fuel.spare_minutes,
+            "passes": checklist.fuel.passes,
+        },
+    }
+
+
+# --- E6B -----------------------------------------------------------------
+#
+# The two standalone calculators in the right-hand bar. They take typed
+# numbers rather than the route, so they are GETs with no request model, and
+# like everything else here each is a direct translation of an engine call.
+
+
+@app.get("/api/e6b/density-altitude")
+def e6b_density_altitude(
+    elevation_ft: float, oat_c: float, altimeter_inhg: float
+) -> dict:
+    """Pressure and density altitude for a field elevation, OAT and setting.
+
+    The rules of thumb come back beside the real figures: a pilot checking
+    this against the arithmetic in their head should see both.
+    """
+    try:
+        pa = atm.pressure_altitude(elevation_ft, altimeter_inhg)
+        da = atm.density_altitude(pa, oat_c)
+        approx_pa = atm.pressure_altitude_approx(elevation_ft, altimeter_inhg)
+        approx_da = atm.density_altitude_approx(pa, oat_c)
+        isa_dev = atm.isa_deviation_c(pa, oat_c)
+    except ValueError as exc:  # AboveModelCeiling and friends
+        return {"ok": False, "error": str(exc)}
+    return {
+        "ok": True,
+        "pressure_altitude_ft": pa,
+        "density_altitude_ft": da,
+        "pressure_altitude_approx_ft": approx_pa,
+        "density_altitude_approx_ft": approx_da,
+        "isa_deviation_c": isa_dev,
+    }
+
+
+@app.get("/api/e6b/variation")
+def e6b_variation(lat: float, lon: float, elevation_ft: float = 0.0) -> dict:
+    """Magnetic variation at a point, positive east.
+
+    Dated today, like the navlog's is: the field drifts about a tenth of a
+    degree a year, so a fixed date would silently age.
+    """
+    if not -90.0 <= lat <= 90.0:
+        return {"ok": False, "error": "Latitude must be between -90 and 90."}
+    if not -180.0 <= lon <= 360.0:
+        return {"ok": False, "error": "Longitude must be between -180 and 360."}
+    decimal_year = mag.decimal_year_now()
+    try:
+        mag.check_validity(decimal_year)
+        variation_deg = mag.variation(lat, lon, elevation_ft, decimal_year)
+    except (OutsideModelValidity, AtGeographicPole) as exc:
+        return {"ok": False, "error": str(exc)}
+    return {
+        "ok": True,
+        "variation_deg": variation_deg,
+        "decimal_year": decimal_year,
+    }
+
+
+@app.post("/api/e6b/weight-balance")
+def e6b_weight_balance(request: WeightBalanceRequest) -> dict:
+    """Gross weight and centre of gravity for a list of loading stations.
+
+    A POST rather than a GET only because the loading is a list: like the
+    other two calculators it takes typed numbers and knows nothing of the
+    route.
+    """
+    try:
+        loading = wb.compute(
+            [
+                wb.Station(
+                    name=station.name,
+                    weight_lb=station.weight_lb,
+                    arm_in=station.arm_in,
+                )
+                for station in request.stations
+            ]
+        )
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    return {
+        "ok": True,
+        "gross_weight_lb": loading.gross_weight_lb,
+        "total_moment_in_lb": loading.total_moment_in_lb,
+        "cg_in": loading.cg_in,
+        "moments_in_lb": [station.moment_in_lb for station in loading.stations],
+    }
+
+
+def _dataset_json(dataset: cur.Dataset, today: date) -> dict:
+    return {
+        "key": dataset.key,
+        "label": dataset.label,
+        "effective": dataset.effective.isoformat() if dataset.effective else None,
+        "expires": dataset.expires.isoformat() if dataset.expires else None,
+        "expired": dataset.expired(today),
+        "days_remaining": dataset.days_remaining(today),
+        "note": dataset.note,
+    }
+
+
+@app.get("/api/status")
+def status() -> dict:
+    today = date.today()
+    # Reported even when the database is missing: knowing the data is stale
+    # is useful whether or not it loaded.
+    data = [_dataset_json(d, today) for d in cur.datasets(today)]
+    try:
+        airport_count = apt.count()
+        waypoint_count = apt.count_vfr_waypoints()
+    except apt.AirportDatabaseMissing as exc:
+        return {"ok": False, "error": str(exc), "data": data}
+    return {
+        "ok": True,
+        "airports": airport_count,
+        "vfr_waypoints": waypoint_count,
+        "data": data,
+    }
+
+
+# --- static files --------------------------------------------------------
+
+
+@app.middleware("http")
+async def no_cache_the_ui(request, call_next):
+    """Never let the browser cache the UI source while developing.
+
+    `index.html` and `app.js` have to move together: the table's headers live
+    in one and its cells in the other. Cache one and not the other and every
+    column shifts under its heading, which looks like a rendering bug and is
+    really a stale file. The basemap and airport data are left cacheable --
+    they are large and change only when the data pipeline is re-run.
+    """
+    response = await call_next(request)
+    if request.url.path in ("/", "/index.html") or request.url.path.endswith(
+        (".js", ".css")
+    ):
+        response.headers["Cache-Control"] = "no-store, must-revalidate"
+    return response
+
+
+# The basemap is served from data/ so that the same files are baked into the
+# PWA bundle later without being duplicated here.
+app.mount("/data", StaticFiles(directory=DATA_DIR), name="data")
+
+
+@app.get("/")
+def index() -> FileResponse:
+    return FileResponse(UI_DIR / "index.html")
+
+
+app.mount("/", StaticFiles(directory=UI_DIR), name="ui")

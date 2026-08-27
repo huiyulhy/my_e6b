@@ -1,0 +1,472 @@
+/* Layout: control panel left, map top-centre, navlog bottom-centre, E6B right.
+   On a narrow screen (an iPad in portrait) it stacks vertically instead. */
+
+:root {
+  --bg: #10151c;
+  --panel: #161d27;
+  --panel-2: #1d2733;
+  --line: #2a3644;
+  --ink: #e6edf5;
+  --ink-dim: #8b9bad;
+  --accent: #4da3ff;
+  /* Phase colours: climb blue, cruise green, descent orange. Only ever used
+     for phases -- the semantic colours below are separate on purpose, so
+     recolouring a phase cannot turn a GO pill orange. */
+  --climb: #4da3ff;
+  --cruise: #7ee081;
+  --descent: #ffa657;
+  /* Taxi and traffic pattern: on the log, but not on the map. */
+  --ground: #9d8df1;
+  --warn: #ff7b72;
+  /* Semantic, not phase: a pass, and a value the pilot typed in. */
+  --ok: #7ee081;
+  --edit: #ffb454;
+  --font: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0; height: 100%;
+  background: var(--bg); color: var(--ink);
+  font-family: var(--font); font-size: 14px;
+  -webkit-text-size-adjust: 100%;
+}
+
+#app {
+  display: grid; height: 100%;
+  grid-template-columns: 340px 1fr 260px;
+  grid-template-rows: 1fr 260px;
+  grid-template-areas: "panel map e6b" "panel navlog e6b";
+}
+
+#panel { grid-area: panel; background: var(--panel); border-right: 1px solid var(--line);
+         overflow-y: auto; padding: 16px; }
+#map-wrap { grid-area: map; position: relative; min-width: 0; }
+#map { position: absolute; inset: 0; }
+/* min-width: 0 so the wide navlog table scrolls inside its column instead of
+   stretching it and pushing the E6B bar off the screen. */
+#navlog-wrap { grid-area: navlog; background: var(--panel); border-top: 1px solid var(--line);
+               display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+#e6b { grid-area: e6b; background: var(--panel); border-left: 1px solid var(--line);
+       overflow-y: auto; padding: 16px; }
+
+/* Hidden: the column is taken out of the grid, not just emptied, so the map
+   and the navigation log take the width back. */
+#app.e6b-hidden { grid-template-columns: 340px 1fr; grid-template-areas: "panel map" "panel navlog"; }
+#app.e6b-hidden #e6b { display: none; }
+
+@media (max-width: 900px) {
+  #app {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto 45vh 1fr auto;
+    grid-template-areas: "panel" "map" "navlog" "e6b";
+    height: auto; min-height: 100%;
+  }
+  #panel { border-right: none; border-bottom: 1px solid var(--line); }
+  #e6b { border-left: none; border-top: 1px solid var(--line); }
+  #app.e6b-hidden {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto 45vh 1fr;
+    grid-template-areas: "panel" "map" "navlog";
+  }
+  /* Stacked, the bar is below the map, so the handle points at where it
+     goes rather than at the right-hand edge it no longer has. */
+  #e6b-toggle { transform: translateY(-50%) rotate(90deg); }
+}
+
+/* --- panel ------------------------------------------------------------ */
+
+h1 { font-size: 18px; margin: 0 0 4px; letter-spacing: .5px; }
+h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em;
+     color: var(--ink-dim); margin: 0 0 8px; }
+
+.disclaimer { font-size: 11px; color: var(--ink-dim); line-height: 1.5; margin: 0 0 4px; }
+.disclaimer strong { color: var(--warn); }
+.hint { font-size: 11px; color: var(--ink-dim); line-height: 1.5; }
+
+/* Data currency: quiet when the data is in date, loud when it is not. */
+.currency { list-style: none; margin: 8px 0 0; padding: 0;
+            font-size: 11px; color: var(--ink-dim); line-height: 1.5; }
+.currency li { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 0 8px; }
+.currency .date { font-family: var(--mono); }
+.currency li.expired, .currency li.expired .date { color: var(--warn); }
+.currency .note { flex-basis: 100%; color: var(--edit); margin-top: 2px; }
+
+.block { border-top: 1px solid var(--line); padding-top: 14px; margin-top: 14px; }
+
+.search { position: relative; }
+input[type="search"], input[type="number"] {
+  width: 100%; padding: 8px 10px; background: var(--panel-2);
+  border: 1px solid var(--line); border-radius: 6px; color: var(--ink);
+  font-family: inherit; font-size: 14px;
+}
+input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+
+.results {
+  position: absolute; z-index: 20; left: 0; right: 0; top: calc(100% + 4px);
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px;
+  max-height: 260px; overflow-y: auto; box-shadow: 0 8px 24px rgba(0,0,0,.5);
+}
+.results button {
+  display: block; width: 100%; text-align: left; padding: 8px 10px;
+  background: none; border: none; color: var(--ink); font: inherit; cursor: pointer;
+  border-bottom: 1px solid var(--line);
+}
+.results button:last-child { border-bottom: none; }
+.results button:hover, .results button.active { background: var(--accent); color: #06121f; }
+.results .ident { font-family: var(--mono); font-weight: 600; }
+.results .meta { display: block; font-size: 11px; color: var(--ink-dim); }
+.results button:hover .meta, .results button.active .meta { color: #06121f; opacity: .8; }
+
+.waypoints { list-style: none; margin: 12px 0 8px; padding: 0; }
+.waypoints li {
+  display: flex; align-items: center; gap: 8px; padding: 6px 8px; margin-bottom: 4px;
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px;
+}
+.waypoints .seq { font-family: var(--mono); font-size: 11px; color: var(--ink-dim); width: 16px; }
+.waypoints .name { flex: 1; font-family: var(--mono); font-weight: 600; }
+.waypoints .drag { cursor: grab; color: var(--ink-dim); }
+.waypoints li.dragging { opacity: .4; }
+.waypoints button.remove {
+  background: none; border: none; color: var(--ink-dim); cursor: pointer;
+  font-size: 16px; line-height: 1; padding: 0 2px;
+}
+.waypoints button.remove:hover { color: var(--warn); }
+
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 8px; }
+label { display: block; font-size: 11px; color: var(--ink-dim); }
+label input { margin-top: 3px; }
+/* A field the current mode does not use -- the cruise altitude in user-driven
+   planning, where it is a bound rather than a target. Dimmed so it reads as
+   inactive rather than as a value the plan is being flown to. */
+input:disabled { opacity: .45; cursor: not-allowed; }
+.checkbox { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ink); }
+.checkbox input { width: auto; margin: 0; }
+
+.summary { display: grid; grid-template-columns: 1fr; gap: 4px; font-size: 13px; }
+.summary div { display: flex; justify-content: space-between; gap: 10px; align-items: baseline; }
+.summary .k { color: var(--ink-dim); }
+.summary .v { font-family: var(--mono); }
+
+.alert {
+  margin-top: 10px; padding: 8px 10px; border-radius: 6px; font-size: 12px; line-height: 1.5;
+  background: rgba(255,123,114,.12); border: 1px solid rgba(255,123,114,.4); color: #ffc9c5;
+}
+
+/* --- map -------------------------------------------------------------- */
+
+.status {
+  position: absolute; left: 10px; bottom: 10px; z-index: 10;
+  background: rgba(16,21,28,.85); border: 1px solid var(--line); border-radius: 6px;
+  padding: 5px 9px; font-size: 11px; color: var(--ink-dim); pointer-events: none;
+}
+
+.marker {
+  width: 13px; height: 13px; border-radius: 50%;
+  background: var(--accent); border: 2px solid #06121f; cursor: grab;
+  box-shadow: 0 0 0 1px rgba(255,255,255,.35);
+}
+.marker.endpoint { width: 17px; height: 17px; background: #fff; }
+.marker.phase { width: 9px; height: 9px; background: var(--edit); cursor: default; }
+.marker-label {
+  position: absolute; left: 16px; top: -3px; white-space: nowrap;
+  font-family: var(--mono); font-size: 11px; color: var(--ink);
+  text-shadow: 0 0 3px #000, 0 0 3px #000; pointer-events: none;
+}
+
+.maplibregl-popup-content {
+  background: var(--panel-2); color: var(--ink); border: 1px solid var(--line);
+  border-radius: 6px; font-size: 12px; padding: 8px 10px;
+}
+.maplibregl-popup-tip { border-top-color: var(--panel-2) !important; }
+.popup-title { font-family: var(--mono); font-weight: 600; margin-bottom: 2px; }
+.popup-meta { color: var(--ink-dim); font-size: 11px; }
+.popup-actions { margin-top: 6px; display: flex; gap: 6px; }
+.popup-actions button {
+  background: var(--accent); color: #06121f; border: none; border-radius: 4px;
+  padding: 4px 8px; font: inherit; font-size: 11px; cursor: pointer;
+}
+
+/* --- navlog ----------------------------------------------------------- */
+
+.navlog-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 14px 6px; border-bottom: 1px solid var(--line);
+}
+.navlog-head h2 { margin: 0; }
+#copy {
+  background: var(--panel-2); color: var(--ink); border: 1px solid var(--line);
+  border-radius: 5px; padding: 4px 10px; font: inherit; font-size: 11px; cursor: pointer;
+}
+#copy:hover { border-color: var(--accent); color: var(--accent); }
+
+.table-scroll { overflow: auto; flex: 1; min-height: 0; }
+table { width: 100%; border-collapse: collapse; font-size: 12px; }
+th, td { padding: 5px 9px; text-align: left; white-space: nowrap; }
+th {
+  position: sticky; top: 0; background: var(--panel); color: var(--ink-dim);
+  font-size: 10px; text-transform: uppercase; letter-spacing: .06em;
+  border-bottom: 1px solid var(--line);
+}
+td { border-bottom: 1px solid rgba(42,54,68,.5); font-family: var(--mono); }
+.num, th.num { text-align: right; }
+tbody tr:hover { background: rgba(77,163,255,.07); }
+tfoot td { border-top: 1px solid var(--line); border-bottom: none; font-weight: 600; }
+
+.phase-climb   { color: var(--climb); }
+.phase-cruise  { color: var(--cruise); }
+.phase-descent { color: var(--descent); }
+.phase-taxi,
+.phase-pattern { color: var(--ground); }
+
+/* Time and fuel only -- these rows cover no ground, so they read quieter. */
+tr.row-ground td { color: var(--ink-dim); }
+tr.row-ground td.num:last-child,
+tr.row-ground td.num:nth-last-child(2),
+tr.row-ground td.num:nth-last-child(3) { color: var(--ink); }
+
+#navlog-empty { padding: 14px; }
+
+.airport-label {
+  font-family: var(--mono); font-size: 10px; color: #8ea3ba;
+  text-shadow: 0 0 3px #0d1218, 0 0 3px #0d1218;
+  transform: translateY(4px); pointer-events: none; white-space: nowrap;
+}
+
+/* Follows the cursor along a road, so it must never eat a click meant for the
+   map underneath, and it stays tighter than the airport popups it borrows. */
+.airspace-tip { pointer-events: none; }
+.airspace-tip .maplibregl-popup-content {
+  font-size: 11px; padding: 5px 8px; line-height: 1.35;
+  background: var(--panel-2); border-color: #3d5a7a;
+}
+.airspace-tip .maplibregl-popup-tip { display: none; }
+.airspace-row + .airspace-row { margin-top: 4px; border-top: 1px solid var(--line); padding-top: 4px; }
+.airspace-row b { font-family: var(--mono); color: #8fb4dd; font-weight: 600; }
+
+.highway-tip { pointer-events: none; }
+.highway-tip .maplibregl-popup-content {
+  font-family: var(--mono); font-size: 11px; padding: 3px 7px;
+  background: #241f16; border-color: #4a3f2d; color: #c8b596;
+}
+.highway-tip .maplibregl-popup-tip { display: none; }
+.marker-label.dim { color: var(--ink-dim); font-size: 10px; left: 12px; }
+
+/* --- manual row edits -------------------------------------------------- */
+
+.navlog-actions { display: flex; gap: 8px; }
+
+#navlog td.editable { padding: 0; }
+#navlog td.editable input {
+  width: 100%; padding: 2px 4px; background: transparent;
+  border: 1px solid transparent; border-radius: 3px;
+  color: inherit; font: inherit; text-align: right;
+  -moz-appearance: textfield;
+}
+#navlog td.editable input::-webkit-outer-spin-button,
+#navlog td.editable input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+#navlog td.editable input:hover { border-color: var(--line); }
+#navlog td.editable input:focus { outline: none; border-color: var(--accent); }
+/* An edited value must never read as a computed one. */
+#navlog td.editable.edited input { color: var(--edit); font-weight: 600; }
+#navlog tr.row-edited td:first-child { border-left: 2px solid var(--edit); }
+
+.waypoints .landing { display: flex; align-items: center; gap: 4px;
+  font-size: 11px; color: var(--ink-dim); cursor: pointer; }
+.waypoints .landing input { width: auto; margin: 0; }
+
+/* --- go / no-go -------------------------------------------------------- */
+
+.verdict { font-family: var(--mono); font-weight: 700; font-size: 13px;
+  padding: 2px 10px; border-radius: 999px; letter-spacing: 0.06em; }
+.verdict.go { background: rgba(126, 224, 129, 0.16); color: var(--ok); }
+.verdict.nogo { background: rgba(255, 123, 114, 0.16); color: var(--warn); }
+
+.check { margin: 12px 0; }
+.check-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.check-title { font-family: var(--mono); font-weight: 600; }
+.check-conditions { font-size: 11px; color: var(--ink-dim); line-height: 1.6; margin: 2px 0 6px; }
+.check-conditions strong { color: var(--ink); }
+
+.pill { font-size: 10px; font-weight: 700; letter-spacing: 0.06em;
+  padding: 1px 7px; border-radius: 999px; }
+.pill.ok { background: rgba(126, 224, 129, 0.16); color: var(--ok); }
+.pill.short { background: rgba(255, 123, 114, 0.16); color: var(--warn); }
+.pill.unknown { background: rgba(139, 155, 173, 0.16); color: var(--ink-dim); }
+
+table.runways { width: 100%; border-collapse: collapse; font-size: 11px;
+  font-family: var(--mono); }
+table.runways th { text-align: left; color: var(--ink-dim); font-weight: 500;
+  padding: 3px 6px; border-bottom: 1px solid var(--line); }
+table.runways td { padding: 3px 6px; border-bottom: 1px solid var(--line); }
+table.runways th.num, table.runways td.num { text-align: right; }
+table.runways tr.short td { color: var(--warn); }
+table.runways tr.note td { color: var(--ink-dim); font-size: 10px; border-bottom: none; }
+
+.fuel-figures { display: grid; grid-template-columns: repeat(2, 1fr);
+  gap: 2px 12px; margin: 6px 0 0; font-size: 11px; }
+.fuel-figures div { display: flex; justify-content: space-between; gap: 8px;
+  border-bottom: 1px solid var(--line); padding: 2px 0; }
+.fuel-figures dt { color: var(--ink-dim); }
+.fuel-figures dd { margin: 0; font-family: var(--mono); }
+
+.alert.unknown { color: var(--ink-dim); }
+
+/* --- waypoint coordinates ---------------------------------------------- */
+
+.waypoints li { flex-direction: column; align-items: stretch; gap: 4px; }
+.wp-row { display: flex; align-items: center; gap: 8px; }
+.coords { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; }
+.coords.readonly { display: block; font-family: var(--mono); font-size: 10px;
+  color: var(--ink-dim); padding-left: 24px; }
+.coords label { display: flex; align-items: center; gap: 4px;
+  font-size: 10px; color: var(--ink-dim); }
+.coords input { padding: 2px 4px; font-size: 11px; font-family: var(--mono); }
+
+/* Field elevation, altimeter setting and temperature: the three inputs the
+   density altitude under them is computed from. Set apart from the position
+   row above so it reads as weather rather than geometry. */
+.coords.field { border-top: 1px dashed var(--line); padding-top: 4px; }
+.field-air {
+  font-family: var(--mono); font-size: 10px; color: var(--ink-dim);
+  padding-left: 2px;
+}
+.field-air:empty { display: none; }
+.field-air strong { color: var(--ink); font-weight: 600; }
+.field-air .from { opacity: .8; }
+
+#navlog td.coord { font-size: 11px; color: var(--ink-dim); }
+
+/* Published VFR waypoints. Magenta throughout, matching the flag symbol used
+   on sectional charts, so the map reads the same way the chart does. */
+.vfr-label {
+  font-family: var(--mono); font-size: 10px; color: #e58fc4;
+  text-shadow: 0 0 3px #0d1218, 0 0 3px #0d1218;
+  transform: translateY(4px); pointer-events: none; white-space: nowrap;
+}
+.popup-title.vfr { color: #e58fc4; }
+.waypoints li.kind-vfr_waypoint .name { color: #e58fc4; }
+
+/* --- segment type, planning mode and consistency ------------------------ */
+
+/* The per-waypoint segment selector. Coloured to match the leg it describes,
+   so the sidebar and the map agree at a glance. */
+.wp-row select.segment {
+  padding: 1px 4px; font-size: 11px; font-family: var(--font);
+  background: var(--panel-2); color: var(--ink);
+  border: 1px solid var(--line); border-radius: 4px;
+}
+.wp-row select.segment.seg-climb   { color: var(--climb); }
+.wp-row select.segment.seg-cruise  { color: var(--cruise); }
+.wp-row select.segment.seg-descent { color: var(--descent); }
+.wp-row select.segment:disabled { opacity: .45; }
+
+/* A TOC/TOD the planner inserted. Dimmed because it is the planner's, not the
+   pilot's -- editing one promotes it and the dimming goes away. */
+.waypoints li.generated { opacity: .72; }
+.waypoints li.generated .name { font-style: italic; }
+.waypoints .role {
+  font-family: var(--mono); font-size: 10px; color: var(--ink-dim);
+  border: 1px solid var(--line); border-radius: 3px; padding: 0 3px;
+}
+
+.mode-toggle { display: flex; gap: 6px; margin: 8px 0 4px; }
+.mode-toggle button {
+  flex: 1; padding: 5px 8px; font-size: 12px; cursor: pointer;
+  background: var(--panel-2); color: var(--ink-dim);
+  border: 1px solid var(--line); border-radius: 5px;
+}
+.mode-toggle button[aria-pressed="true"] {
+  background: rgba(77, 163, 255, 0.16); color: var(--accent);
+  border-color: var(--accent);
+}
+
+#consistency-block .navlog-head button {
+  padding: 4px 10px; font-size: 12px; cursor: pointer;
+  background: var(--panel-2); color: var(--ink);
+  border: 1px solid var(--line); border-radius: 5px;
+}
+#consistency-block .navlog-head button:hover { border-color: var(--accent); }
+.finding { display: flex; gap: 8px; align-items: baseline;
+  padding: 6px 8px; margin-bottom: 6px; border-radius: 5px;
+  background: var(--panel-2); font-size: 12px; }
+.finding .where {
+  font-family: var(--mono); font-size: 10px; color: var(--ink-dim);
+  white-space: nowrap;
+}
+.finding.error { border-left: 2px solid var(--warn); }
+.finding.warning { border-left: 2px solid var(--edit); }
+.finding.info { border-left: 2px solid var(--line); }
+
+/* The navlog's own message line. Sits above the table so a refusal to plan is
+   the first thing read, not something below the fold. */
+#navlog-empty.alert { margin: 0 12px 8px; }
+
+/* Consistency findings, in the same place and for the same reason. Capped and
+   scrollable: a plan with a dozen findings must not squeeze the table it is
+   describing out of a 260px panel. */
+#navlog-findings {
+  flex: 0 0 auto; margin: 0 12px 8px;
+  max-height: 96px; overflow-y: auto;
+}
+#navlog-findings .finding:last-child { margin-bottom: 0; }
+
+/* --- E6B bar ---------------------------------------------------------- */
+
+/* Narrow enough that the two-column .grid used in the left panel would put a
+   label on three lines; one field per row instead. */
+#e6b .grid { grid-template-columns: 1fr; }
+#e6b .block:first-of-type { border-top: none; margin-top: 8px; padding-top: 0; }
+#e6b .summary { margin: 10px 0 0; }
+#e6b .summary .v.big { font-size: 15px; color: var(--accent); }
+#e6b .summary .rule { color: var(--ink-dim); font-size: 11px; }
+#e6b .summary .k { white-space: nowrap; }
+#e6b .hint { margin: 10px 0 0; }
+
+.e6b-actions { display: flex; justify-content: flex-end; margin-top: 10px; }
+.e6b-actions button {
+  background: var(--panel-2); color: var(--ink-dim);
+  border: 1px solid var(--line); border-radius: 6px;
+  padding: 5px 10px; font: inherit; font-size: 11px; cursor: pointer;
+}
+.e6b-actions button:hover { color: var(--ink); border-color: var(--accent); }
+
+/* Nothing typed yet, or half typed: say so rather than showing a stale answer. */
+#e6b .waiting { font-size: 11px; color: var(--ink-dim); line-height: 1.5; margin: 10px 0 0; }
+
+/* The loading form. Three fields and a delete on one line: the bar is narrow,
+   so the name takes what is left after two fixed number boxes. A header row
+   would cost a line for every pilot who already knows lb comes before in, so
+   the units are placeholders instead. */
+.wb-rows { display: grid; gap: 6px; }
+.wb-row { display: grid; grid-template-columns: 1fr 52px 46px 16px; gap: 4px; align-items: center; }
+.wb-row input { margin: 0; font-size: 11px; padding: 5px 6px; min-width: 0; }
+.wb-row .wb-weight, .wb-row .wb-arm { font-family: var(--mono); text-align: right; }
+.wb-row .wb-del {
+  background: none; border: none; color: var(--ink-dim); cursor: pointer;
+  font-size: 15px; line-height: 1; padding: 0;
+}
+.wb-row .wb-del:hover { color: var(--warn); }
+
+.wb-add { margin-top: 8px; }
+.wb-add button {
+  background: none; color: var(--ink-dim); border: 1px dashed var(--line);
+  border-radius: 6px; padding: 5px 10px; font: inherit; font-size: 11px;
+  cursor: pointer; width: 100%;
+}
+.wb-add button:hover { color: var(--ink); border-color: var(--accent); }
+
+/* The E6B handle: a tab on the edge the bar closes toward, chevron pointing
+   the way that edge will move. Vertically centred so it clears the zoom
+   control in the corner. */
+#e6b-toggle {
+  position: absolute; right: 0; top: 50%; transform: translateY(-50%); z-index: 10;
+  width: 16px; height: 46px; padding: 0; cursor: pointer;
+  background: rgba(16,21,28,.85); color: var(--ink-dim);
+  border: 1px solid var(--line); border-right: none;
+  border-radius: 6px 0 0 6px;
+  font: inherit; font-size: 13px; line-height: 1;
+}
+#e6b-toggle:hover { color: var(--ink); border-color: var(--accent); }

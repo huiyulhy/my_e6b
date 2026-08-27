@@ -1,0 +1,25 @@
+# Render blueprint. Deploys the FastAPI dev shim as a real web service.
+#
+# This is the *networked* deployment: the iPad talks to this server over
+# HTTPS. It is a stepping stone, not the destination -- the offline PWA
+# (docs/ARCHITECTURE.md section 2) still needs Pyodide, and when that lands it
+# becomes a Render *static site* instead, with no server at all.
+services:
+  - type: web
+    name: my-e6b
+    runtime: python
+    plan: free
+    # uv provisions its own CPython 3.13, matching .python-version, so the
+    # deployed interpreter is the one the tests ran against.
+    # uv.lock is the source of truth; requirements.txt is exported from it
+    # (see the Makefile) for anything that wants a plain pip install.
+    buildCommand: pip install uv && uv sync --frozen --no-dev
+    startCommand: uv run --no-dev uvicorn server.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/status
+    envVars:
+      # Cleared for the same reason the Makefile clears it: a stray ROS-style
+      # PYTHONPATH would shadow the venv.
+      - key: PYTHONPATH
+        value: ""
+      - key: UV_FROZEN
+        value: "1"

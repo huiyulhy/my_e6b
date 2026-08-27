@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>my_e6b — VFR planner</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/vendor/maplibre-gl.css">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<div id="app">
+
+  <aside id="panel">
+    <header>
+      <h1>my_e6b</h1>
+      <p class="disclaimer">Planning aid only — <strong>not for navigation</strong>.
+         Verify against the POH and current charts.</p>
+      <ul id="data-currency" class="currency"></ul>
+    </header>
+
+    <section class="block">
+      <h2>Route</h2>
+      <div class="search">
+        <input id="search" type="search" autocomplete="off" spellcheck="false"
+               placeholder="Add airport — type KSQL, San Carlos…">
+        <div id="results" class="results" hidden></div>
+      </div>
+      <ol id="waypoints" class="waypoints"></ol>
+      <p id="route-hint" class="hint">
+        Add a departure and destination. Click the map to insert a waypoint,
+        drag any marker to move it.
+      </p>
+    </section>
+
+    <section class="block">
+      <h2>Flight</h2>
+      <div class="mode-toggle" role="group" aria-label="Planning mode">
+        <button id="mode-auto" type="button" aria-pressed="false"
+                title="The planner places top of climb and top of descent for you">
+          Automatic
+        </button>
+        <button id="mode-manual" type="button" aria-pressed="true"
+                title="You declare what each leg does; altitudes follow from performance">
+          User-driven
+        </button>
+      </div>
+      <div class="grid">
+        <label id="altitude-label">Target cruise altitude
+          <input id="altitude" type="number" value="6500" step="500" min="1000" max="14000"
+                 disabled>
+        </label>
+        <label>Cruise RPM
+          <input id="rpm" type="number" value="2400" step="50" min="2100" max="2700">
+        </label>
+        <label>Fuel on board (gal)
+          <input id="fuel" type="number" value="50" step="1" min="1" max="53">
+        </label>
+        <label>Altimeter (inHg)
+          <input id="altimeter" type="number" value="29.92" step="0.01" min="27" max="32">
+        </label>
+        <label title="Used only where nothing was observed. A field temperature on an airport below, or an OAT typed into the navigation log, replaces it.">
+          ISA deviation (°C) — fallback
+          <input id="isadev" type="number" value="0" step="1" min="-30" max="40">
+        </label>
+        <label>Weight (lb)
+          <input id="weight" type="number" value="2550" step="10" min="1600" max="2550">
+        </label>
+      </div>
+      <label class="checkbox">
+        <input id="night" type="checkbox"> Night VFR (45 min reserve)
+      </label>
+      <div class="grid">
+        <label title="Extra runway required beyond the POH book distance">
+          Runway margin (%)
+          <input id="runway-margin" type="number" value="20" step="5" min="0" max="200">
+        </label>
+        <label title="Extra fuel required beyond the FAR 91.151 reserve">
+          Fuel margin (%)
+          <input id="fuel-margin" type="number" value="10" step="5" min="0" max="200">
+        </label>
+      </div>
+    </section>
+
+    <section class="block" id="summary-block" hidden>
+      <h2>Summary</h2>
+      <div id="summary" class="summary"></div>
+      <div id="warnings"></div>
+    </section>
+
+    <section class="block" id="checklist-block" hidden>
+      <div class="navlog-head">
+        <h2>Go / no-go</h2>
+        <span id="verdict" class="verdict"></span>
+      </div>
+      <div id="checklist"></div>
+      <p class="hint">
+        Distances are computed at zero wind — a headwind is margin, not credit —
+        and landing distance is the POH max-weight figure. An unknown runway is
+        never treated as a pass.
+      </p>
+    </section>
+
+    <section class="block" id="consistency-block">
+      <div class="navlog-head">
+        <h2>Navlog consistency</h2>
+        <button id="check-consistency" type="button">Check navlog consistency</button>
+      </div>
+      <div id="consistency"></div>
+      <p class="hint">
+        Checks the log against itself — altitudes that do not join up, a leg
+        that does not do what it says. Separate from go/no-go: that says whether
+        the airplane can do it, this says whether the plan agrees with itself.
+      </p>
+    </section>
+
+  </aside>
+
+  <main id="map-wrap">
+    <div id="map"></div>
+    <div id="status" class="status">Loading…</div>
+    <!-- The E6B bar's handle. It sits on the map rather than in the bar so
+         that it survives the bar being hidden -- a toggle inside the thing it
+         toggles can only ever be pressed once. -->
+    <button id="e6b-toggle" type="button" aria-controls="e6b" aria-expanded="true"
+            title="Hide the E6B bar">›</button>
+  </main>
+
+  <!-- The E6B bar: two standalone calculators that answer a question about a
+       place, not about the route. Deliberately independent of the plan — they
+       are what a pilot reaches for while the route is still half-formed. -->
+  <aside id="e6b">
+    <header>
+      <h1>E6B</h1>
+    </header>
+
+    <section class="block" id="da-block">
+      <h2>Density altitude</h2>
+      <div class="grid">
+        <label>Elevation (ft)
+          <input id="da-elev" type="number" step="10" min="-1400" max="30000"
+                 placeholder="—" inputmode="numeric">
+        </label>
+        <label>OAT (°C)
+          <input id="da-oat" type="number" step="1" min="-60" max="60"
+                 placeholder="—" inputmode="numeric">
+        </label>
+        <label>Altimeter (inHg)
+          <input id="da-altimeter" type="number" step="0.01" min="27" max="32"
+                 placeholder="29.92" inputmode="decimal">
+        </label>
+      </div>
+      <div id="da-out" class="summary"></div>
+      <div id="da-error"></div>
+      <div class="e6b-actions">
+        <button id="da-clear" type="button">Clear</button>
+      </div>
+      <p class="hint">
+        Pressure altitude from the setting, density altitude from that and the
+        temperature — the same functions the navigation log reads performance at.
+      </p>
+    </section>
+
+    <section class="block" id="var-block">
+      <h2>Magnetic variation</h2>
+      <div class="grid">
+        <label>Latitude (°)
+          <input id="var-lat" type="number" step="0.0001" min="-90" max="90"
+                 placeholder="—" inputmode="decimal">
+        </label>
+        <label>Longitude (°)
+          <input id="var-lon" type="number" step="0.0001" min="-180" max="180"
+                 placeholder="—" inputmode="decimal">
+        </label>
+      </div>
+      <div id="var-out" class="summary"></div>
+      <div id="var-error"></div>
+      <div class="e6b-actions">
+        <button id="var-clear" type="button">Clear</button>
+      </div>
+      <p class="hint">
+        Decimal degrees, south and west negative. East is positive:
+        subtract it from a true course to get magnetic.
+      </p>
+    </section>
+
+    <section class="block" id="wb-block">
+      <h2>Weight &amp; balance</h2>
+      <!-- Rows are added by the pilot rather than fixed: the stations on a
+           loading form differ by aircraft, and this bar knows nothing about
+           which one is being planned. -->
+      <div id="wb-rows" class="wb-rows"></div>
+      <div class="wb-add">
+        <button id="wb-add" type="button">+ Add row</button>
+      </div>
+      <div id="wb-out" class="summary"></div>
+      <div id="wb-error"></div>
+      <div class="e6b-actions">
+        <button id="wb-clear" type="button">Clear</button>
+      </div>
+      <p class="hint">
+        Weights in pounds, arms in inches aft of the datum. Gross weight is
+        the sum; the CG is the total moment divided by it. No envelope is
+        checked — compare both against the POH for your aircraft.
+      </p>
+    </section>
+  </aside>
+
+  <section id="navlog-wrap">
+    <div class="navlog-head">
+      <h2>Navigation log</h2>
+      <div class="navlog-actions">
+        <button id="reset-edits" type="button" hidden>Reset manual edits</button>
+        <button id="copy" type="button">Copy as text</button>
+      </div>
+    </div>
+    <!-- Above the table, not below it: this is where a refusal to plan is
+         shown, and the panel is short enough that anything after the table is
+         scrolled out of sight. An error nobody can see reads as a blank log. -->
+    <p id="navlog-empty" class="hint">Add at least two waypoints to build a navigation log.</p>
+    <!-- Consistency findings, for the same reason: they point at rows of the
+         table below, so they belong beside it rather than in the sidebar. -->
+    <div id="navlog-findings" class="findings" hidden></div>
+    <div class="table-scroll">
+      <table id="navlog">
+        <thead>
+          <tr>
+            <th>From</th><th>To</th>
+            <th class="num" title="Latitude of the point this leg starts at">Lat</th>
+            <th class="num" title="Longitude of the point this leg starts at">Lon</th>
+            <th>Phase</th>
+            <th class="num">Alt</th>
+            <th class="num" title="Outside air temperature at this leg's altitude — editable. Type the FD forecast temperature here; it lapses into the legs around it.">OAT</th>
+            <th class="num" title="Pressure altitude — this leg's altitude at the route altimeter setting">PA</th>
+            <th class="num" title="Density altitude — what every performance figure on this row was read at">DA</th>
+            <th class="num" title="True course — the track over the ground">TC</th>
+            <th class="num" title="Wind correction angle — the crab">WCA</th>
+            <th class="num" title="True heading — where the nose points">TH</th>
+            <th class="num" title="Magnetic variation, east positive">Var</th>
+            <th class="num" title="Magnetic heading — what you fly on the DG">MH</th>
+            <th class="num" title="Wind direction, true — editable">Wind °</th>
+            <th class="num" title="Wind speed, knots — editable">Wind kt</th>
+            <th class="num" title="True airspeed — editable">TAS</th>
+            <th class="num">GS</th>
+            <th class="num">Dist</th><th class="num">ETE</th>
+            <th class="num">Fuel</th><th class="num">Rem</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+        <tfoot></tfoot>
+      </table>
+    </div>
+  </section>
+
+</div>
+
+<script src="/vendor/maplibre-gl.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

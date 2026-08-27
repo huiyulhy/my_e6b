@@ -1,0 +1,43 @@
+[project]
+name = "my-e6b"
+version = "0.1.0"
+description = "Offline VFR cross-country flight planner for the Cessna 172S"
+readme = "README.md"
+# Pinned to 3.13 to match the CPython that Pyodide 0.28 ships (3.13.2), so the
+# engine runs unmodified in the browser when the PWA is packaged.
+requires-python = ">=3.13"
+# Runtime only -- what the deployed web service imports. Build-script deps
+# (shapely, pyshp) live in the dev group, so `uv sync --no-dev` on the server
+# installs neither. scipy and networkx were listed here but imported nowhere;
+# networkx returns as a runtime dep when corridor-constrained A* routing lands
+# (docs/ARCHITECTURE.md section 6) -- it is pure Python, so Pyodide takes it.
+dependencies = [
+    "fastapi>=0.140.0",
+    "numpy>=2.5.1",
+    "pandas>=3.0.5",
+    "uvicorn>=0.51.0",
+]
+
+[dependency-groups]
+dev = [
+    "playwright>=1.61.0",
+    # pyshp and shapely are used only by tools/build_*.py, which run on the
+    # desktop; their artefacts in data/ are committed and shipped.
+    "pyshp>=2.3.1",
+    "shapely>=2.1.2",
+    "pytest>=9.1.1",
+    "ruff>=0.16.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["engine"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100

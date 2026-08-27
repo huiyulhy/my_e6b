@@ -1,0 +1,1989 @@
+/* my_e6b — route editor and live navigation log.
+ *
+ * This file talks to the engine through exactly three operations: search for
+ * an airport, list airports in view, and plan a route. In the packaged PWA
+ * the same calls go to Pyodide instead of HTTP, so `api` below is the only
+ * thing that changes between the two run modes. Keep planning logic out of
+ * here — it belongs in engine/, or the desktop and iPad builds will drift.
+ */
+
+'use strict';
+
+// --- the entire server boundary ----------------------------------------
+
+const api = {
+  async searchAirports(query) {
+    const r = await fetch(`/api/airports/search?q=${encodeURIComponent(query)}`);
+    return r.ok ? r.json() : [];
+  },
+  async airportsInView(bounds, minRunway) {
+    const p = new URLSearchParams({
+      south: bounds.getSouth(), west: bounds.getWest(),
+      north: bounds.getNorth(), east: bounds.getEast(),
+    });
+    if (minRunway) p.set('min_runway_ft', minRunway);
+    const r = await fetch(`/api/airports/bbox?${p}`);
+    return r.ok ? r.json() : [];
+  },
+  async vfrWaypointsInView(bounds) {
+    const p = new URLSearchParams({
+      south: bounds.getSouth(), west: bounds.getWest(),
+      north: bounds.getNorth(), east: bounds.getEast(),
+    });
+    const r = await fetch(`/api/vfr-waypoints/bbox?${p}`);
+    return r.ok ? r.json() : [];
+  },
+  async status() {
+    const r = await fetch('/api/status');
+    return r.json();
+  },
+
+  async plan(body) {
+    const r = await fetch('/api/plan', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    return r.json();
+  },
+  async consistency(body) {
+    const r = await fetch('/api/consistency', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    return r.json();
+  },
+
+  async densityAltitude({ elevationFt, oatC, altimeterInhg }) {
+    const p = new URLSearchParams({
+      elevation_ft: elevationFt, oat_c: oatC, altimeter_inhg: altimeterInhg,
+    });
+    const r = await fetch(`/api/e6b/density-altitude?${p}`);
+    return r.json();
+  },
+  async variation({ lat, lon }) {
+    const p = new URLSearchParams({ lat, lon });
+    const r = await fetch(`/api/e6b/variation?${p}`);
+    return r.json();
+  },
+  async weightBalance(stations) {
+    const r = await fetch('/api/e6b/weight-balance', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ stations }),
+    });
+    return r.json();
+  },
+};
+
+// Phase colours, single source of truth for the map paint expression. Kept in
+// step with --climb / --cruise / --descent in style.css: climb blue, cruise
+// green, descent orange.
+const PHASE_COLOUR = {
+  climb: '#4da3ff',
+  cruise: '#7ee081',
+  descent: '#ffa657',
+};
+
+const SEGMENT_TYPES = ['climb', 'cruise', 'descent'];
+
+// --- state --------------------------------------------------------------
+
+/** The route. Order is the flight order; index 0 departs, last arrives. */
+let route = [];
+let markers = [];
+let lastPlan = null;
+/** "manual" -- the default -- takes the profile from each waypoint's segment
+ *  type; "auto" lets the planner place TOC/TOD instead. Kept in step with the
+ *  toggle's pressed state and the altitude field's disabled state in the
+ *  markup, which start on the same mode. */
+let planningMode = 'manual';
+/** Findings from the last consistency check, or null if it has not been run
+ *  or the route changed under it. */
+let consistencyReport = null;
+
+/** Pressure and density altitude at each waypoint's own elevation, as the
+ *  engine computed them on the last plan, indexed by route position. Derived
+ *  and never sent back: the inputs live on the waypoints. */
+let fieldAir = [];
+
+const $ = (id) => document.getElementById(id);
+const setStatus = (text) => { $('status').textContent = text; };
+
+// --- map ----------------------------------------------------------------
+
+const map = new maplibregl.Map({
+  container: 'map',
+  // No tile server: the basemap is local GeoJSON, so this works offline.
+  style: {
+    version: 8,
+    sources: {},
+    layers: [{ id: 'bg', type: 'background', paint: { 'background-color': '#0d1218' } }],
+  },
+  center: [-122.1, 37.2],
+  zoom: 7,
+  attributionControl: false,
+});
+map.addControl(new maplibregl.NavigationControl({ showCompass: false }), 'top-right');
+map.addControl(new maplibregl.ScaleControl({ unit: 'nautical' }), 'bottom-right');
+
+map.on('load', async () => {
+  await addBasemap();
+  addRouteLayers();
+  bindMapInteractions();
+  refreshAirportLayer();
+  renderDataCurrency();
+  setStatus('Ready — offline');
+});
+
+/** Show how old the bundled data is: NASR runs out in a month, the
+ *  magnetic model in five years, and offline there is nothing to warn us. */
+async function renderDataCurrency() {
+  const list = $('data-currency');
+  let datasets = [];
+  try {
+    datasets = (await api.status()).data || [];
+  } catch {
+    return;
+  }
+  list.innerHTML = '';
+  for (const d of datasets) {
+    const li = document.createElement('li');
+    if (d.expired) li.classList.add('expired');
+    const when = d.effective
+      ? `${d.effective}${d.expired ? ' — expired' : ` — ${d.days_remaining} d left`}`
+      : 'date unknown';
+    li.innerHTML = `<span>${d.label}</span><span class="date">${when}</span>`;
+    if (d.note) {
+      const note = document.createElement('span');
+      note.className = 'note';
+      note.textContent = d.note;
+      li.appendChild(note);
+    }
+    li.title = d.expires ? `Effective ${d.effective}, expires ${d.expires}` : '';
+    list.appendChild(li);
+  }
+}
+
+async function addBasemap() {
+  for (const name of ['lakes', 'coastline', 'states', 'highways']) {
+    const data = await (await fetch(`/data/basemap/${name}.geojson`)).json();
+    map.addSource(name, { type: 'geojson', data });
+  }
+  map.addLayer({
+    id: 'lakes-fill', type: 'fill', source: 'lakes',
+    paint: { 'fill-color': '#0f1c2b' },
+  });
+  // Under the borders and coastline so those stay readable, and warm brown so
+  // roads never read as water. No symbol layer for the route numbers: that
+  // needs a `glyphs` URL, which is a network dependency this app cannot have.
+  map.addLayer({
+    id: 'highways-line', type: 'line', source: 'highways',
+    layout: { 'line-cap': 'round', 'line-join': 'round' },
+    paint: {
+      'line-color': '#3a3226',
+      'line-width': ['interpolate', ['linear'], ['zoom'], 5, 0.4, 10, 1.6],
+      // Two thousand lines are noise at continental zoom.
+      'line-opacity': ['interpolate', ['linear'], ['zoom'], 4, 0, 6, 0.85],
+    },
+  });
+  // A transparent fat line over the drawn one, purely so the pointer can hit a
+  // road that is under two pixels wide. Invisible layers are still returned by
+  // feature queries, which is the whole trick.
+  map.addLayer({
+    id: 'highways-hit', type: 'line', source: 'highways',
+    paint: { 'line-color': '#000', 'line-opacity': 0, 'line-width': 12 },
+  });
+  map.addLayer({
+    id: 'states-line', type: 'line', source: 'states',
+    paint: { 'line-color': '#243547', 'line-width': 1 },
+  });
+  map.addLayer({
+    id: 'coastline-line', type: 'line', source: 'coastline',
+    paint: { 'line-color': '#2f4459', 'line-width': 1.2 },
+  });
+  await addAirspace();
+}
+
+// Sectional convention, adapted to a dark background: Class B solid blue,
+// Class C solid magenta, Class D dashed blue. Class E is not in the data --
+// see tools/build_airspace.py for why.
+const AIRSPACE_COLOUR = ['match', ['get', 'class'], 'C', '#b0568f', '#4a7fc1'];
+
+async function addAirspace() {
+  const data = await (await fetch('/data/aero/airspace.geojson')).json();
+  map.addSource('airspace', { type: 'geojson', data });
+
+  // A wash rather than a fill: Class B shelves stack, and at full opacity the
+  // overlaps would read as darker airspace that does not exist.
+  map.addLayer({
+    id: 'airspace-fill', type: 'fill', source: 'airspace',
+    paint: {
+      'fill-color': AIRSPACE_COLOUR,
+      'fill-opacity': ['interpolate', ['linear'], ['zoom'], 5, 0, 7, 0.07],
+    },
+  });
+  map.addLayer({
+    id: 'airspace-line', type: 'line', source: 'airspace',
+    paint: {
+      'line-color': AIRSPACE_COLOUR,
+      'line-width': ['interpolate', ['linear'], ['zoom'], 5, 0.6, 10, 1.6],
+      'line-opacity': ['interpolate', ['linear'], ['zoom'], 4, 0, 6, 0.75],
+      // Only Class D is dashed. MapLibre cannot vary dashes per feature, so
+      // the D outline is a second layer rather than a data expression.
+      'line-dasharray': [1, 0],
+    },
+    filter: ['!=', ['get', 'class'], 'D'],
+  });
+  map.addLayer({
+    id: 'airspace-line-d', type: 'line', source: 'airspace',
+    paint: {
+      'line-color': AIRSPACE_COLOUR,
+      'line-width': ['interpolate', ['linear'], ['zoom'], 5, 0.6, 10, 1.4],
+      'line-opacity': ['interpolate', ['linear'], ['zoom'], 4, 0, 6, 0.75],
+      'line-dasharray': [3, 2],
+    },
+    filter: ['==', ['get', 'class'], 'D'],
+  });
+}
+
+function addRouteLayers() {
+  map.addSource('airports', { type: 'geojson', data: emptyCollection() });
+  map.addLayer({
+    id: 'airports-dot', type: 'circle', source: 'airports',
+    paint: {
+      'circle-radius': ['interpolate', ['linear'], ['zoom'], 6, 2, 10, 4.5],
+      'circle-color': '#5b7e9e', 'circle-opacity': 0.9,
+    },
+  });
+  // No MapLibre symbol layer for airport identifiers. `text-field` requires a
+  // `glyphs` URL serving font PBFs, which is a network dependency this app
+  // cannot have. Labels are drawn as HTML instead -- see renderAirportLabels.
+
+  // Published VFR waypoints, drawn magenta to match the flag symbol used on
+  // sectionals. They sit above the airport dots because they are the points a
+  // VFR route should actually be built from.
+  map.addSource('vfr', { type: 'geojson', data: emptyCollection() });
+  map.addLayer({
+    id: 'vfr-dot', type: 'circle', source: 'vfr',
+    paint: {
+      'circle-radius': ['interpolate', ['linear'], ['zoom'], 6, 2.5, 10, 5],
+      'circle-color': '#d24ba0',
+      'circle-stroke-color': '#2a1020',
+      'circle-stroke-width': 1,
+    },
+  });
+
+  map.addSource('route', { type: 'geojson', data: emptyCollection() });
+  map.addLayer({
+    id: 'route-line', type: 'line', source: 'route',
+    layout: { 'line-cap': 'round', 'line-join': 'round' },
+    paint: {
+      'line-width': 3,
+      'line-color': [
+        'match', ['get', 'phase'],
+        'climb', PHASE_COLOUR.climb,
+        'descent', PHASE_COLOUR.descent,
+        PHASE_COLOUR.cruise,
+      ],
+    },
+  });
+}
+
+const emptyCollection = () => ({ type: 'FeatureCollection', features: [] });
+
+function bindMapInteractions() {
+  map.on('moveend', refreshAirportLayer);
+
+  // Clicking an airport dot offers to add it to the route.
+  map.on('click', 'airports-dot', (event) => {
+    const f = event.features[0];
+    showAirportPopup(f.geometry.coordinates, f.properties);
+  });
+  map.on('click', 'vfr-dot', (event) => {
+    const f = event.features[0];
+    showVfrWaypointPopup(f.geometry.coordinates, f.properties);
+  });
+
+  for (const layer of ['airports-dot', 'vfr-dot']) {
+    map.on('mouseenter', layer, () => { map.getCanvas().style.cursor = 'pointer'; });
+    map.on('mouseleave', layer, () => { map.getCanvas().style.cursor = ''; });
+  }
+
+  // Naming the road under the cursor. Hover rather than click, because a click
+  // on the map inserts a waypoint and a road is not somewhere you fly to.
+  map.on('mousemove', 'highways-hit', showHighwayTooltip);
+  map.on('mouseleave', 'highways-hit', hideHighwayTooltip);
+
+  // Same idea for airspace, where the floor and ceiling are the whole point:
+  // knowing a Class B shelf is overhead means nothing without knowing at what
+  // altitude it starts.
+  map.on('mousemove', 'airspace-fill', showAirspaceTooltip);
+  map.on('mouseleave', 'airspace-fill', hideAirspaceTooltip);
+
+  // Clicking empty map inserts a free waypoint into the nearest leg.
+  map.on('click', (event) => {
+    const hits = map.queryRenderedFeatures(event.point, {
+      layers: ['airports-dot', 'vfr-dot'],
+    });
+    if (hits.length) return;
+    if (route.length < 2) return;
+    insertWaypointAt(event.lngLat);
+  });
+}
+
+async function refreshAirportLayer() {
+  if (!map.getSource('airports')) return;
+  const zoom = map.getZoom();
+  // Thin the display when zoomed out; fifteen thousand dots is not a map.
+  const minRunway = zoom < 7 ? 5000 : zoom < 9 ? 3000 : null;
+  const airports = await api.airportsInView(map.getBounds(), minRunway);
+  map.getSource('airports').setData({
+    type: 'FeatureCollection',
+    features: airports.map((a) => ({
+      type: 'Feature',
+      geometry: { type: 'Point', coordinates: [a.lon, a.lat] },
+      properties: a,
+    })),
+  });
+  renderAirportLabels(airports, zoom);
+  refreshVfrLayer(zoom);
+}
+
+async function refreshVfrLayer(zoom) {
+  if (!map.getSource('vfr')) return;
+  // There are only 663 of these nationally, so no thinning is needed the way
+  // twelve thousand airports need it. They are hidden right out at low zoom
+  // only because a scatter of unlabelled dots is noise, not information.
+  if (zoom < VFR_MIN_ZOOM) {
+    map.getSource('vfr').setData(emptyCollection());
+    renderVfrLabels([], zoom);
+    return;
+  }
+  const waypoints = await api.vfrWaypointsInView(map.getBounds());
+  map.getSource('vfr').setData({
+    type: 'FeatureCollection',
+    features: waypoints.map((w) => ({
+      type: 'Feature',
+      geometry: { type: 'Point', coordinates: [w.lon, w.lat] },
+      properties: w,
+    })),
+  });
+  renderVfrLabels(waypoints, zoom);
+}
+
+/** Identifiers, as HTML rather than a MapLibre symbol layer.
+ *  Only close in, and capped, because these are real DOM nodes. */
+let labelMarkers = [];
+let vfrLabelMarkers = [];
+const LABEL_MIN_ZOOM = 8;
+const LABEL_MAX_COUNT = 60;
+const VFR_MIN_ZOOM = 7;
+
+function renderLabels(points, className) {
+  return points.map((point) => {
+    const element = document.createElement('div');
+    element.className = className;
+    element.textContent = point.ident;
+    return new maplibregl.Marker({ element, anchor: 'top' })
+      .setLngLat([point.lon, point.lat])
+      .addTo(map);
+  });
+}
+
+function renderAirportLabels(airports, zoom) {
+  labelMarkers.forEach((m) => m.remove());
+  labelMarkers = [];
+  if (zoom < LABEL_MIN_ZOOM) return;
+  labelMarkers = renderLabels(airports.slice(0, LABEL_MAX_COUNT), 'airport-label');
+}
+
+function renderVfrLabels(waypoints, zoom) {
+  vfrLabelMarkers.forEach((m) => m.remove());
+  vfrLabelMarkers = [];
+  if (zoom < LABEL_MIN_ZOOM) return;
+  vfrLabelMarkers = renderLabels(waypoints.slice(0, LABEL_MAX_COUNT), 'vfr-label');
+}
+
+/** "I-5", "US-101", "State route 1". Natural Earth stores the bare route
+ *  number, so the prefix has to come from `level`. State routes get no state
+ *  code because the source does not carry one. */
+function highwayName(props) {
+  const number = props.name;
+  if (!number) return null;
+  if (props.level === 'Interstate') return `I-${number}`;
+  if (props.level === 'Federal') return `US-${number}`;
+  if (props.level === 'State') return `State route ${number}`;
+  return `Route ${number}`;
+}
+
+let highwayTooltip = null;
+
+function showHighwayTooltip(event) {
+  // An airport or waypoint sitting on top wins: those are clickable and the
+  // tooltip would cover what the user is reaching for.
+  const dots = map.queryRenderedFeatures(event.point, {
+    layers: ['airports-dot', 'vfr-dot'],
+  });
+  if (dots.length) return hideHighwayTooltip();
+
+  const name = highwayName(event.features[0].properties);
+  if (!name) return hideHighwayTooltip();
+
+  if (!highwayTooltip) {
+    highwayTooltip = new maplibregl.Popup({
+      closeButton: false, closeOnClick: false, className: 'highway-tip',
+      offset: 10, anchor: 'bottom',
+    });
+  }
+  highwayTooltip.setLngLat(event.lngLat).setText(name).addTo(map);
+}
+
+function hideHighwayTooltip() {
+  if (highwayTooltip) highwayTooltip.remove();
+}
+
+/** "SFC–2500" or "1000–7000", in feet. The ceiling is always MSL in the
+ *  source; the floor is either MSL or the surface, and that difference is the
+ *  one a pilot actually acts on. */
+function airspaceBand(props) {
+  const floor = props.lower_code === 'SFC' ? 'SFC' : props.lower;
+  return `${floor}–${props.upper} ft`;
+}
+
+let airspaceTooltip = null;
+
+function showAirspaceTooltip(event) {
+  const dots = map.queryRenderedFeatures(event.point, {
+    layers: ['airports-dot', 'vfr-dot'],
+  });
+  if (dots.length) return hideAirspaceTooltip();
+
+  // Shelves overlap, so report every layer under the cursor rather than the
+  // topmost one. Stacked floors are exactly what a VFR pilot is checking.
+  const seen = new Set();
+  const rows = [];
+  for (const f of map.queryRenderedFeatures(event.point, { layers: ['airspace-fill'] })) {
+    const line = `Class ${f.properties.class} · ${airspaceBand(f.properties)}`;
+    if (seen.has(line)) continue;
+    seen.add(line);
+    rows.push({ line, name: f.properties.name });
+  }
+  if (!rows.length) return hideAirspaceTooltip();
+
+  const node = document.createElement('div');
+  node.innerHTML = rows
+    .map((r) => `<div class="airspace-row"><b>${r.line}</b><br>${r.name}</div>`)
+    .join('');
+
+  if (!airspaceTooltip) {
+    airspaceTooltip = new maplibregl.Popup({
+      closeButton: false, closeOnClick: false, className: 'airspace-tip',
+      offset: 12, anchor: 'bottom',
+    });
+  }
+  airspaceTooltip.setLngLat(event.lngLat).setDOMContent(node).addTo(map);
+}
+
+function hideAirspaceTooltip() {
+  if (airspaceTooltip) airspaceTooltip.remove();
+}
+
+function showVfrWaypointPopup(coordinates, props) {
+  const node = document.createElement('div');
+  node.innerHTML =
+    `<div class="popup-title vfr">${props.ident}</div>` +
+    `<div class="popup-meta">Published VFR checkpoint` +
+    `${props.region ? ` · ${props.region}` : ''}<br>` +
+    `What it marks is printed on the sectional</div>` +
+    `<div class="popup-actions"><button type="button">Add to route</button></div>`;
+  const popup = new maplibregl.Popup({ closeButton: false })
+    .setLngLat(coordinates).setDOMContent(node).addTo(map);
+  node.querySelector('button').addEventListener('click', () => {
+    addWaypoint({
+      name: props.ident,
+      lat: props.lat, lon: props.lon,
+      kind: 'vfr_waypoint',
+      // Null, not zero: a VFR waypoint has no elevation, and the navlog
+      // refuses a route whose endpoints lack one. That refusal is correct --
+      // you cannot depart from a bridge -- and it depends on this staying null.
+      elevation_ft: null,
+      label: props.label,
+    });
+    popup.remove();
+  });
+}
+
+function showAirportPopup(coordinates, props) {
+  const runway = props.longest_runway_ft
+    ? `${Math.round(props.longest_runway_ft)} ft runway` : 'runway length unknown';
+  const node = document.createElement('div');
+  node.innerHTML =
+    `<div class="popup-title">${props.ident}</div>` +
+    `<div class="popup-meta">${props.name}<br>` +
+    `${Math.round(props.elevation_ft)} ft elev · ${runway}</div>` +
+    `<div class="popup-actions"><button type="button">Add to route</button></div>`;
+  const popup = new maplibregl.Popup({ closeButton: false })
+    .setLngLat(coordinates).setDOMContent(node).addTo(map);
+  node.querySelector('button').addEventListener('click', () => {
+    addWaypoint({
+      name: props.ident,
+      lat: props.lat, lon: props.lon,
+      kind: 'airport',
+      elevation_ft: props.elevation_ft,
+      label: props.label,
+    });
+    popup.remove();
+  });
+}
+
+// --- route editing ------------------------------------------------------
+
+function addWaypoint(waypoint) {
+  // A new point asks the planner what its leg should do. In user-driven mode
+  // the pilot has to answer before the plan will build, which is the intended
+  // prompt rather than an error to avoid.
+  route.push({ segment_type: 'automatic', generated: false, ...waypoint });
+  onRouteChanged();
+  fitRoute();
+}
+
+/** Frame the whole route. Called when waypoints are added or removed, but
+ *  deliberately not while dragging a marker -- the map moving under the
+ *  cursor mid-drag is disorienting. */
+function fitRoute() {
+  if (route.length < 2) return;
+  const bounds = route.reduce(
+    (b, w) => b.extend([w.lon, w.lat]),
+    new maplibregl.LngLatBounds([route[0].lon, route[0].lat], [route[0].lon, route[0].lat]),
+  );
+  map.fitBounds(bounds, { padding: 80, maxZoom: 10, duration: 600 });
+}
+
+/** Insert a clicked point into whichever leg it lies closest to. */
+function insertWaypointAt(lngLat) {
+  let bestLeg = 0;
+  let bestDistance = Infinity;
+  for (let i = 0; i < route.length - 1; i += 1) {
+    const d = distanceToSegment(lngLat, route[i], route[i + 1]);
+    if (d < bestDistance) { bestDistance = d; bestLeg = i; }
+  }
+  route.splice(bestLeg + 1, 0, {
+    name: `WP${route.length - 1}`,
+    lat: +lngLat.lat.toFixed(5),
+    lon: +lngLat.lng.toFixed(5),
+    kind: 'waypoint',
+    elevation_ft: null,
+  });
+  onRouteChanged();
+}
+
+/** Planar point-to-segment distance, with longitude scaled by latitude.
+ *  Only used to pick which leg a click belongs to, so exactness is wasted. */
+function distanceToSegment(point, a, b) {
+  const k = Math.cos((a.lat * Math.PI) / 180);
+  const px = point.lng * k, py = point.lat;
+  const ax = a.lon * k, ay = a.lat;
+  const bx = b.lon * k, by = b.lat;
+  const dx = bx - ax, dy = by - ay;
+  const lengthSq = dx * dx + dy * dy;
+  const t = lengthSq === 0 ? 0 : Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / lengthSq));
+  return Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
+}
+
+function removeWaypoint(index) {
+  route.splice(index, 1);
+  onRouteChanged();
+  fitRoute();
+}
+
+function moveWaypoint(from, to) {
+  const [item] = route.splice(from, 1);
+  route.splice(to, 0, item);
+  onRouteChanged();
+}
+
+function onRouteChanged() {
+  // Row edits are keyed by row index and a route change can renumber the rows,
+  // but which ones it renumbered is only knowable once the next plan comes
+  // back -- `pruneOverrides` does it there, per row, against the leg each edit
+  // was typed on.
+  //
+  // The derived pressure and density altitudes are
+  // indexed by route position, and the next plan is what re-earns them.
+  if (fieldAir.length !== route.length) fieldAir = [];
+  clearConsistency();
+  renderWaypointList();
+  renderMarkers();
+  renderRouteLine();
+  requestPlan();
+}
+
+// --- rendering ----------------------------------------------------------
+
+/** Below this, the ground is close enough that the air at it is a question.
+ *  Above it the FD levels are pressure altitudes already and carry their own
+ *  temperatures, so a field altimeter setting has nothing left to say. */
+const LOW_ALTITUDE_FT = 3000;
+
+/** Whether this waypoint is somewhere the air *at the ground* matters.
+ *
+ *  Every airport, because one may become a stop and all of them report; the
+ *  departure and destination whatever they are, because a strip with no
+ *  database entry still has to be got out of; and any point crossed low,
+ *  where an elevation and a temperature are what make the density altitude
+ *  beside it mean anything.
+ */
+function isFieldPoint(waypoint, index) {
+  if (waypoint.generated) return false;
+  if (index === 0 || index === route.length - 1) return true;
+  if (waypoint.kind === 'airport' || waypoint.is_landing) return true;
+  if (waypoint.elevation_ft != null) return true;
+  return waypoint.altitude_ft != null && waypoint.altitude_ft < LOW_ALTITUDE_FT;
+}
+
+/** Field elevation, altimeter setting and temperature, plus what they work
+ *  out to.
+ *
+ *  The elevation is editable even for an airport whose figure came from the
+ *  database: the database is a stopgap, a private strip is not in it at all,
+ *  and a takeoff distance read at the wrong field elevation is wrong in the
+ *  direction that matters. Blank means "use the published figure" for an
+ *  airport and "unknown" for anything else.
+ *
+ *  Altimeter setting and temperature both fall back to the route-wide figures
+ *  when left blank, which the placeholders say. Departure and destination are
+ *  often an hour and a different airmass apart, so each gets its own.
+ */
+function fieldBlock(waypoint, index) {
+  if (!isFieldPoint(waypoint, index)) return '';
+  return `<div class="coords field">` +
+    `<label title="Field or ground elevation, in feet MSL">Elev` +
+      `<input class="elev-in" type="number" step="1" min="-1500" max="15000" ` +
+        `placeholder="${waypoint.kind === 'airport' ? 'published' : 'unknown'}" ` +
+        `value="${waypoint.elevation_ft ?? ''}"></label>` +
+    `<label title="Field altimeter setting, off this station's METAR or ATIS">` +
+      `Alt&nbsp;set<input class="qnh" type="number" step="0.01" min="27" max="32" ` +
+        `placeholder="route" value="${waypoint.altimeter_inhg ?? ''}"></label>` +
+    `<label title="Field temperature">OAT °C` +
+      `<input class="oat" type="number" step="1" min="-40" max="55" ` +
+        `placeholder="ISA" value="${waypoint.oat_c ?? ''}"></label>` +
+    `</div>` +
+    // Filled in from the last plan, so the pressure and density altitude the
+    // engine computed are the ones shown -- there is no second implementation
+    // of the atmosphere in the browser to drift from it.
+    `<div class="field-air" data-index="${index}">${fieldAirText(index)}</div>`;
+}
+
+/** The derived line under one waypoint's field inputs, or empty. */
+function fieldAirText(index) {
+  const air = fieldAir[index];
+  if (!air || air.pressure_altitude_ft == null) return '';
+  const ft = (v) => `${Math.round(v).toLocaleString()} ft`;
+  return `PA ${ft(air.pressure_altitude_ft)} · ` +
+    `<strong>DA ${ft(air.density_altitude_ft)}</strong> ` +
+    `<span class="from">at ${air.altimeter_inhg.toFixed(2)} inHg, ` +
+    `${Math.round(air.oat_c)} °C</span>`;
+}
+
+/** Repaint the derived lines in place after a plan.
+ *
+ *  In place rather than by re-rendering the list: the pilot is often still
+ *  typing in another box when the debounced plan comes back, and rebuilding
+ *  the sidebar under them would take the caret with it.
+ */
+function renderFieldAir() {
+  for (const node of document.querySelectorAll('.field-air')) {
+    node.innerHTML = fieldAirText(+node.dataset.index);
+  }
+}
+
+function renderWaypointList() {
+  const list = $('waypoints');
+  list.innerHTML = '';
+  route.forEach((waypoint, index) => {
+    const li = document.createElement('li');
+    li.draggable = true;
+    li.dataset.index = index;
+    // Colours the identifier magenta for a VFR checkpoint, matching the map.
+    li.classList.add(`kind-${waypoint.kind}`);
+    // A TOC/TOD the planner inserted, dimmed because it is not the pilot's.
+    if (waypoint.generated) li.classList.add('generated');
+    // Only an intermediate airport can be a stop: the first and last points
+    // are always a departure and a destination, and are landed at anyway.
+    const canLand = waypoint.kind === 'airport'
+      && index > 0 && index < route.length - 1;
+    const landing = canLand
+      ? `<label class="landing" title="Land here — adds a descent in and a climb out">` +
+        `<input type="checkbox" ${waypoint.is_landing ? 'checked' : ''}> stop</label>`
+      : '';
+    // What the leg *arriving* here does. The first waypoint is departed from,
+    // never arrived at, so it has no segment of its own.
+    const type = waypoint.segment_type || 'automatic';
+    // In user-driven mode "automatic" is not a choice, but it is still what a
+    // freshly added point holds. It gets a placeholder rather than nothing, so
+    // the box shows an unanswered question instead of silently reading
+    // "climb" while the route is really undeclared and will refuse to plan.
+    const segment = index === 0
+      ? ''
+      : `<select class="segment seg-${type}" ` +
+        `title="What the leg arriving here does about altitude">` +
+        (planningMode === 'auto'
+          ? `<option value="automatic" ${type === 'automatic' ? 'selected' : ''}>auto</option>`
+          : (type === 'automatic'
+            ? `<option value="automatic" selected disabled>choose…</option>`
+            : '')) +
+        SEGMENT_TYPES.map((t) =>
+          `<option value="${t}" ${type === t ? 'selected' : ''}>${t}</option>`).join('') +
+        `</select>`;
+    const role = waypoint.generated ? `<span class="role">${waypoint.name}</span>` : '';
+    // An airport's position comes from the database and is not ours to move.
+    // A point dropped on the map is arbitrary, so it can be typed exactly --
+    // off a chart, or to place a fix on an airway intersection.
+    const freeform = waypoint.kind !== 'airport';
+    const coords = freeform
+      ? `<div class="coords">` +
+        `<label>Lat<input class="lat" type="number" step="0.0001" ` +
+          `min="-90" max="90" value="${waypoint.lat}"></label>` +
+        `<label>Lon<input class="lon" type="number" step="0.0001" ` +
+          `min="-180" max="180" value="${waypoint.lon}"></label>` +
+        `<label title="Cross this point at this altitude">Cross` +
+          `<input class="alt" type="number" step="500" min="0" max="17999" ` +
+            `placeholder="cruise" value="${waypoint.altitude_ft ?? ''}"></label>` +
+        `</div>`
+      : `<div class="coords readonly">` +
+          `${waypoint.lat.toFixed(4)}, ${waypoint.lon.toFixed(4)}</div>`;
+    li.innerHTML =
+      `<div class="wp-row">` +
+        `<span class="drag">⠿</span>` +
+        `<span class="seq">${index + 1}</span>` +
+        `<span class="name">${waypoint.name}</span>` +
+        segment +
+        landing +
+        `<button class="remove" type="button" title="Remove">×</button>` +
+      `</div>` + coords + fieldBlock(waypoint, index);
+    li.querySelector('.remove').addEventListener('click', () => removeWaypoint(index));
+
+    {
+      const bind = (selector, apply) => {
+        const input = li.querySelector(selector);
+        if (!input) return;
+        input.addEventListener('change', () => {
+          const raw = input.value.trim();
+          const value = raw === '' ? null : Number(raw);
+          if (value !== null && !Number.isFinite(value)) return;
+          if (!apply(value)) return;
+          onRouteChanged();
+        });
+        // Typing in a field must not start a drag-reorder of the row.
+        input.addEventListener('mousedown', (e) => e.stopPropagation());
+        input.draggable = false;
+      };
+      bind('.lat', (v) => {
+        if (v === null || v < -90 || v > 90) return false;
+        waypoint.lat = v; return true;
+      });
+      bind('.lon', (v) => {
+        if (v === null || v < -180 || v > 180) return false;
+        waypoint.lon = v; return true;
+      });
+      // Blank means "no constraint" -- fly the route's cruise altitude.
+      bind('.alt', (v) => { waypoint.altitude_ft = v; return true; });
+      // Below sea level is real (Death Valley), above 15000 ft is not a field
+      // this airplane is leaving from.
+      bind('.elev-in', (v) => {
+        if (v !== null && (v < -1500 || v > 15000)) return false;
+        waypoint.elevation_ft = v;
+        return true;
+      });
+      // Blank means "use the route's weather" for this field.
+      bind('.qnh', (v) => {
+        if (v !== null && (v < 27 || v > 32)) return false;
+        waypoint.altimeter_inhg = v;
+        // The setting the pilot just read off the departure ATIS is almost
+        // always the one to fly the whole route on. Offered only while the
+        // route field is still at standard, so it never overwrites a figure
+        // somebody chose.
+        if (v !== null && index === 0 && +$('altimeter').value === 29.92) {
+          $('altimeter').value = v;
+        }
+        return true;
+      });
+      bind('.oat', (v) => { waypoint.oat_c = v; return true; });
+    }
+    const picker = li.querySelector('select.segment');
+    if (picker) {
+      picker.addEventListener('change', () => {
+        waypoint.segment_type = picker.value;
+        // Choosing a type for a planner-inserted point makes it the pilot's,
+        // so the next resolve keeps it instead of discarding and re-deriving.
+        if (waypoint.generated) {
+          waypoint.generated = false;
+          waypoint.kind = 'waypoint';
+        }
+        // The profile changes shape here, but not necessarily under every
+        // row: the next plan drops the edits whose legs actually moved.
+        onRouteChanged();
+      });
+      picker.addEventListener('mousedown', (e) => e.stopPropagation());
+      picker.draggable = false;
+    }
+    const box = li.querySelector('.landing input');
+    if (box) {
+      box.addEventListener('change', () => {
+        waypoint.is_landing = box.checked;
+        // A stop changes which rows exist; the next plan drops the edits
+        // whose legs went with them and keeps the rest.
+        onRouteChanged();
+      });
+    }
+    bindDragToReorder(li);
+    list.appendChild(li);
+  });
+  $('route-hint').hidden = route.length >= 2;
+}
+
+let dragFrom = null;
+function bindDragToReorder(li) {
+  li.addEventListener('dragstart', () => {
+    dragFrom = +li.dataset.index;
+    li.classList.add('dragging');
+  });
+  li.addEventListener('dragend', () => li.classList.remove('dragging'));
+  li.addEventListener('dragover', (e) => e.preventDefault());
+  li.addEventListener('drop', (e) => {
+    e.preventDefault();
+    const to = +li.dataset.index;
+    if (dragFrom !== null && dragFrom !== to) moveWaypoint(dragFrom, to);
+    dragFrom = null;
+  });
+}
+
+function renderMarkers() {
+  markers.forEach((m) => m.remove());
+  markers = route.map((waypoint, index) => {
+    const element = document.createElement('div');
+    const isEndpoint = index === 0 || index === route.length - 1;
+    element.className = `marker${isEndpoint ? ' endpoint' : ''}`;
+    const label = document.createElement('div');
+    label.className = 'marker-label';
+    label.textContent = waypoint.name;
+    element.appendChild(label);
+
+    const marker = new maplibregl.Marker({ element, draggable: true })
+      .setLngLat([waypoint.lon, waypoint.lat])
+      .addTo(map);
+    marker.on('dragend', () => {
+      const position = marker.getLngLat();
+      route[index].lat = +position.lat.toFixed(5);
+      route[index].lon = +position.lng.toFixed(5);
+      // Dragging an airport off its published position makes it a plain
+      // waypoint; keeping the identifier would be a lie.
+      if (route[index].kind === 'airport' && index !== 0 && index !== route.length - 1) {
+        route[index].kind = 'waypoint';
+      }
+      onRouteChanged();
+    });
+    return marker;
+  });
+}
+
+function renderRouteLine() {
+  if (!map.getSource('route')) return;
+  const features = [];
+
+  // Draw from the plan's legs when there is one. The plan contains top of
+  // climb and top of descent, which the raw route does not, so its leg list
+  // is longer -- indexing the route by leg number would paint the whole line
+  // the colour of the first phase.
+  if (lastPlan?.ok) {
+    for (const leg of lastPlan.legs) {
+      // Taxi and pattern rows sit at a single point; drawing them would put a
+      // zero-length line under the airport marker.
+      if (!leg.covers_ground) continue;
+      features.push({
+        type: 'Feature',
+        properties: { phase: leg.phase },
+        geometry: {
+          type: 'LineString',
+          coordinates: [[leg.from_lon, leg.from_lat], [leg.to_lon, leg.to_lat]],
+        },
+      });
+    }
+  } else {
+    for (let i = 0; i < route.length - 1; i += 1) {
+      features.push({
+        type: 'Feature',
+        properties: { phase: 'cruise' },
+        geometry: {
+          type: 'LineString',
+          coordinates: [[route[i].lon, route[i].lat], [route[i + 1].lon, route[i + 1].lat]],
+        },
+      });
+    }
+  }
+  map.getSource('route').setData({ type: 'FeatureCollection', features });
+  renderPhaseMarkers();
+}
+
+/** Small markers at top of climb and top of descent. */
+let phaseMarkers = [];
+function renderPhaseMarkers() {
+  phaseMarkers.forEach((m) => m.remove());
+  phaseMarkers = [];
+  if (!lastPlan?.ok) return;
+  for (const leg of lastPlan.legs) {
+    // Match the role rather than the name, so a numbered TOC2 on a
+    // multi-stop day gets a marker too, and a charted point nominated as the
+    // top of climb is marked under its own name.
+    if (!leg.end_role) continue;
+    const element = document.createElement('div');
+    element.className = 'marker phase';
+    const label = document.createElement('div');
+    label.className = 'marker-label dim';
+    label.textContent = legLabel(leg.to, leg.end_role);
+    element.appendChild(label);
+    phaseMarkers.push(
+      new maplibregl.Marker({ element }).setLngLat([leg.to_lon, leg.to_lat]).addTo(map),
+    );
+  }
+}
+
+// --- manual row edits ---------------------------------------------------
+//
+// Keyed by row index, which is what the engine's `overrides` map wants -- but
+// a row index is only a position, and positions move. Each entry therefore
+// also remembers the leg it was typed on (the two points and the phase), and
+// every plan checks that the row at that index is still that leg. An edit
+// survives anything that leaves its leg alone -- a field temperature, an
+// altimeter setting, a waypoint dragged somewhere else -- and is dropped, with
+// a notice, only when the leg it belonged to is gone. Wind is entered here and
+// nowhere else, so silently reapplying one to a different leg would be worse
+// than losing it, and silently losing it is what made the table unusable.
+//
+// Each value is `{ leg, fields }`: `leg` the signature below, `fields` the
+// numbers the pilot typed.
+
+let overrides = new Map();
+
+/** What makes a navlog row itself: where it goes, and what it is doing. */
+function legSignature(leg) {
+  return leg ? `${leg.from}>${leg.to}|${leg.phase}` : null;
+}
+
+/** Rows dropped by the last prune, for the notice under the table. */
+let droppedRows = [];
+
+/** Drop every edit whose leg is no longer at the index it was typed at.
+ *
+ *  Returns true if anything went, in which case the plan on screen was built
+ *  with an edit that has since been withdrawn and has to be built again.
+ */
+function pruneOverrides(plan) {
+  if (!overrides.size) return false;
+  const legs = plan?.ok ? plan.legs : null;
+  if (!legs) return false;
+  const gone = [...overrides.entries()].filter(
+    ([row, entry]) => entry.leg !== null && legSignature(legs[row]) !== entry.leg,
+  );
+  if (!gone.length) return false;
+  gone.forEach(([row]) => overrides.delete(row));
+  droppedRows = gone.map(([row]) => row + 1);
+  $('reset-edits').hidden = overrides.size === 0;
+  return true;
+}
+
+// Committing an edit replans, which rebuilds the whole table and destroys the
+// input the pilot was typing in. Remember where the cursor was so it can be
+// put back, or tabbing from wind direction to wind speed silently drops focus
+// and the next keystrokes go nowhere.
+let focusedCell = null;
+const FIELD_CLASS = {
+  wind_from_deg: 'wind-dir',
+  wind_speed_kt: 'wind-speed',
+  tas_kt: 'tas',
+  altitude_ft: 'alt',
+  oat_c: 'oat',
+  pressure_altitude_ft: 'pa',
+};
+
+/** A waypoint name with its top-of-climb/descent role beside it.
+ *
+ *  `TOC` alone where the planner invented the point, `KWVI (TOC)` where the
+ *  pilot nominated a charted one -- the name on the sectional is what they
+ *  will be looking for, so it is never replaced.
+ */
+function legLabel(name, role) {
+  return !role || name === role ? name : `${name} (${role})`;
+}
+
+function restoreFocus() {
+  if (!focusedCell) return;
+  const { row, field, start, end } = focusedCell;
+  const tr = document.querySelectorAll('#navlog tbody tr')[row];
+  const input = tr && tr.querySelector(`td.${FIELD_CLASS[field]} input`);
+  if (!input) { focusedCell = null; return; }
+  input.focus();
+  try { input.setSelectionRange(start, end); } catch { /* number inputs vary */ }
+}
+
+function clearOverrides() {
+  droppedRows = [];
+  if (overrides.size === 0) return;
+  overrides = new Map();
+  const reset = $('reset-edits');
+  if (reset) reset.hidden = true;
+}
+
+/** Drop the consistency verdict. Called whenever the route changes, so a
+ *  clean bill of health never outlives the plan it was given for. */
+function clearConsistency() {
+  if (consistencyReport === null) return;
+  consistencyReport = null;
+  renderConsistency(null);
+}
+
+function setOverride(row, field, value) {
+  const entry = overrides.get(row) || {
+    // The leg this number is about, taken from the plan the pilot is looking
+    // at as they type it.
+    leg: legSignature(lastPlan?.ok ? lastPlan.legs[row] : null),
+    fields: {},
+  };
+  if (value === null) {
+    delete entry.fields[field];
+  } else {
+    entry.fields[field] = value;
+  }
+  if (Object.keys(entry.fields).length === 0) {
+    overrides.delete(row);
+  } else {
+    overrides.set(row, entry);
+  }
+  $('reset-edits').hidden = overrides.size === 0;
+  requestPlan();
+}
+
+function overridesPayload() {
+  return [...overrides.entries()].map(([row, entry]) => ({ row, ...entry.fields }));
+}
+
+/** Turn a table cell into a number the pilot can type over. */
+function makeEditable(cell, { row, field, value, format, title }) {
+  cell.classList.add('editable');
+  cell.title = title;
+  const edited = overrides.get(row)?.fields[field] != null;
+  if (edited) cell.classList.add('edited');
+
+  const input = document.createElement('input');
+  input.type = 'number';
+  input.value = format(value);
+  input.setAttribute('aria-label', title);
+  cell.textContent = '';
+  cell.appendChild(input);
+
+  const commit = () => {
+    const raw = input.value.trim();
+    const next = raw === '' ? null : Number(raw);
+    if (next !== null && !Number.isFinite(next)) return;
+    setOverride(row, field, next);
+  };
+  input.addEventListener('focus', () => {
+    focusedCell = { row, field, start: 0, end: input.value.length };
+  });
+  input.addEventListener('select', () => {
+    if (focusedCell) {
+      focusedCell.start = input.selectionStart ?? 0;
+      focusedCell.end = input.selectionEnd ?? 0;
+    }
+  });
+  input.addEventListener('change', commit);
+  input.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') { focusedCell = null; input.blur(); }
+    if (event.key === 'Escape') { focusedCell = null; setOverride(row, field, null); }
+  });
+}
+
+// --- planning -----------------------------------------------------------
+
+let planTimer = null;
+function requestPlan() {
+  clearTimeout(planTimer);
+  // Debounced so dragging a marker does not fire a request per frame.
+  planTimer = setTimeout(runPlan, 180);
+}
+
+/** The plan request for the current route and form. Shared by the plan call
+ *  and the consistency check, so the two can never describe different flights. */
+function planBody() {
+  return {
+    waypoints: route.map((w) => ({
+      name: w.name, lat: w.lat, lon: w.lon, kind: w.kind,
+      elevation_ft: w.elevation_ft, ident: w.name,
+      is_landing: !!w.is_landing,
+      altitude_ft: w.altitude_ft ?? null,
+      segment_type: w.segment_type || 'automatic',
+      generated: !!w.generated,
+      altimeter_inhg: w.altimeter_inhg ?? null,
+      oat_c: w.oat_c ?? null,
+    })),
+    planning_mode: planningMode,
+    overrides: overridesPayload(),
+    runway_margin: +$('runway-margin').value / 100,
+    fuel_margin: +$('fuel-margin').value / 100,
+    cruise_altitude_ft: +$('altitude').value,
+    cruise_rpm: +$('rpm').value,
+    weight_lb: +$('weight').value,
+    fuel_on_board_gal: +$('fuel').value,
+    altimeter_inhg: +$('altimeter').value,
+    isa_deviation_c: +$('isadev').value,
+    night: $('night').checked,
+    // No route-wide wind: it is typed on the navlog row it applies to, and
+    // travels to the engine in `overrides`.
+  };
+}
+
+async function runPlan() {
+  if (route.length < 2) {
+    lastPlan = null;
+    adoptFieldAir(null);
+    renderNavlog(null);
+    return;
+  }
+  setStatus('Planning…');
+  // The notice below the table belongs to the plan that dropped the edits and
+  // to no later one, so it starts every plan empty.
+  droppedRows = [];
+  lastPlan = await api.plan(planBody());
+  // An edit whose leg is gone was still sent, so this plan was built with a
+  // number that no longer applies to the row it landed on. Drop it and plan
+  // again rather than show it: one extra round trip against a wind on the
+  // wrong leg is not a trade.
+  if (pruneOverrides(lastPlan)) {
+    lastPlan = await api.plan(planBody());
+  }
+  // Before adopting: adoption may re-render the sidebar, and the derived
+  // lines should already be right when it does.
+  adoptFieldAir(lastPlan?.ok ? lastPlan.resolved_waypoints : null);
+  if (lastPlan?.ok) adoptResolvedRoute(lastPlan.resolved_waypoints);
+  renderFieldAir();
+  renderNavlog(lastPlan);
+  renderRouteLine();
+  // renderNavlog owns the status when it refuses, so it can say why.
+  if (lastPlan?.ok) setStatus('Ready — offline');
+}
+
+/** Keep the pressure and density altitude the engine computed at each field.
+ *
+ *  Indexed by position in the resolved route, which is the route the sidebar
+ *  is about to show. A refused plan clears them rather than leaving yesterday's
+ *  density altitude under today's temperature.
+ */
+function adoptFieldAir(resolved) {
+  fieldAir = Array.isArray(resolved)
+    ? resolved.map((w) => ({
+      altimeter_inhg: w.field_altimeter_inhg,
+      oat_c: w.field_oat_c,
+      pressure_altitude_ft: w.field_pressure_altitude_ft,
+      density_altitude_ft: w.field_density_altitude_ft,
+    }))
+    : [];
+}
+
+/** Take the planner's TOC/TOD points into the route the pilot is editing.
+ *
+ *  Only rewrites the list when it actually differs, because rewriting it
+ *  re-renders the sidebar and would fight with whatever the pilot is typing.
+ *  Safe to do on every plan: the engine strips its own generated points before
+ *  re-resolving, so this cannot compound.
+ */
+function adoptResolvedRoute(resolved) {
+  if (!Array.isArray(resolved) || !resolved.length) return;
+  const same = resolved.length === route.length && resolved.every((w, i) =>
+    w.name === route[i].name
+    && !!w.generated === !!route[i].generated
+    && (w.segment_type || 'automatic') === (route[i].segment_type || 'automatic'));
+  if (same) return;
+  route = resolved.map((w, i) => ({
+    // Keep anything of the pilot's the engine does not round-trip.
+    ...(w.generated ? {} : route.find((r) => r.name === w.name) || {}),
+    name: w.name, lat: w.lat, lon: w.lon, kind: w.kind,
+    elevation_ft: w.elevation_ft,
+    is_landing: !!w.is_landing,
+    altitude_ft: w.altitude_ft,
+    segment_type: w.segment_type,
+    generated: !!w.generated,
+    altimeter_inhg: w.altimeter_inhg,
+    oat_c: w.oat_c,
+  }));
+  renderWaypointList();
+  renderMarkers();
+}
+
+function renderNavlog(plan) {
+  const body = document.querySelector('#navlog tbody');
+  const foot = document.querySelector('#navlog tfoot');
+  const empty = $('navlog-empty');
+  body.innerHTML = '';
+  foot.innerHTML = '';
+  $('summary-block').hidden = true;
+  $('warnings').innerHTML = '';
+  // Cleared up front, not on the success path, so that every early return
+  // below leaves it hidden. A stale "GO" beside a route that would not plan is
+  // the single most dangerous thing this screen could show.
+  renderChecklist(null);
+
+  if (!plan) {
+    empty.hidden = false;
+    empty.className = 'hint';
+    empty.textContent = 'Add at least two waypoints to build a navigation log.';
+    return;
+  }
+  if (!plan.ok) {
+    // A refusal to plan is a result, not a blank screen. Styled as an alert
+    // and echoed into the status bar, because "Ready" beside an empty table
+    // reads as "nothing to show" rather than "here is what is wrong".
+    empty.hidden = false;
+    empty.className = 'alert';
+    empty.textContent = plan.error;
+    setStatus('Cannot plan this route');
+    return;
+  }
+  empty.className = 'hint';
+  empty.hidden = true;
+
+  const round = (v, d = 0) => v.toFixed(d);
+  plan.legs.forEach((leg, row) => {
+    const tr = document.createElement('tr');
+    if (leg.overridden.length) tr.classList.add('row-edited');
+
+    // Taxi and the traffic pattern cost time and fuel without covering
+    // ground, so they get a row -- the fuel column adds up to the total --
+    // but every navigation column on it is a dash rather than a number that
+    // looks flyable. Nothing on the row is editable either.
+    if (!leg.covers_ground) {
+      tr.classList.add('row-ground');
+      tr.innerHTML =
+        `<td>${leg.from}</td><td></td><td></td><td></td>` +
+        `<td class="phase-${leg.phase}">${leg.phase}</td>` +
+        `<td class="num">${round(leg.altitude_ft)}</td>` +
+        // The air is real even where the row goes nowhere: this is the field's
+        // density altitude, the one the takeoff distance was read at.
+        `<td class="num">${round(leg.oat_c)}</td>` +
+        `<td class="num">${round(leg.pressure_altitude_ft)}</td>` +
+        `<td class="num">${round(leg.density_altitude_ft)}</td>` +
+        // Course through ground speed, plus distance: ten columns of nothing.
+        '<td class="num">—</td>'.repeat(10) +
+        `<td class="num">${round(leg.ete_min, 1)}</td>` +
+        `<td class="num">${round(leg.fuel_gal, 1)}</td>` +
+        `<td class="num">${round(leg.fuel_remaining_gal, 1)}</td>`;
+      body.appendChild(tr);
+      return;
+    }
+
+    tr.innerHTML =
+      `<td>${legLabel(leg.from, leg.start_role)}</td>` +
+      `<td>${legLabel(leg.to, leg.end_role)}</td>` +
+      // Read-only here: a navlog row may start at a synthetic TOC or TOD,
+      // which has no independent existence to move. Arbitrary waypoints are
+      // edited in the route list, where they actually live.
+      `<td class="num coord">${leg.from_lat.toFixed(4)}</td>` +
+      `<td class="num coord">${leg.from_lon.toFixed(4)}</td>` +
+      `<td class="phase-${leg.phase}">${leg.phase}</td>` +
+      `<td class="num alt"></td>` +
+      `<td class="num oat"></td>` +
+      `<td class="num pa"></td>` +
+      // Derived, never typed: whatever pressure altitude and temperature the
+      // row ends up with, this follows from the pair of them.
+      `<td class="num">${round(leg.density_altitude_ft)}</td>` +
+      // The full chain a pilot works through: true course, crab into wind for
+      // true heading, then variation for the magnetic heading actually flown.
+      `<td class="num">${round(leg.true_course_deg).padStart(3, '0')}</td>` +
+      `<td class="num">${leg.wind_correction_angle_deg >= 0 ? '+' : ''}` +
+        `${round(leg.wind_correction_angle_deg, 1)}</td>` +
+      `<td class="num">${round(leg.true_heading_deg).padStart(3, '0')}</td>` +
+      `<td class="num">${leg.variation_deg >= 0 ? '+' : ''}${round(leg.variation_deg, 1)}</td>` +
+      `<td class="num">${round(leg.magnetic_heading_deg).padStart(3, '0')}</td>` +
+      `<td class="num wind-dir"></td>` +
+      `<td class="num wind-speed"></td>` +
+      `<td class="num tas"></td>` +
+      `<td class="num">${round(leg.ground_speed_kt)}</td>` +
+      `<td class="num">${round(leg.distance_nm, 1)}</td>` +
+      `<td class="num">${round(leg.ete_min, 1)}</td>` +
+      `<td class="num">${round(leg.fuel_gal, 1)}</td>` +
+      `<td class="num">${round(leg.fuel_remaining_gal, 1)}</td>`;
+
+    // The cells the pilot can overwrite. Everything else on the row is
+    // derived from them and recomputes on the next plan.
+    makeEditable(tr.querySelector('.wind-dir'), {
+      row, field: 'wind_from_deg', value: leg.wind_from_deg,
+      format: (v) => Math.round(v),
+      title: 'Wind direction on this leg, degrees true. Blank for calm.',
+    });
+    makeEditable(tr.querySelector('.wind-speed'), {
+      row, field: 'wind_speed_kt', value: leg.wind_speed_kt,
+      format: (v) => Math.round(v),
+      title: 'Wind speed on this leg, knots. Blank for calm.',
+    });
+    // The altitude this leg *ends* at, which carries forward to every row
+    // after it -- editing the top of a climb re-flies the rest of the plan.
+    makeEditable(tr.querySelector('.alt'), {
+      row, field: 'altitude_ft',
+      value: leg.exit_altitude_ft ?? leg.altitude_ft,
+      format: (v) => Math.round(v),
+      title: 'Altitude at the end of this leg. Blank to compute it again.',
+    });
+    // Temperature is the odd one out: it describes the air, not the row, so
+    // it joins the field temperatures in the flight's profile and lapses into
+    // the legs above and below rather than stopping at this one.
+    makeEditable(tr.querySelector('.oat'), {
+      row, field: 'oat_c', value: leg.oat_c,
+      format: (v) => Math.round(v),
+      title: 'Outside air temperature at this altitude, °C — the FD forecast '
+        + 'figure for this part of the route. It lapses into the rows above '
+        + 'and below. Blank to go back to the standard lapse.',
+    });
+    // Pressure altitude, which the route's altimeter setting normally decides.
+    // Typing one says the air over this leg does not match that setting; the
+    // density altitude beside it and the charts this row reads follow.
+    makeEditable(tr.querySelector('.pa'), {
+      row, field: 'pressure_altitude_ft', value: leg.pressure_altitude_ft,
+      format: (v) => Math.round(v),
+      title: 'Pressure altitude of this row\'s air, ft — what the altimeter '
+        + 'reads with 29.92 set. Density altitude and this row\'s chart '
+        + 'readings follow from it. Blank to take it from the altimeter '
+        + 'setting again.',
+    });
+    makeEditable(tr.querySelector('.tas'), {
+      row, field: 'tas_kt', value: leg.tas_kt,
+      format: (v) => Math.round(v),
+      title: 'True airspeed, knots. Blank to go back to the POH figure.',
+    });
+    body.appendChild(tr);
+  });
+
+  const t = plan.totals;
+  const tr = document.createElement('tr');
+  tr.innerHTML =
+    `<td colspan="18">Total</td>` +
+    `<td class="num">${round(t.distance_nm, 1)}</td>` +
+    `<td class="num">${round(t.time_min, 1)}</td>` +
+    `<td class="num">${round(t.fuel_gal, 1)}</td>` +
+    `<td class="num">${round(t.fuel_remaining_gal, 1)}</td>`;
+  foot.appendChild(tr);
+
+  renderSummary(plan);
+  renderChecklist(plan.checklist);
+  restoreFocus();
+}
+
+// --- go / no-go ---------------------------------------------------------
+
+function renderChecklist(checklist) {
+  const block = $('checklist-block');
+  const body = $('checklist');
+  body.innerHTML = '';
+  if (!checklist) { block.hidden = true; return; }
+  block.hidden = false;
+
+  const verdict = $('verdict');
+  verdict.textContent = checklist.is_go ? 'GO' : 'NO GO';
+  verdict.className = `verdict ${checklist.is_go ? 'go' : 'nogo'}`;
+
+  const ft = (v) => (v == null ? '—' : `${Math.round(v)}`);
+  const mark = (p) => (p === true ? 'ok' : p === false ? 'short' : 'unknown');
+  const label = (p) => (p === true ? 'OK' : p === false ? 'SHORT' : '?');
+
+  for (const check of checklist.airports) {
+    const section = document.createElement('div');
+    section.className = 'check';
+    // The conditions the numbers were computed at, shown beside them: a
+    // surprising distance is nearly always a surprising density altitude.
+    section.innerHTML =
+      `<div class="check-head">` +
+        `<span class="check-title">${check.airport} ${check.operation}</span>` +
+        `<span class="pill ${mark(check.passes)}">${label(check.passes)}</span>` +
+      `</div>` +
+      `<div class="check-conditions">` +
+        `Field ${ft(check.elevation_ft)} ft · OAT ${Math.round(check.oat_c)} °C · ` +
+        `Pressure alt ${ft(check.pressure_altitude_ft)} ft · ` +
+        `<strong>Density alt ${ft(check.density_altitude_ft)} ft</strong> · ` +
+        `${ft(check.weight_lb)} lb · margin ${Math.round(check.margin * 100)}%` +
+      `</div>`;
+
+    const table = document.createElement('table');
+    table.className = 'runways';
+    table.innerHTML =
+      `<thead><tr><th>Runway</th><th>Surface</th>` +
+      `<th class="num">Length</th><th class="num">Roll</th>` +
+      `<th class="num" title="Book distance over a 50 ft obstacle">Book 50</th>` +
+      `<th class="num" title="Book distance plus your margin">Required</th>` +
+      `<th class="num">Spare</th><th></th></tr></thead><tbody></tbody>`;
+    const tbody = table.querySelector('tbody');
+    for (const runway of check.runways) {
+      const tr = document.createElement('tr');
+      tr.className = mark(runway.passes);
+      tr.innerHTML =
+        `<td>${runway.runway || '—'}</td>` +
+        `<td>${runway.surface || '—'}${runway.dry_grass_applied ? ' (grass)' : ''}</td>` +
+        `<td class="num">${ft(runway.runway_available_ft)}</td>` +
+        `<td class="num">${ft(runway.ground_roll_ft)}</td>` +
+        `<td class="num">${ft(runway.over_50ft_ft)}</td>` +
+        `<td class="num">${ft(runway.required_ft)}</td>` +
+        `<td class="num">${ft(runway.spare_ft)}</td>` +
+        `<td><span class="pill ${mark(runway.passes)}">` +
+        // A blank chart cell is still a no-go, but calling it SHORT would be
+        // a lie -- nothing was measured against the runway at all.
+        `${runway.outside_envelope ? 'NO DATA' : label(runway.passes)}</span></td>`;
+      tbody.appendChild(tr);
+      if (runway.note) {
+        const note = document.createElement('tr');
+        note.className = 'note';
+        note.innerHTML = `<td colspan="8">${runway.note}</td>`;
+        tbody.appendChild(note);
+      }
+    }
+    section.appendChild(table);
+    body.appendChild(section);
+  }
+
+  const fuel = checklist.fuel;
+  const fuelSection = document.createElement('div');
+  fuelSection.className = 'check';
+  const spareMin = fuel.spare_minutes == null
+    ? '' : ` (${Math.round(fuel.spare_minutes)} min)`;
+  fuelSection.innerHTML =
+    `<div class="check-head">` +
+      `<span class="check-title">Fuel reserve</span>` +
+      `<span class="pill ${mark(fuel.passes)}">${label(fuel.passes)}</span>` +
+    `</div>` +
+    `<div class="check-conditions">` +
+      `${fuel.reserve_minutes} minutes ${fuel.night ? 'night' : 'day'} VFR ` +
+      `(FAR 91.151) · margin ${Math.round(fuel.margin * 100)}%` +
+    `</div>` +
+    `<dl class="fuel-figures">` +
+      `<div><dt>On board</dt><dd>${fuel.fuel_on_board_gal.toFixed(1)} gal</dd></div>` +
+      `<div><dt>Burn</dt><dd>${fuel.burn_gal.toFixed(1)} gal</dd></div>` +
+      `<div><dt>Lands with</dt><dd>${fuel.landing_with_gal.toFixed(1)} gal</dd></div>` +
+      `<div><dt>Reserve</dt><dd>${fuel.reserve_required_gal.toFixed(1)} gal</dd></div>` +
+      `<div><dt>Required</dt><dd>${fuel.required_with_margin_gal.toFixed(1)} gal</dd></div>` +
+      `<div><dt>Spare</dt><dd>${fuel.spare_gal.toFixed(1)} gal${spareMin}</dd></div>` +
+    `</dl>`;
+  body.appendChild(fuelSection);
+
+  for (const reason of checklist.blockers) {
+    const div = document.createElement('div');
+    div.className = 'alert';
+    div.textContent = `NO GO — ${reason}`;
+    body.appendChild(div);
+  }
+  for (const reason of checklist.unknowns) {
+    const div = document.createElement('div');
+    div.className = 'alert unknown';
+    div.textContent = `Unknown — ${reason}`;
+    body.appendChild(div);
+  }
+}
+
+function renderSummary(plan) {
+  const t = plan.totals;
+  const hours = Math.floor(t.time_min / 60);
+  const minutes = Math.round(t.time_min % 60);
+  $('summary').innerHTML = [
+    ['Distance', `${t.distance_nm.toFixed(1)} nm`],
+    ['Time en route', hours ? `${hours}h ${minutes}m` : `${minutes} min`],
+    ['Fuel burn', `${t.fuel_gal.toFixed(1)} gal`],
+    ['Landing with', `${t.fuel_remaining_gal.toFixed(1)} gal`],
+    ['Reserve needed', `${t.reserve_required_gal.toFixed(1)} gal`],
+    ['Fuel legal', t.legal_on_fuel ? 'yes' : 'NO'],
+  ].map(([k, v]) => `<div><span class="k">${k}</span><span class="v">${v}</span></div>`).join('');
+
+  const warnings = $('warnings');
+  // Edits this browser dropped, said in the same place as the engine's own
+  // warnings: a number the pilot typed disappearing without a word is what
+  // makes a navlog untrustworthy.
+  if (droppedRows.length) {
+    const div = document.createElement('div');
+    div.className = 'alert';
+    div.textContent = `manual edits on row(s) ${droppedRows.join(', ')} were `
+      + 'dropped: the route no longer has those legs';
+    warnings.appendChild(div);
+  }
+  for (const message of plan.warnings) {
+    const div = document.createElement('div');
+    div.className = 'alert';
+    div.textContent = message;
+    warnings.appendChild(div);
+  }
+  $('summary-block').hidden = false;
+}
+
+// --- airport search box -------------------------------------------------
+
+let searchTimer = null;
+$('search').addEventListener('input', (event) => {
+  clearTimeout(searchTimer);
+  const query = event.target.value.trim();
+  if (query.length < 2) { $('results').hidden = true; return; }
+  searchTimer = setTimeout(async () => {
+    const found = await api.searchAirports(query);
+    renderSearchResults(found);
+  }, 150);
+});
+
+$('search').addEventListener('keydown', (event) => {
+  if (event.key === 'Escape') { $('results').hidden = true; }
+  if (event.key === 'Enter') {
+    const first = $('results').querySelector('button');
+    if (first) first.click();
+  }
+});
+
+function renderSearchResults(found) {
+  const box = $('results');
+  box.innerHTML = '';
+  if (!found.length) { box.hidden = true; return; }
+  for (const airport of found) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    const runway = airport.longest_runway_ft
+      ? ` · ${Math.round(airport.longest_runway_ft)} ft` : '';
+    button.innerHTML =
+      `<span class="ident">${airport.ident}</span> ${airport.name}` +
+      `<span class="meta">${airport.municipality ?? ''} ${airport.region ?? ''}` +
+      ` · ${Math.round(airport.elevation_ft)} ft${runway}</span>`;
+    button.addEventListener('click', () => {
+      addWaypoint({
+        name: airport.ident, lat: airport.lat, lon: airport.lon,
+        kind: 'airport', elevation_ft: airport.elevation_ft, label: airport.label,
+      });
+      $('search').value = '';
+      box.hidden = true;
+      // Only recentre on the first waypoint. After that `addWaypoint` has
+      // already framed the whole route, and flying to the newest point would
+      // undo that -- which is exactly what it used to do.
+      if (route.length === 1) {
+        map.flyTo({ center: [airport.lon, airport.lat], zoom: Math.max(map.getZoom(), 8) });
+      }
+    });
+    box.appendChild(button);
+  }
+  box.hidden = false;
+}
+
+document.addEventListener('click', (event) => {
+  if (!event.target.closest('.search')) $('results').hidden = true;
+});
+
+// --- form and misc ------------------------------------------------------
+
+for (const id of ['altitude', 'rpm', 'weight', 'fuel', 'altimeter', 'isadev',
+                  'night']) {
+  $(id).addEventListener('change', requestPlan);
+}
+
+$('reset-edits').addEventListener('click', () => {
+  clearOverrides();
+  requestPlan();
+});
+
+for (const id of ['runway-margin', 'fuel-margin']) {
+  $(id).addEventListener('change', requestPlan);
+}
+
+$('copy').addEventListener('click', async () => {
+  if (!lastPlan?.ok) return;
+  await navigator.clipboard.writeText(lastPlan.text);
+  $('copy').textContent = 'Copied';
+  setTimeout(() => { $('copy').textContent = 'Copy as text'; }, 1200);
+});
+
+// --- planning mode ------------------------------------------------------
+
+function setPlanningMode(mode) {
+  if (mode === planningMode) return;
+  planningMode = mode;
+  $('mode-auto').setAttribute('aria-pressed', String(mode === 'auto'));
+  $('mode-manual').setAttribute('aria-pressed', String(mode === 'manual'));
+
+  // Taking over from an automatic pass means taking over its points too.
+  // Resolution discards planner-owned points before re-deriving, so a TOC left
+  // marked generated would simply vanish on the switch and leave the route
+  // with nothing between departure and destination. Adopting them is the whole
+  // reason the planner writes them into the list in the first place.
+  if (mode === 'manual') {
+    route = route.map((w) => (w.generated
+      ? { ...w, generated: false, kind: 'waypoint' }
+      : w));
+  }
+  // In user-driven mode the profile comes from the declared segments, so the
+  // cruise altitude is no longer what the aeroplane aims for.
+  $('altitude-label').firstChild.textContent =
+    mode === 'manual' ? 'Target cruise altitude ' : 'Cruise altitude ';
+  $('altitude').disabled = mode === 'manual';
+  // Switching modes can change which rows exist; as everywhere else, the
+  // next plan is what decides which edits still have a leg to sit on.
+  onRouteChanged();
+}
+
+$('mode-auto').addEventListener('click', () => setPlanningMode('auto'));
+$('mode-manual').addEventListener('click', () => setPlanningMode('manual'));
+
+// --- navlog consistency -------------------------------------------------
+
+// One finding, one row. Shared by the sidebar list and the banner above the
+// navlog so the two can never describe the same finding differently.
+function findingRow(finding) {
+  const div = document.createElement('div');
+  div.className = `finding ${finding.severity}`;
+  const where = finding.row == null ? 'plan' : `row ${finding.row + 1}`;
+  div.innerHTML =
+    `<span class="where">${where}</span><span>${finding.message}</span>`;
+  return div;
+}
+
+// The banner over the navlog table. It carries findings only: a clean plan says
+// so in the sidebar, and a permanent green bar would eat rows off a panel that
+// is only 260px tall. Called from renderConsistency so clearConsistency, which
+// renders null, empties it too -- findings must never outlive their plan.
+function renderNavlogFindings(report) {
+  const banner = $('navlog-findings');
+  banner.innerHTML = '';
+  const findings = (report && report.ok && report.findings) || [];
+  banner.hidden = findings.length === 0;
+  for (const finding of findings) banner.appendChild(findingRow(finding));
+}
+
+function renderConsistency(report) {
+  renderNavlogFindings(report);
+  const box = $('consistency');
+  box.innerHTML = '';
+  if (!report) {
+    box.innerHTML =
+      '<p class="hint">Not checked yet.</p>';
+    return;
+  }
+  if (!report.ok) {
+    const div = document.createElement('div');
+    div.className = 'alert';
+    div.textContent = report.error;
+    box.appendChild(div);
+    return;
+  }
+  if (!report.findings.length) {
+    const div = document.createElement('div');
+    div.className = 'finding info';
+    div.innerHTML = '<span class="where">plan</span>' +
+      '<span>Nothing inconsistent found.</span>';
+    box.appendChild(div);
+    return;
+  }
+  for (const finding of report.findings) box.appendChild(findingRow(finding));
+}
+
+$('check-consistency').addEventListener('click', async () => {
+  if (route.length < 2) return;
+  const button = $('check-consistency');
+  button.disabled = true;
+  button.textContent = 'Checking…';
+  try {
+    consistencyReport = await api.consistency(planBody());
+    renderConsistency(consistencyReport);
+  } finally {
+    button.disabled = false;
+    button.textContent = 'Check navlog consistency';
+  }
+});
+
+renderConsistency(null);
+
+// --- E6B bar ------------------------------------------------------------
+//
+// Two calculators that stand apart from the route: they answer a question
+// about a place and a moment, not about the plan. Every number is computed by
+// the same engine functions the navigation log uses -- nothing is worked out
+// here -- so the two can never disagree.
+
+/** A field's value as a number, or null if it is blank or not a number.
+ *  Blank is a state, not a zero: an empty elevation box must not read as sea
+ *  level and quietly produce an answer. */
+function e6bValue(id) {
+  const raw = $(id).value.trim();
+  if (raw === '') return null;
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : null;
+}
+
+function e6bRow(key, value, className = '') {
+  return `<div><span class="k">${key}</span>` +
+         `<span class="v ${className}">${value}</span></div>`;
+}
+
+/** Show an engine refusal where the answer would have been. */
+function e6bError(boxId, message) {
+  const box = $(boxId);
+  box.innerHTML = '';
+  if (!message) return;
+  const div = document.createElement('div');
+  div.className = 'alert';
+  div.textContent = message;
+  box.appendChild(div);
+}
+
+const roundFt = (ft) => `${Math.round(ft).toLocaleString()} ft`;
+
+/** Density altitude, from an elevation, an OAT and an altimeter setting. */
+async function runDensityAltitude() {
+  const elevationFt = e6bValue('da-elev');
+  const oatC = e6bValue('da-oat');
+  // The setting is the one field with a sensible default: 29.92 is what a
+  // pilot who has not been given one would set anyway.
+  const altimeterInhg = e6bValue('da-altimeter') ?? 29.92;
+  e6bError('da-error', null);
+  if (elevationFt === null || oatC === null) {
+    $('da-out').innerHTML =
+      '<p class="waiting">Enter an elevation and an OAT.</p>';
+    return;
+  }
+  const result = await api.densityAltitude({ elevationFt, oatC, altimeterInhg });
+  if (!result.ok) {
+    $('da-out').innerHTML = '';
+    e6bError('da-error', result.error);
+    return;
+  }
+  $('da-out').innerHTML =
+    e6bRow('Pressure alt', roundFt(result.pressure_altitude_ft), 'big') +
+    e6bRow('Density alt', roundFt(result.density_altitude_ft), 'big') +
+    e6bRow('ISA dev',
+           `${result.isa_deviation_c >= 0 ? '+' : ''}` +
+           `${result.isa_deviation_c.toFixed(1)} °C`) +
+    e6bRow('Approx PA / DA',
+           `${roundFt(result.pressure_altitude_approx_ft)} / ` +
+           `${roundFt(result.density_altitude_approx_ft)}`, 'rule');
+}
+
+/** Magnetic variation at a latitude and longitude, positive east. */
+async function runVariation() {
+  const lat = e6bValue('var-lat');
+  const lon = e6bValue('var-lon');
+  e6bError('var-error', null);
+  if (lat === null || lon === null) {
+    $('var-out').innerHTML =
+      '<p class="waiting">Enter a latitude and a longitude.</p>';
+    return;
+  }
+  const result = await api.variation({ lat, lon });
+  if (!result.ok) {
+    $('var-out').innerHTML = '';
+    e6bError('var-error', result.error);
+    return;
+  }
+  // Spelled out as well as signed: "6.1° E" is what goes on the chart, and
+  // the sign is what goes into the arithmetic.
+  const variation = result.variation_deg;
+  const hemisphere = variation >= 0 ? 'E' : 'W';
+  $('var-out').innerHTML =
+    e6bRow('Variation', `${Math.abs(variation).toFixed(1)}° ${hemisphere}`, 'big') +
+    e6bRow('Signed', `${variation >= 0 ? '+' : ''}${variation.toFixed(2)}°`) +
+    e6bRow('Dated', result.decimal_year.toFixed(2), 'rule');
+}
+
+/** Both calculators recompute as you type, so the last field entered finishes
+ *  the answer. Debounced for the same reason the plan is: a held arrow key on
+ *  a number input is a stream of keystrokes, not a stream of questions. */
+function bindE6b(inputIds, run, clearId) {
+  let timer = null;
+  for (const id of inputIds) {
+    $(id).addEventListener('input', () => {
+      clearTimeout(timer);
+      timer = setTimeout(run, 180);
+    });
+  }
+  $(clearId).addEventListener('click', () => {
+    clearTimeout(timer);
+    for (const id of inputIds) $(id).value = '';
+    run();
+  });
+  run();
+}
+
+bindE6b(['da-elev', 'da-oat', 'da-altimeter'], runDensityAltitude, 'da-clear');
+bindE6b(['var-lat', 'var-lon'], runVariation, 'var-clear');
+
+// --- weight and balance -------------------------------------------------
+//
+// The one calculator here with a variable number of inputs: a loading form is
+// as long as the aircraft has stations. The rows live in state rather than in
+// the DOM so that adding or deleting one cannot lose what was typed in the
+// others, and, as everywhere else, the sums come back from the engine.
+
+/** The loading form. Name, weight in pounds, arm in inches aft of the datum;
+ *  weight and arm are strings so a half-typed "-" or "" stays as the pilot
+ *  left it. */
+let wbRows = [];
+let wbNextId = 0;
+
+const WB_SEED_NAMES = ['Empty weight', 'Front seats', 'Fuel'];
+
+function wbBlankRows() {
+  return WB_SEED_NAMES.map((name) => ({
+    id: wbNextId++, name, weight: '', arm: '',
+  }));
+}
+
+/** A typed field as a number, or null if blank or not a number. Blank is a
+ *  state, not a zero -- an empty weight box is a row not filled in yet, and
+ *  must not be totalled as though it were. */
+function wbNumber(raw) {
+  const text = String(raw).trim();
+  if (text === '') return null;
+  const value = Number(text);
+  return Number.isFinite(value) ? value : null;
+}
+
+/** The rows the engine can be asked about: both numbers present. */
+function wbComplete() {
+  return wbRows
+    .map((row) => ({
+      name: row.name,
+      weight_lb: wbNumber(row.weight),
+      arm_in: wbNumber(row.arm),
+    }))
+    .filter((row) => row.weight_lb !== null && row.arm_in !== null);
+}
+
+/** One input, built rather than templated: the station name is free text and
+ *  has no business going anywhere near innerHTML. */
+function wbInput(className, attrs, value, label) {
+  const el = document.createElement('input');
+  el.className = className;
+  Object.assign(el, attrs);
+  el.value = value;
+  el.setAttribute('aria-label', label);
+  return el;
+}
+
+function renderWeightBalance() {
+  const box = $('wb-rows');
+  box.innerHTML = '';
+  for (const row of wbRows) {
+    const line = document.createElement('div');
+    line.className = 'wb-row';
+
+    const nameEl = wbInput('wb-name', { type: 'text', placeholder: 'Station' },
+                           row.name, 'Station name');
+    const weightEl = wbInput('wb-weight',
+                             { type: 'number', step: '1', inputMode: 'decimal',
+                               placeholder: 'lb' },
+                             row.weight, 'Weight, pounds');
+    const armEl = wbInput('wb-arm',
+                          { type: 'number', step: '0.1', inputMode: 'decimal',
+                            placeholder: 'in' },
+                          row.arm, 'Arm, inches');
+    const del = document.createElement('button');
+    del.className = 'wb-del';
+    del.type = 'button';
+    del.textContent = '×';
+    del.title = 'Remove this row';
+    del.setAttribute('aria-label', `Remove ${row.name || 'row'}`);
+
+    nameEl.addEventListener('input', () => {
+      row.name = nameEl.value;
+      del.setAttribute('aria-label', `Remove ${row.name || 'row'}`);
+    });
+    weightEl.addEventListener('input', () => {
+      row.weight = weightEl.value;
+      wbRunSoon();
+    });
+    armEl.addEventListener('input', () => {
+      row.arm = armEl.value;
+      wbRunSoon();
+    });
+    // Deleting re-renders, which would throw away any half-typed name in
+    // another row -- state holds every field, so nothing is lost.
+    del.addEventListener('click', () => {
+      wbRows = wbRows.filter((other) => other.id !== row.id);
+      if (wbRows.length === 0) {
+        wbRows = [{ id: wbNextId++, name: '', weight: '', arm: '' }];
+      }
+      renderWeightBalance();
+      runWeightBalance();
+    });
+
+    line.append(nameEl, weightEl, armEl, del);
+    box.appendChild(line);
+  }
+}
+
+async function runWeightBalance() {
+  const stations = wbComplete();
+  e6bError('wb-error', null);
+  if (stations.length === 0) {
+    $('wb-out').innerHTML =
+      '<p class="waiting">Enter a weight and an arm on at least one row.</p>';
+    return;
+  }
+  const result = await api.weightBalance(stations);
+  if (!result.ok) {
+    $('wb-out').innerHTML = '';
+    e6bError('wb-error', result.error);
+    return;
+  }
+  $('wb-out').innerHTML =
+    e6bRow('Gross weight',
+           `${Math.round(result.gross_weight_lb).toLocaleString()} lb`, 'big') +
+    e6bRow('CG', `${result.cg_in.toFixed(2)} in`, 'big') +
+    e6bRow('Moment',
+           `${Math.round(result.total_moment_in_lb).toLocaleString()} in-lb`,
+           'rule');
+}
+
+let wbTimer = null;
+/** Same debounce as the other two: a held arrow key is a stream of
+ *  keystrokes, not a stream of questions. */
+function wbRunSoon() {
+  clearTimeout(wbTimer);
+  wbTimer = setTimeout(runWeightBalance, 180);
+}
+
+$('wb-add').addEventListener('click', () => {
+  wbRows.push({ id: wbNextId++, name: '', weight: '', arm: '' });
+  renderWeightBalance();
+  // Straight to the new row's name box: adding a row is always followed by
+  // typing in it.
+  const boxes = $('wb-rows').querySelectorAll('.wb-name');
+  boxes[boxes.length - 1].focus();
+});
+
+$('wb-clear').addEventListener('click', () => {
+  clearTimeout(wbTimer);
+  wbRows = wbBlankRows();
+  renderWeightBalance();
+  runWeightBalance();
+});
+
+wbRows = wbBlankRows();
+renderWeightBalance();
+runWeightBalance();
+
+// --- E6B bar visibility -------------------------------------------------
+//
+// A wide navigation log and a narrow screen are a common pair, and the two
+// calculators are not needed while reading it. Hiding the bar gives the
+// column back to the map and the log rather than leaving it blank.
+
+function setE6bHidden(hidden) {
+  const toggle = $('e6b-toggle');
+  document.getElementById('app').classList.toggle('e6b-hidden', hidden);
+  toggle.textContent = hidden ? '\u2039' : '\u203a';
+  toggle.title = hidden ? 'Show the E6B bar' : 'Hide the E6B bar';
+  toggle.setAttribute('aria-expanded', String(!hidden));
+  // The map fills its container absolutely, so it has to be told the
+  // container changed width or the canvas stays the old size.
+  map.resize();
+}
+
+$('e6b-toggle').addEventListener('click', () => {
+  setE6bHidden(!document.getElementById('app').classList.contains('e6b-hidden'));
+});
