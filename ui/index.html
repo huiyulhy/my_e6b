@@ -97,9 +97,15 @@
       </div>
       <div id="checklist"></div>
       <p class="hint">
-        Distances are computed at zero wind — a headwind is margin, not credit —
-        and landing distance is the POH max-weight figure. An unknown runway is
-        never treated as a pass.
+        Each runway is checked end by end at the field's wind: the end with the
+        better headwind is the one the distances are read for, and its
+        crosswind is checked against the 15 kt maximum demonstrated. A gust
+        counts against you — for the crosswind and for a tailwind — and never
+        for you. <strong>Get weather</strong>, over the navlog, fills each
+        field's wind, temperature and altimeter setting from its current
+        report; with no wind entered the distances are the zero-wind book
+        figures, which every runway says beside itself. Landing distance is the
+        POH max-weight figure. An unknown runway is never treated as a pass.
       </p>
     </section>
 
@@ -213,7 +219,15 @@
       <h2>Navigation log</h2>
       <div class="navlog-actions">
         <button id="reset-edits" type="button" hidden>Reset manual edits</button>
+        <button id="get-weather" type="button"
+                title="Fetch the current surface weather for every airport on the route and fill in its altimeter setting, temperature and wind">
+          Get weather
+        </button>
         <button id="copy" type="button">Copy as text</button>
+        <button id="download-csv" type="button"
+                title="Save the log as CSV in the column order of a paper nav log">
+          Download CSV
+        </button>
       </div>
     </div>
     <!-- Above the table, not below it: this is where a refusal to plan is
@@ -233,7 +247,7 @@
             <th>Phase</th>
             <th class="num">Alt</th>
             <th class="num" title="Outside air temperature at this leg's altitude — editable. Type the FD forecast temperature here; it lapses into the legs around it.">OAT</th>
-            <th class="num" title="Pressure altitude — this leg's altitude at the route altimeter setting">PA</th>
+            <th class="num" title="Pressure altitude — editable. What the altimeter reads with 29.92 set; from the route altimeter setting unless you type one here. Density altitude and this row's chart readings follow from it.">PA</th>
             <th class="num" title="Density altitude — what every performance figure on this row was read at">DA</th>
             <th class="num" title="True course — the track over the ground">TC</th>
             <th class="num" title="Wind correction angle — the crab">WCA</th>

@@ -146,6 +146,28 @@ class TestClimbAchievable:
         log = nl.build_navlog([KSQL, KMRY], 8500, conditions=CALM, planning_mode="auto")
         assert "climb-unreachable" not in codes(cy.check_navlog_consistency(log))
 
+    def test_it_grades_the_climb_in_the_wind_the_row_flew(self):
+        """The check has to re-fly the row in the same air the planner did.
+
+        A tailwind puts the same waypoint behind the aeroplane sooner, so the
+        climb has fewer minutes and reaches lower. A check reading the route's
+        conditions instead would grade a still-air day and disagree with the
+        plan in front of it.
+        """
+        route = [KSQL, declare(VPWDM, "climb", 8000), declare(KMRY, "descent", 257)]
+        calm = nl.build_navlog(route, 8000, conditions=CALM, planning_mode="manual")
+        assert "climb-unreachable" not in codes(cy.check_navlog_consistency(calm))
+
+        tailwind = nl.build_navlog(
+            route,
+            8000,
+            conditions=CALM,
+            planning_mode="manual",
+            # Row 1: row 0 is the taxi allowance, which flies nowhere.
+            overrides={1: nl.LegOverride(wind_from_deg=333.0, wind_speed_kt=30.0)},
+        )
+        assert "climb-unreachable" in codes(cy.check_navlog_consistency(tailwind))
+
     def test_a_climb_the_leg_can_just_about_make_passes(self):
         log = nl.build_navlog([KSQL, VPWDM, KMRY], 6500, conditions=CALM, planning_mode="auto")
         assert "climb-unreachable" not in codes(cy.check_navlog_consistency(log))

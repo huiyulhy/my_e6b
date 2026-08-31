@@ -470,3 +470,20 @@ table.runways tr.note td { color: var(--ink-dim); font-size: 10px; border-bottom
   font: inherit; font-size: 13px; line-height: 1;
 }
 #e6b-toggle:hover { color: var(--ink); border-color: var(--accent); }
+
+/* A crosswind past the maximum demonstrated, called out in the cell it is in:
+   the row already reads as a failure, and this says which gate closed. */
+table.runways td.over { color: var(--warn); font-weight: 600; }
+
+/* The wind row continues the weather block above it, so it gets no second
+   divider -- one dashed line separates weather from geometry, not each box
+   from the next. */
+.coords.field + .coords.field { border-top: none; padding-top: 0; }
+
+/* Where a field's numbers came from, under the boxes they were written into.
+   Quiet: it is provenance, not a reading. */
+.field-wx {
+  font-family: var(--mono); font-size: 10px; color: var(--ink-dim);
+  padding-left: 2px;
+}
+.field-wx.none { color: var(--warn); }

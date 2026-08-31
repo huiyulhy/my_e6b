@@ -52,6 +52,7 @@ my_e6b/
     altitude.py      [later]  cruise altitude optimiser
     alternates.py    [later]  alternate ranking
     airports.py      [built]  airport lookup against the local SQLite
+    weather.py       [built]  METAR/TAF/model parsing + source resolution (pure)
   data/
     poh/c172s/       [built]  five CSVs + SOURCE.md provenance
     magnetic/        [built]  WMM2025.COF + NOAA's 100-point test set
@@ -62,10 +63,15 @@ my_e6b/
     build_airports.py[built]  OurAirports -> SQLite
     build_basemap.py [built]  Natural Earth -> clipped, simplified GeoJSON
     screenshot_ui.py [built]  drive the map in a real browser
+    plot_altimeter_trend.py
+                     [built]  24 h of altimeter settings, and what they cost in feet
     build_nasr.py    [later]  FAA NASR / DOF / airspace -> SQLite
   ui/                [built]  static HTML/JS + MapLibre — same files dev and prod
   server/            [built]  FastAPI dev shim, never shipped
-  tests/             [built]  332 tests
+    main.py          [built]  the HTTP surface
+    wx_surface.py    [built]  the only network fetch: AWC METAR/TAF + model (see 4d)
+    wx_aloft.py      [later]  winds aloft at leg midpoints
+  tests/             [built]  672 tests
   Makefile           [built]  every recipe clears PYTHONPATH (see §7)
 ```
 
@@ -213,13 +219,19 @@ courses. Refresh from NOAA when it lapses.
 
 ## 4b. `engine/navlog.py` — [built]
 
-Where the other four modules meet. It owns no physics; it sequences theirs. Four modelling
+Where the other four modules meet. It owns no physics; it sequences theirs. Five modelling
 decisions, all visible in the output:
 
 - **User-driven planning is the default.** The pilot declares what each leg does and the
   altitudes follow from performance; an undeclared leg is refused rather than guessed at, and
   the cruise altitude is a bound rather than a target. `planning_mode="auto"` asks for the
   other behaviour, where the planner picks the profile from a stated cruise altitude.
+- **A wind typed on a row is planned with, not just flown with.** It reaches the profile
+  before the tops of climb and descent are placed, so a headwind on the climb row moves the
+  TOC back down the route. It belongs to the leg, not to an altitude: it holds all the way up
+  the climb, where a typed *temperature* is hung at one altitude and interpolated between.
+  Automatic mode needs one rehearsal lay-out to learn which drawn leg a row sits inside, the
+  same way row temperatures do.
 - **TOC and TOD are spliced in as real waypoints.** No leg spans a phase change, so every row
   has one altitude, one TAS and one fuel flow. This is why the arithmetic stays simple and
   still correct.
@@ -299,6 +311,136 @@ bugs it caught that nothing else would have:
 
 Headless Chrome has no GPU, so the script forces software WebGL. Without that MapLibre never
 fires `load` and the map stays blank — which is exactly what a naive screenshot shows.
+
+---
+
+## 4d. `engine/weather.py` + `server/wx_surface.py` — [built]
+
+Live surface weather for a field, so a go/no-go is computed on the air that is actually there
+rather than on 29.92 and ISA. **The split is the point of this section**, because the obvious
+split is the wrong one.
+
+### Why it is not split by source
+
+The natural instinct is one module per provider: AWC over here, the model over there. That
+fails, because the sources do not divide along the question being asked:
+
+| | wind | vis / ceiling | **temperature** | **altimeter** |
+|---|---|---|---|---|
+| METAR (observation, now only) | ✅ | ✅ | ✅ | ✅ |
+| TAF (forecast, to 24-30 h) | ✅ | ✅ | **✗** | **✗** |
+| model (any point, any hour) | ✅ | — | ✅ | ✅ |
+
+**A TAF carries no temperature and no altimeter setting.** Not usually-missing — structurally
+absent; the decoded `fcsts` blocks have `"altim": null` and `"temp": []`. So a TAF alone cannot
+produce a pressure altitude, cannot produce a density altitude, and therefore cannot produce the
+takeoff and landing distances it was fetched for. The model is needed on the *surface* tier, not
+just aloft, and any split by provider cuts straight through the middle of one question.
+
+The split that holds is **fetch vs decide**:
+
+- `engine/weather.py` — pure. Types, parsers, and `resolve_surface`, the one place the choice
+  between sources is made. Takes decoded payloads, opens no socket, and so keeps working under
+  Pyodide and under test.
+- `server/wx_surface.py` — all the I/O: three concurrent stdlib `urllib` GETs, a `.cache/wx/`
+  disk cache with per-product TTLs, and the nearest-TAF fallback.
+
+This is the engine boundary from §2 applied to a feature that is *entirely* about the network.
+It survives the boundary by having its judgement separated from its plumbing.
+
+### What `resolve_surface` decides
+
+Per field, with the winning `Source` recorded on every one — a mixed result is the normal case,
+not an exception:
+
+- **Target is now and the METAR is current** → the METAR wins on everything it publishes.
+  An observation beats a forecast of the same moment.
+- **Target is in the future** → TAF for wind, gusts, visibility and ceiling; **model for
+  temperature and altimeter**. This is what makes a target-time go/no-go possible at all.
+- **The METAR is dropped entirely once the target is past it**, rather than kept as a last
+  resort. Most fields here are part-time — KSQL's "latest" observation is three hours old at
+  2 am — and its temperature is exactly the field that moves. An afternoon takeoff computed on
+  the morning's OAT reads short on the hottest day of the year. The model is fetched even for a
+  "now" request so there is something to fall back to.
+- **No TAF at the field** → borrow the nearest one that covers the target (`airports.near`,
+  already a database read), tagged `NEAREST_TAF` and named in `notes`. Only ~600 US airports
+  issue a TAF and most GA fields are not among them, so this is the common path, and it is
+  labelled rather than silent.
+- **Anything nobody supplies stays `None`**, with a note saying distances cannot be computed.
+  Same rule as `OutsidePOHEnvelope`: refuse rather than guess.
+
+### Two facts that will bite whoever touches this next
+
+- **AWC reports `altim` in hectopascals** — `1012.6`, while the `rawOb` beside it says `A2990`.
+  Read as inches it is thirty-four times too large, and the wrong pressure altitude is confident
+  and unsafe. `hpa_to_inhg` refuses anything outside 25–32.5 inHg rather than converting
+  silently, and tests assert the decoded field against the raw text.
+- **`visib` is a number on one observation and a string on the next** (`10`, `"10+"`, `"1 1/2"`).
+  Both appear in a single 24-hour response.
+
+Model pressure comes from `pressure_msl`, never `surface_pressure`: an altimeter setting is
+sea-level-reduced by definition, and station pressure would double-count field elevation when
+`pressure_altitude` applies it again.
+
+### How it reaches the go/no-go
+
+It needs no engine change. `preflight._check_one_runway` already reads only OAT and pressure
+altitude, both derived from `field_weather()`, which already reads `Waypoint.altimeter_inhg` and
+`Waypoint.oat_c`. **Get weather**, over the navlog, calls `GET /api/wx/surface?ident=` once per
+airport on the route and fills the boxes the plan already sends: altimeter setting, temperature,
+and now wind and gust. At KMOD that moved density altitude from 97 ft to 1052 ft and the takeoff
+over a 50 ft obstacle from 1644 ft to 1744 ft.
+
+Only what the report actually gives is written — a station with no temperature leaves that box
+alone rather than blanking it — and a wind is written whole, direction, speed and gust together,
+because half a wind is not one and a stale gust would be held against the crosswind limit after
+it had dropped. Each field then carries a provenance line (`KSQL 1953Z — wind metar · OAT metar ·
+alt set metar`) that disappears from any box the pilot has since typed over: a line still
+claiming a METAR said something it did not is the failure this panel exists to prevent.
+
+The surface wind reaches the distances too. `Waypoint.wind_from_deg` / `wind_speed_kt` /
+`gust_kt` carry it as reported — **true**, the way a METAR gives it — and `navlog._field_wind`
+converts it to magnetic through the same WMM the navlog's headings come from, because a runway
+designator is magnetic and 13°E of variation on the west coast is a quarter of the way to the
+next designator: enough to move a crosswind across the demonstrated limit.
+
+`preflight` then works end by end. `Runway.ends` parses the designator (`09L/27R` → 90°, 270°),
+`wind_components` resolves the wind onto each, and `_pick_end` takes the end with the better
+headwind — the end a pilot would pick, and the only one whose distances mean anything. That
+headwind goes to `perf.takeoff_distance`/`landing_distance`, whose POH correction was already
+there and previously always called with zero.
+
+Two asymmetries are deliberate:
+
+- **Gusts count against you, never for you.** A gusting headwind is read at the steady wind (the
+  gust may not be there on the roll); a gusting tailwind is read at the gust (it may well be);
+  the crosswind is always read at the peak, because the gust is the part that runs out of rudder.
+- **Crosswind and length are separate gates.** A 10,000 ft runway 90° across a 25 kt wind fails,
+  and it fails *as a crosswind* — `_why_no_runway` names the gate that closed, because "wait for
+  the wind" and "do not go" are different decisions. Beyond 10 kt of tailwind the chart's
+  correction is refused outright rather than extrapolated: 10% per 2 kt compounds too fast to
+  guess past the published end.
+
+A field with no wind on it keeps the zero-wind book figures and says so in every runway's note.
+Silently reading "no wind given" as "calm" would be the one failure mode worth avoiding here.
+
+`tools/plot_altimeter_trend.py` is the evidence behind all of this — 24 h of settings for six
+Bay Area fields in one request, plotted in inches and in the pressure altitude error they cause.
+Over a representative day each field moved about 0.10 inHg (~95 ft), and two fields 60 nm apart
+differed by 0.12 inHg (~112 ft) at the same moment. The spread across the area is the better
+argument than the drift over time: it is why one field's ATIS should not be used for the next
+airport down the route.
+
+### Not built: winds aloft
+
+The aloft tier is designed but unimplemented. When it lands it must request
+`geopotential_height_{level}hPa` alongside the winds and interpolate on **actual height** — the
+`5000 ft ≈ 850 hPa` table is the ISA mapping and isobaric surfaces move with the pressure field.
+Build a `WindsAloft` ladder and let its existing vector interpolation do the work rather than
+hand-rolling u/v. Feed it through `profile.resolve_route(leg_winds=)`, sampling every leg
+midpoint in one batched request. Note that doing so revisits §4b's decision that a typed wind
+does not move the top of climb: the reason given there was that an FD level is too coarse to
+trust, and point-resolved model data is not.
 
 ---
 

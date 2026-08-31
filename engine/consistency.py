@@ -271,6 +271,26 @@ def _check_stale_overrides(ctx: _Context) -> list[Finding]:
     return findings
 
 
+def _in_row_wind(conditions: Conditions, leg) -> Conditions:
+    """`conditions` with the wind this row was actually flown in.
+
+    A row carries the wind it used, whether that came from the route's profile
+    or from the pilot's own entry, and it held for the whole leg. Standing it
+    up as a uniform profile is how a check re-flies the row in the same air the
+    planner did.
+    """
+    from dataclasses import replace
+
+    from engine.navlog import WindsAloft
+
+    if leg.wind_speed_kt is None or leg.wind_from_deg is None:
+        return conditions
+    return replace(
+        conditions,
+        winds=WindsAloft.uniform(leg.wind_from_deg, leg.wind_speed_kt),
+    )
+
+
 def _check_climb_achievable(ctx: _Context) -> list[Finding]:
     """A climb must not demand more altitude than the leg has distance for.
 
@@ -281,6 +301,10 @@ def _check_climb_achievable(ctx: _Context) -> list[Finding]:
     climb table for the top actually attainable in the ground distance
     available, at this leg's own wind and temperature, and anything more than
     `CLIMB_TOLERANCE_FT` above that is a plan the aeroplane cannot fly.
+
+    "This leg's own wind" is read off the row rather than out of `conditions`,
+    because that is where a wind the pilot typed ends up -- and a check graded
+    against a still-air day would disagree with the plan it is checking.
 
     Only the over-reaching side is checked: topping out lower than the aeroplane
     could manage is a choice, not a contradiction.
@@ -297,7 +321,12 @@ def _check_climb_achievable(ctx: _Context) -> list[Finding]:
         geo = inverse(leg.from_position, leg.to_position)
         try:
             reachable = profile.reachable_altitude(
-                entry, exit_, leg.distance_nm, geo, ctx.aircraft, ctx.conditions
+                entry,
+                exit_,
+                leg.distance_nm,
+                geo,
+                ctx.aircraft,
+                _in_row_wind(ctx.conditions, leg),
             )
         except perf.OutsidePOHEnvelope:
             # A navlog that built cannot normally get here, but a check is the

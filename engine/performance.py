@@ -53,6 +53,19 @@ FUEL_USABLE_GAL = 50.0
 BEST_GLIDE_KIAS = 68.0
 GLIDE_RATIO_NM_PER_1000FT = 1.5
 
+# Maximum demonstrated crosswind, POH Section 1. Not a certificated limit --
+# it is the strongest crosswind the type was flight tested in -- but it is the
+# only number the manufacturer publishes, so the checklist treats exceeding it
+# as a no-go rather than as advice.
+MAX_DEMONSTRATED_CROSSWIND_KT = 15.0
+
+# The takeoff and landing charts publish their wind correction for headwinds
+# up to 30 kt and tailwinds up to 10 kt. Past the tailwind end the correction
+# is an extrapolation of a penalty that is already steep (10% per 2 kt), so the
+# query is refused instead.
+MAX_CHART_TAILWIND_KT = 10.0
+MAX_CHART_HEADWIND_KT = 30.0
+
 # Taxi takeoff fuel consumption (based on POH)
 START_TAXI_TAKEOFF_FUEL_GAL = 1.4
 
@@ -471,7 +484,18 @@ def _apply_wind(roll: float, over: float, headwind_kt: float) -> tuple[float, fl
     """POH wind corrections, shared by the takeoff and landing charts. (based on 172s)
     1. Add 15% of takeoff for dry grass
     2. Subtract 10% per 9 kts of headwind, add 10% per 2 kts of tailwind
+
+    The correction is published over a limited band. Beyond the tailwind end it
+    is refused: 10% per 2 kt compounds fast, and a number extrapolated off the
+    end of that slope is not one to commit a takeoff to. A headwind past the
+    published end is credited only as far as the chart goes, which errs long.
     """
+    if headwind_kt < -MAX_CHART_TAILWIND_KT:
+        raise OutsidePOHEnvelope(
+            f"tailwind of {-headwind_kt:.0f} kt is beyond the "
+            f"{MAX_CHART_TAILWIND_KT:.0f} kt the chart corrects for"
+        )
+    headwind_kt = min(headwind_kt, MAX_CHART_HEADWIND_KT)
     if headwind_kt >= 0:
         factor = 1.0 - 0.10 * (headwind_kt / 9.0)
     else:

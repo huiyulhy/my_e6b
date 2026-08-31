@@ -54,3 +54,9 @@ airspace:
 # not at import. Needs `make serve` running.
 ui-shot:
 	$(UV) run python tools/screenshot_ui.py
+
+# How far the altimeter setting moves over a day, and what that is worth in
+# feet of pressure altitude. This is the evidence behind fetching a live
+# setting rather than planning on 29.92. Downloads METARs; cached in .cache/.
+altimeter-trend:
+	$(UV) run python tools/plot_altimeter_trend.py

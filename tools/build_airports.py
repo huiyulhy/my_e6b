@@ -4,13 +4,7 @@
     make airports NASR=/path/to.zip   # or point it at one
 
 Reads the 28-day NASR subscription zip directly -- including the CSV bundle
-nested inside it -- so there is nothing to unpack by hand. **No network
-access**: unlike the OurAirports build this replaces, the data is a file you
-already downloaded, which is the right shape for an offline-first app.
-
-NASR is the authoritative US source and carries what OurAirports could not:
-published magnetic variation, traffic pattern altitude, fuel types, tower
-type, the sectional each airport appears on, and precise surveyed positions.
+nested inside it
 
 Two structural notes about NASR that shape the output:
 
@@ -18,10 +12,6 @@ Two structural notes about NASR that shape the output:
   `ICAO_ID` is the ICAO one (`KSQL`), present for only about a fifth of
   airports. The ICAO form is used for display where it exists because that is
   what pilots type, and both are kept searchable.
-* **Most airports are private.** Of 12,582 open US airports only 4,730 are
-  public use. Both are ingested, flagged by `public_use`. Dropping the private
-  ones would discard 7,852 possible forced-landing sites, which is exactly the
-  information a planner should keep.
 """
 
 from __future__ import annotations

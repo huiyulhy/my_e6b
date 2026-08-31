@@ -39,6 +39,10 @@ if TYPE_CHECKING:  # pragma: no cover - import cycle avoidance
 # Type of flight phase
 SegmentType = Literal["climb", "cruise", "descent", "automatic"]
 
+# A wind the pilot typed against one leg, keyed by leg index and then by the
+# phase it was typed on. 
+LegWinds = dict[int, dict[str, "object"]]
+
 CONCRETE_SEGMENT_TYPES: tuple[str, ...] = ("climb", "cruise", "descent")
 PLANNING_MODES: tuple[str, ...] = ("manual", "auto")
 
@@ -48,8 +52,7 @@ _ALTITUDE_EPSILON_FT = 1.0
 _BOUNDARY_EPSILON_NM = 0.1
 # The step an altitude change is integrated on. The POH climb tables are
 # printed every 1000 ft, and marching on that spacing lands within 0.03 nm of a
-# 100 ft march even in strong shear -- the chart's own resolution is the
-# natural step and there is nothing left to win below it.
+# 100 ft march even in strong shear
 _PROFILE_BAND_FT = 1000.0
 
 
@@ -98,6 +101,14 @@ class Waypoint:
     altimeter_inhg: float | None = None
     oat_c: float | None = None
 
+    # The surface wind on the field, TRUE-referenced as a METAR or TAF reports
+    # it. The go/no-go check converts it to magnetic to line it up with the
+    # runway designators. Null means unknown, and the runway distances fall
+    # back to the no-wind book figures, which the checklist says out loud.
+    wind_from_deg: float | None = None
+    wind_speed_kt: float | None = None
+    gust_kt: float | None = None
+
 
 @dataclass(frozen=True)
 class ProfileSegment:
@@ -110,7 +121,8 @@ class ProfileSegment:
     start: Waypoint
     end: Waypoint
     phase: str  # climb | cruise | descent
-    altitude_ft: float  # representative altitude: the midpoint of a change
+    altitude_ft: float  # representative altitude: Used for calculating density
+    # altitude and interpolating later
     entry_altitude_ft: float
     exit_altitude_ft: float
     tas_kt: float
@@ -124,13 +136,10 @@ class ProfileSegment:
     end_role: str | None = None
 
     # Ground distance flown *level* on this leg, after the climb has topped
-    # out. Non-zero only in user-driven mode, where a leg's length is set by
-    # the two waypoints rather than by the climb: "climb to 3000" over 50 nm
-    # reaches 3000 after six and then flies the rest of the way level.
-    #
-    # It is kept as a distance rather than folded into the airspeed because
-    # the two halves cost different fuel: the climb is charged the published
-    # figure, and this part is charged as level flight. See `navlog._leg_fuel`.
+    # out. Non-zero only in user-driven mode
+    # Kept as a distance because the two cost different fuel: 
+    # the climb is charged the published figure, and this part is charged
+    #  as level flight.
     level_distance_nm: float = 0.0
     level_minutes: float = 0.0
 
@@ -171,8 +180,14 @@ def resolve_route(
     conditions: Conditions,
     names: PhaseNamer,
     warnings: list[str],
+    leg_winds: LegWinds | None = None,
 ) -> list[Waypoint]:
     """Return a route on which every leg has a concrete segment type.
+
+    `leg_winds` is keyed by leg of *this* route -- the one the pilot drew --
+    because that is what the planner walks. `build_segments` takes the same
+    map keyed by the resolved route it produces, which is not the same list
+    once tops of climb have been inserted into it.
     """
     if mode not in PLANNING_MODES:
         raise RouteError(f"unknown planning mode {mode!r}")
@@ -196,6 +211,7 @@ def resolve_route(
 
     return _expand_automatic(
         route,
+        leg_winds=leg_winds,
         cruise_altitude_ft=cruise_altitude_ft,
         departure_elevation=departure_elevation,
         destination_elevation=destination_elevation,
@@ -208,6 +224,7 @@ def resolve_route(
 def _expand_automatic(
     waypoints: list[Waypoint],
     *,
+    leg_winds: LegWinds | None = None,
     cruise_altitude_ft: float,
     departure_elevation: float,
     destination_elevation: float,
@@ -233,14 +250,14 @@ def _expand_automatic(
         destination_elevation=destination_elevation,
         aircraft=aircraft,
         conditions=conditions,
+        leg_winds=leg_winds,
     )
 
     resolved: list[Waypoint] = [waypoints[0]]
     entry = departure_elevation
     for index, (start, end) in enumerate(pairwise(waypoints)):
         # Never aim higher than the point from which the rest of the route can
-        # still be flown down. This is what pulls the top of descent backwards
-        # across an intervening waypoint.
+        # still be flown down.
         plateau = min(plateaus[index], ceilings[index])
         exit_ = ceilings[index + 1]
 
@@ -252,6 +269,7 @@ def _expand_automatic(
             exit_altitude_ft=exit_,
             aircraft=aircraft,
             conditions=conditions,
+            winds_by_phase=(leg_winds or {}).get(index),
             names=names,
             warnings=warnings,
         )
@@ -275,6 +293,7 @@ def _expand_leg(
     exit_altitude_ft: float,
     aircraft: Aircraft,
     conditions: Conditions,
+    winds_by_phase: dict[str, object] | None = None,
     names: PhaseNamer,
     warnings: list[str],
 ) -> tuple[list[Waypoint], str, float]:
@@ -290,10 +309,22 @@ def _expand_leg(
     if geo.distance_nm <= 0:
         return [], "cruise", entry_altitude_ft
 
-    lead = _solve_change(
-        entry_altitude_ft, plateau_altitude_ft, geo, aircraft, conditions
+    # A leg the pilot drew can hold two changes -- up to the plateau and back
+    # down off it -- and a wind was typed against each of them separately, so
+    # each is solved in its own. Which is which comes from the direction the
+    # piece goes, not from what the leg is called.
+    lead_conditions = _in_phase_wind(
+        conditions, winds_by_phase, entry_altitude_ft, plateau_altitude_ft
     )
-    tail = _solve_change(plateau_altitude_ft, exit_altitude_ft, geo, aircraft, conditions)
+    tail_conditions = _in_phase_wind(
+        conditions, winds_by_phase, plateau_altitude_ft, exit_altitude_ft
+    )
+    lead = _solve_change(
+        entry_altitude_ft, plateau_altitude_ft, geo, aircraft, lead_conditions
+    )
+    tail = _solve_change(
+        plateau_altitude_ft, exit_altitude_ft, geo, aircraft, tail_conditions
+    )
 
     if lead is None and tail is None:
         return [], "cruise", plateau_altitude_ft
@@ -310,9 +341,11 @@ def _expand_leg(
             geo.distance_nm,
             geo,
             aircraft,
-            conditions,
+            lead_conditions,
         )
-        piece = _solve_change(entry_altitude_ft, achieved, geo, aircraft, conditions)
+        piece = _solve_change(
+            entry_altitude_ft, achieved, geo, aircraft, lead_conditions
+        )
         if piece is None:
             return [], "cruise", entry_altitude_ft
         return [], piece["phase"], achieved
@@ -375,6 +408,39 @@ def _expand_leg(
 # --- building the segments -----------------------------------------------
 
 
+def _in_leg_wind(
+    conditions: Conditions,
+    leg_winds: LegWinds | None,
+    index: int,
+    phase: str,
+) -> Conditions:
+    """`conditions` as this leg is flown, with a typed wind swapped in.
+
+    The wind a pilot types on a navlog row is a statement about that leg, not
+    about an altitude: it holds all the way up the climb and all the way along
+    the ground the row covers. So it replaces the route's wind profile outright
+    for the leg it was typed on, rather than being hung at one altitude and
+    interpolated between -- which is what `Conditions.temperatures` does, and is
+    right for temperature and wrong for this.
+    """
+    winds = (leg_winds or {}).get(index, {}).get(phase)
+    return conditions if winds is None else replace(conditions, winds=winds)
+
+
+def _in_phase_wind(
+    conditions: Conditions,
+    winds_by_phase: dict[str, object] | None,
+    from_altitude_ft: float,
+    to_altitude_ft: float,
+) -> Conditions:
+    """`_in_leg_wind` for one piece of a leg, named by which way it goes."""
+    if not winds_by_phase:
+        return conditions
+    phase = "climb" if to_altitude_ft > from_altitude_ft else "descent"
+    winds = winds_by_phase.get(phase)
+    return conditions if winds is None else replace(conditions, winds=winds)
+
+
 def build_segments(
     waypoints: list[Waypoint],
     *,
@@ -383,6 +449,7 @@ def build_segments(
     conditions: Conditions,
     cruise_point: perf.CruisePoint,
     altitude_overrides: dict[int, float] | None = None,
+    leg_winds: LegWinds | None = None,
 ) -> list[ProfileSegment]:
     """One segment per leg, from a route whose legs all have concrete types.
 
@@ -398,6 +465,11 @@ def build_segments(
     the finished log. It is applied here rather than afterwards so the change
     carries forward: editing the top of a climb re-flies every leg after it,
     which is the whole point of editing it.
+
+    `leg_winds` does the same for a wind typed against a row. It matters most
+    on a "climb" with no stated altitude, where the exit altitude *is* the top
+    the aeroplane reaches in the distance available: into a headwind there are
+    fewer ground miles per minute of climb, so the leg tops out lower.
     """
     altitude_overrides = altitude_overrides or {}
     segments: list[ProfileSegment] = []
@@ -412,6 +484,9 @@ def build_segments(
             )
 
         geo = inverse(start.position, end.position)
+        # Every reading for this leg -- the top it reaches and the marching
+        # that gets it there -- is taken in the leg's own wind.
+        leg_conditions = _in_leg_wind(conditions, leg_winds, index, phase)
         exit_altitude = altitude_overrides.get(index)
         if exit_altitude is None:
             exit_altitude = _exit_altitude(
@@ -420,7 +495,7 @@ def build_segments(
                 entry_altitude_ft=entry,
                 geo=geo,
                 aircraft=aircraft,
-                conditions=conditions,
+                conditions=leg_conditions,
             )
         segments.append(
             _segment_for(
@@ -431,7 +506,7 @@ def build_segments(
                 exit_altitude_ft=exit_altitude,
                 geo=geo,
                 aircraft=aircraft,
-                conditions=conditions,
+                conditions=leg_conditions,
                 cruise_point=cruise_point,
             )
         )
@@ -665,6 +740,7 @@ def _descent_ceilings(
     destination_elevation: float,
     aircraft: Aircraft,
     conditions: Conditions,
+    leg_winds: LegWinds | None = None,
 ) -> list[float]:
     """The highest altitude each waypoint may be crossed at, walking backwards.
 
@@ -682,7 +758,12 @@ def _descent_ceilings(
     for index in range(len(waypoints) - 2, -1, -1):
         geo = inverse(waypoints[index].position, waypoints[index + 1].position)
         below = ceilings[index + 1]
-        gain = _descendable_ft(geo, below, aircraft, conditions)
+        gain = _descendable_ft(
+            geo,
+            below,
+            aircraft,
+            _in_leg_wind(conditions, leg_winds, index, "descent"),
+        )
         ceilings[index] = min(plateaus[index], below + gain)
 
     return ceilings

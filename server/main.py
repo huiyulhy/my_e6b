@@ -13,24 +13,27 @@ run modes will drift apart. See docs/ARCHITECTURE.md section 2.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from engine import airports as apt
 from engine import atmosphere as atm
 from engine import consistency as consistency_checks
+from engine import csv_download as csv_export
 from engine import currency as cur
 from engine import magnetic as mag
 from engine import navlog as nl
 from engine import preflight as pf
+from engine import weather as wx
 from engine import weight_balance as wb
 from engine.geo import LatLon
 from engine.magnetic import AtGeographicPole, OutsideModelValidity
+from server import wx_surface
 
 ROOT = Path(__file__).resolve().parent.parent
 UI_DIR = ROOT / "ui"
@@ -68,12 +71,22 @@ class WaypointIn(BaseModel):
     # route-wide altimeter setting and ISA deviation.
     altimeter_inhg: float | None = None
     oat_c: float | None = None
+    # The surface wind on the field, true-referenced as the METAR reports it.
+    # It picks the runway end and corrects the distances, and its crosswind is
+    # checked against the maximum demonstrated. Null leaves the go/no-go on
+    # the no-wind book figures and says so.
+    wind_from_deg: float | None = None
+    wind_speed_kt: float | None = None
+    gust_kt: float | None = None
 
 
 class LegOverrideIn(BaseModel):
     """A manually entered value for one navlog row."""
 
     row: int  # index into the returned legs
+    # The wind on this leg. Unlike the rest of these it is applied before the
+    # profile is solved, so it moves the top of climb and the top of descent as
+    # well as the row's own ground speed; see navlog.LegOverride.
     wind_from_deg: float | None = None
     wind_speed_kt: float | None = None
     tas_kt: float | None = None
@@ -226,6 +239,68 @@ def get_airport(ident: str) -> dict:
     return _airport_json(airport)
 
 
+# --- weather -------------------------------------------------------------
+# The one endpoint here that reaches the outside world. It is also the one
+# place the two run modes genuinely differ rather than merely being wired
+# differently: under Pyodide there is no server and no network, so there is no
+# live weather and the pilot types the altimeter setting and temperature in as
+# they always have. Everything downstream already works that way, which is why
+# this can be additive.
+
+
+def _surface_json(report: wx.SurfaceWeather) -> dict:
+    """A resolved observation, in the units the UI's boxes already use.
+
+    `sources` travels with it. A density altitude computed from a model is a
+    different thing from one computed from an observation, and the pilot is
+    entitled to see which they have before deciding to fly.
+    """
+    return {
+        "station": report.station,
+        "valid_time": report.valid_time.isoformat(),
+        "wind_from_deg": None if report.wind is None else round(report.wind.from_deg, 1),
+        "wind_speed_kt": None if report.wind is None else round(report.wind.speed_kt, 1),
+        "gust_kt": report.gust_kt,
+        "visibility_sm": report.visibility_sm,
+        "ceiling_ft_agl": report.ceiling_ft_agl,
+        # Rounded to what a pilot actually sets and reads: hundredths on the
+        # Kollsman window, whole degrees on the ATIS.
+        "oat_c": None if report.oat_c is None else round(report.oat_c, 1),
+        "altimeter_inhg": (
+            None if report.altimeter_inhg is None else round(report.altimeter_inhg, 2)
+        ),
+        "has_field_conditions": report.has_field_conditions,
+        "sources": {name: str(source) for name, source in report.sources.items()},
+        "notes": list(report.notes),
+    }
+
+
+@app.get("/api/wx/surface")
+def surface_weather(ident: str, time: str | None = None) -> dict:
+    """Surface weather at one field, for now or for a target time.
+
+    `time` is an ISO 8601 instant; naive values are read as UTC, as every
+    source here publishes in Zulu.
+    """
+    target: datetime | None = None
+    if time:
+        try:
+            target = datetime.fromisoformat(time)
+        except ValueError:
+            raise HTTPException(400, f"could not read {time!r} as an ISO 8601 time")
+
+    try:
+        report = wx_surface.fetch_surface(ident, target)
+    except wx_surface.AirportUnknown as exc:
+        raise HTTPException(404, str(exc))
+    except wx.WeatherUnavailable as exc:
+        # The established convention in this file: an engine-level refusal is
+        # data the UI renders, not an HTTP error it has to catch.
+        return {"ok": False, "error": str(exc)}
+
+    return {"ok": True, **_surface_json(report)}
+
+
 # --- planning ------------------------------------------------------------
 
 
@@ -251,6 +326,9 @@ def _waypoint_json(waypoint: nl.Waypoint, conditions: nl.Conditions) -> dict:
         "generated": waypoint.generated,
         "altimeter_inhg": waypoint.altimeter_inhg,
         "oat_c": waypoint.oat_c,
+        "wind_from_deg": waypoint.wind_from_deg,
+        "wind_speed_kt": waypoint.wind_speed_kt,
+        "gust_kt": waypoint.gust_kt,
         # The setting and temperature actually used, which is the waypoint's
         # own where it has one and the route's where it does not.
         "field_altimeter_inhg": None if air is None else air.altimeter_inhg,
@@ -282,6 +360,9 @@ def _build_from_request(request: PlanRequest):
             generated=w.generated,
             altimeter_inhg=w.altimeter_inhg,
             oat_c=w.oat_c,
+            wind_from_deg=w.wind_from_deg,
+            wind_speed_kt=w.wind_speed_kt,
+            gust_kt=w.gust_kt,
             runways=_runways_for(w),
         )
         for w in request.waypoints
@@ -344,8 +425,12 @@ def consistency(request: PlanRequest) -> dict:
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
 
+    # The log's own conditions, not the request's: the temperature profile is
+    # folded in while the log is built, so this is the only object that knows
+    # what the air was taken to be. Checking against the request's would grade
+    # the plan on a day it was not planned for.
     report = consistency_checks.check_navlog_consistency(
-        log, aircraft=aircraft, conditions=conditions
+        log, aircraft=aircraft, conditions=log.conditions or conditions
     )
     return {
         "ok": True,
@@ -361,6 +446,40 @@ def consistency(request: PlanRequest) -> dict:
         ],
         "text": consistency_checks.format_report(report),
     }
+
+
+@app.post("/api/navlog.csv")
+def navlog_csv(request: PlanRequest, time_off: str | None = None) -> Response:
+    """The same plan, as the columns of a paper navigation log.
+
+    A download rather than JSON, so the browser saves a file the pilot can open
+    in a spreadsheet. Everything about the format lives in
+    `engine.csv_download`; this only builds the plan and attaches a filename.
+
+    `time_off` is an optional `HH:MM` departure time, which fills the ETA
+    column. Errors come back as JSON like every other endpoint's: a browser
+    that asked for a file and got a 400 can still read the reason out of it.
+    """
+    if len(request.waypoints) < 2:
+        return JSONResponse(
+            {"ok": False, "error": "Add a departure and a destination."},
+            status_code=400,
+        )
+    try:
+        log, _aircraft, _conditions = _build_from_request(request)
+        text = csv_export.navlog_csv(log, time_off=time_off)
+    except (nl.RouteError, OutsideModelValidity, ValueError) as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+    return Response(
+        content=text,
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="{csv_export.csv_filename(log)}"'
+            )
+        },
+    )
 
 
 @app.post("/api/plan")
@@ -488,11 +607,23 @@ def _checklist_json(checklist: pf.GoNoGo | None) -> dict | None:
                 "weight_lb": check.weight_lb,
                 "margin": check.margin,
                 "passes": check.passes,
+                # Magnetic, because that is the frame the runways are in and
+                # the frame the numbers beside them were worked out in.
+                "wind_from_deg": None if check.wind is None else check.wind.from_deg,
+                "wind_speed_kt": None if check.wind is None else check.wind.speed_kt,
+                "gust_kt": None if check.wind is None else check.wind.gust_kt,
                 "runways": [
                     {
                         "runway": runway.runway,
                         "surface": runway.surface,
                         "dry_grass_applied": runway.dry_grass_applied,
+                        "end_used": runway.end_used,
+                        "headwind_kt": runway.headwind_kt,
+                        "crosswind_kt": runway.crosswind_kt,
+                        "crosswind_from_right": runway.crosswind_from_right,
+                        "crosswind_exceeds_demonstrated": (
+                            runway.crosswind_exceeds_demonstrated
+                        ),
                         "runway_available_ft": runway.runway_available_ft,
                         "ground_roll_ft": runway.ground_roll_ft,
                         "over_50ft_ft": runway.over_50ft_ft,
@@ -625,7 +756,7 @@ def _dataset_json(dataset: cur.Dataset, today: date) -> dict:
 
 @app.get("/api/status")
 def status() -> dict:
-    today = date.today()
+    today = datetime.now(tz=UTC).date()
     # Reported even when the database is missing: knowing the data is stale
     # is useful whether or not it loaded.
     data = [_dataset_json(d, today) for d in cur.datasets(today)]

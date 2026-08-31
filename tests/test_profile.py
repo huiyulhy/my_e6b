@@ -603,3 +603,97 @@ class TestMarchedProfile:
         ).ground_speed_kt
         ete = 60.0 * change["distance_nm"] / ground_speed
         assert ete == pytest.approx(change["climb"].time_min)
+
+
+class TestRowWindReachesTheProfile:
+    """A wind typed against a row is flown by the profile, not just the row.
+
+    It is the leg's wind, not an altitude's: it holds all the way up the climb
+    and along the whole ground the row covers, which is why it replaces the
+    route's wind profile outright rather than being hung at one altitude the
+    way a temperature is.
+    """
+
+    @staticmethod
+    def _wind(from_deg, speed_kt):
+        return {1: nl.LegOverride(wind_from_deg=from_deg, wind_speed_kt=speed_kt)}
+
+    @staticmethod
+    def _climb(log):
+        return next(leg for leg in log.legs if leg.phase == "climb")
+
+    def _reaching(self, overrides):
+        """A 'climb' with no altitude: the top *is* what the leg reaches."""
+        route = [KSQL, declare(VPWDM, "climb"), declare(KMRY, "descent")]
+        return self._climb(
+            nl.build_navlog(route, 12000, conditions=CALM, overrides=overrides)
+        )
+
+    def test_a_headwind_reaches_higher_over_a_fixed_leg(self):
+        """The ground distance is set by the waypoints, so wind buys minutes.
+
+        Slower over the ground means longer in the climb, which means higher by
+        the time the leg ends -- the opposite of the automatic case below,
+        where the altitude is fixed and it is the distance that gives.
+        """
+        calm = self._reaching({})
+        headwind = self._reaching(self._wind(150, 30))
+        tailwind = self._reaching(self._wind(330, 30))
+        assert headwind.exit_altitude_ft > calm.exit_altitude_ft
+        assert tailwind.exit_altitude_ft < calm.exit_altitude_ft
+
+    def test_the_top_of_climb_moves_in_automatic_mode(self):
+        """The altitude is the target, so the headwind moves the TOC back.
+
+        The climb takes the minutes the POH says either way; into wind it
+        covers less ground in them, so it tops out sooner along the route.
+        """
+
+        def toc_at(overrides):
+            log = nl.build_navlog(
+                [KSQL, KSBP], 9500, conditions=CALM,
+                overrides=overrides, planning_mode="auto",
+            )
+            return self._climb(log)
+
+        calm = toc_at({})
+        headwind = toc_at(self._wind(160, 30))
+        tailwind = toc_at(self._wind(340, 30))
+        assert headwind.distance_nm < calm.distance_nm < tailwind.distance_nm
+        # The climb itself is unchanged: same air, same POH minutes and fuel.
+        assert headwind.ete_min == pytest.approx(calm.ete_min, rel=0.02)
+        assert headwind.exit_altitude_ft == pytest.approx(calm.exit_altitude_ft)
+
+    def test_it_stops_at_the_leg_it_was_typed_on(self):
+        """A wind is a leg's, unlike a temperature, which is the air's."""
+        route = [KSQL, declare(VPWDM, "climb", 5500), declare(KMRY, "descent")]
+        base = nl.build_navlog(route, 7500, conditions=CALM)
+        edited = nl.build_navlog(
+            route, 7500, conditions=CALM, overrides=self._wind(150, 30)
+        )
+        descent_before = next(leg for leg in base.legs if leg.phase == "descent")
+        descent_after = next(leg for leg in edited.legs if leg.phase == "descent")
+        assert descent_after.ground_speed_kt == pytest.approx(
+            descent_before.ground_speed_kt
+        )
+        assert descent_after.ete_min == pytest.approx(descent_before.ete_min)
+
+    def test_half_an_entry_leaves_the_other_half_alone(self):
+        """Typing a speed with no direction must not invent a direction.
+
+        The route's own profile answers for whatever was not typed, at whatever
+        altitude the profile asks about.
+        """
+        winds = nl.WindsAloft.uniform(90.0, 10.0)
+        typed = nl.TypedWind(winds, from_deg=None, speed_kt=25.0)
+        assert typed.at(5000).from_deg == pytest.approx(90.0)
+        assert typed.at(5000).speed_kt == pytest.approx(25.0)
+        typed = nl.TypedWind(winds, from_deg=200.0, speed_kt=None)
+        assert typed.at(5000).from_deg == pytest.approx(200.0)
+        assert typed.at(5000).speed_kt == pytest.approx(10.0)
+
+    def test_the_same_wind_holds_at_every_altitude_in_the_leg(self):
+        """Not hung at one altitude and interpolated: it is the leg's wind."""
+        typed = nl.TypedWind(nl.WindsAloft.calm(), from_deg=270.0, speed_kt=20.0)
+        for altitude in (0.0, 3000.0, 9500.0, 14000.0):
+            assert typed.at(altitude) == nl.Wind(270.0, 20.0)

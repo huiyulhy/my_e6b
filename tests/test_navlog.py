@@ -313,8 +313,10 @@ class TestFuelReserve:
             planning_mode="auto",
         )
         assert night.reserve_required_gal > day.reserve_required_gal
+        # Both figures are rounded up to the tenth a pilot writes down, so the
+        # ratio holds to within that rather than exactly.
         assert night.reserve_required_gal == pytest.approx(
-            day.reserve_required_gal * 45.0 / 30.0
+            day.reserve_required_gal * 45.0 / 30.0, abs=0.1
         )
 
 
@@ -710,8 +712,12 @@ class TestPerLegCruiseRpm:
         )
         assert both.legs[row].tas_kt == pytest.approx(130.0)
         # Fuel flow, not fuel: the faster row spends less time burning it.
+        # Tolerance because the fuel itself is rounded up to a tenth before the
+        # rate is worked back out of it.
         rate = lambda leg: leg.fuel_gal / (leg.ete_min / 60.0)
-        assert rate(both.legs[row]) == pytest.approx(rate(rpm_only.legs[row]))
+        assert rate(both.legs[row]) == pytest.approx(
+            rate(rpm_only.legs[row]), abs=0.1
+        )
 
     def test_an_empty_override_is_ignored(self):
         assert nl.LegOverride().is_empty
@@ -1044,7 +1050,8 @@ class TestClimbLegLongerThanItsClimb:
             CALM.pressure_altitude_ft(5),
             CALM.pressure_altitude_ft(climb.exit_altitude_ft),
         )
-        assert climb.fuel_gal <= whole.fuel_gal + 1e-6
+        # Plus the tenth of a gallon the row is rounded up to.
+        assert climb.fuel_gal <= whole.fuel_gal + 0.1 + 1e-6
 
 
 class TestRowPressureAltitude:
@@ -1243,7 +1250,11 @@ class TestDescentFuelFlow:
             nl.Aircraft().cruise_rpm,
             CALM.oat_c(leg.entry_altitude_ft),
         ).gph
-        assert self._gph(leg) == pytest.approx(expected, rel=1e-3)
+        # The row's fuel is rounded up to a tenth, so the rate worked back out
+        # of it is only good to that tenth spread over the leg's own time.
+        assert self._gph(leg) == pytest.approx(
+            expected, abs=0.1 / (leg.ete_min / 60.0)
+        )
 
     def test_a_descent_below_the_chart_still_plans(self):
         """The chart starts at 2000 ft; a low descent reads its bottom page."""
@@ -1251,3 +1262,53 @@ class TestDescentFuelFlow:
         leg = self._descent(log)
         assert leg.fuel_gal > 0
         assert self._gph(leg) > 0
+
+
+class TestFuelIsRoundedUpToTheTenth:
+    """Every fuel figure is a tenth of a gallon, rounded up, and adds up.
+
+    The convention a paper navigation log is filled in with: round each box up
+    to the nearest tenth, then total the column from the boxes.
+    """
+
+    @staticmethod
+    def _log(**kwargs):
+        return nl.build_navlog(
+            [KSQL, KSBP], 7500, conditions=CALM, planning_mode="auto", **kwargs
+        )
+
+    def test_every_row_is_a_whole_tenth(self):
+        for leg in self._log().legs:
+            assert leg.fuel_gal * 10 == pytest.approx(round(leg.fuel_gal * 10))
+
+    def test_the_column_adds_up_to_the_total(self):
+        """The reason the rounding is done in the engine and not on the way out."""
+        log = self._log()
+        assert sum(leg.fuel_gal for leg in log.legs) == pytest.approx(
+            log.total_fuel_gal
+        )
+        assert log.legs[-1].cumulative_fuel_gal == pytest.approx(log.total_fuel_gal)
+
+    def test_the_landing_figure_agrees_with_the_column(self):
+        log = self._log()
+        assert log.fuel_remaining_gal == pytest.approx(
+            nl.Aircraft().fuel_on_board_gal - log.total_fuel_gal
+        )
+
+    def test_it_rounds_up_and_never_down(self):
+        """A plan must not come out of the arithmetic holding fuel it has not got."""
+        assert nl._fuel_written_on_the_log(2.51) == pytest.approx(2.6)
+        assert nl._fuel_written_on_the_log(2.501) == pytest.approx(2.6)
+        assert nl._fuel_written_on_the_log(2.5) == pytest.approx(2.5)
+
+    def test_an_exact_tenth_stays_where_it_is(self):
+        """Floating point must not push 2.6 to 2.7."""
+        for tenths in range(1, 200):
+            exact = tenths / 10.0
+            assert nl._fuel_written_on_the_log(exact) == pytest.approx(exact)
+
+    def test_the_reserve_is_rounded_the_same_way(self):
+        log = self._log()
+        assert log.reserve_required_gal * 10 == pytest.approx(
+            round(log.reserve_required_gal * 10)
+        )

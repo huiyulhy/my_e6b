@@ -275,7 +275,12 @@ def decimal_year_now() -> float:
     """Today, as a fractional year.
 s
     """
-    today = datetime.date.today()
+    # UTC rather than the machine's local date. Aviation dates are Zulu, and
+    # `date.today()` would step the decimal year a day early or late depending
+    # on where the laptop's clock is set. It is worth ~0.0003 degrees of
+    # variation, so this is tidiness rather than a fix -- but the whole
+    # program reads dates in Zulu and this is the one place that did not.
+    today = datetime.datetime.now(tz=datetime.UTC).date()
     return decimal_year_for(today.year, today.month, today.day)
 
 

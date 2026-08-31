@@ -21,7 +21,7 @@ segment only has 1 flight phase
 descent speed) against the forecast wind, not from the published no-wind
 climb distance column. Time and fuel stay the published figures.
 3. Descent is taken at a constant % of the cruise
-4. Assume 20 mins in traffic pattern
+4. Assume 10 mins in traffic pattern
 """
 
 from __future__ import annotations
@@ -29,7 +29,9 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
+from datetime import UTC
 from datetime import date as Date
+from datetime import datetime as DateTime
 from itertools import pairwise
 
 from engine import performance as perf
@@ -80,6 +82,7 @@ __all__ = [
     "SegmentType",
     "TemperatureProfile",
     "TemperatureSample",
+    "TypedWind",
     "Waypoint",
     "Wind",
     "WindsAloft",
@@ -163,6 +166,32 @@ def _wind_components(wind: Wind) -> tuple[float, float]:
     """East and north components of wind vector, in knots."""
     towards = math.radians((wind.from_deg + 180.0) % 360.0)
     return wind.speed_kt * math.sin(towards), wind.speed_kt * math.cos(towards)
+
+
+@dataclass(frozen=True)
+class TypedWind:
+    """One leg's wind, as far as the pilot typed it.
+
+    Answers `at()` like `WindsAloft`, so it can stand in for the route's wind
+    profile on the leg it belongs to -- but it is a leg's wind, not an
+    altitude's: the same answer all the way up the climb and all the way along
+    the ground the row covers, which is what "the wind on this leg" means.
+
+    Either half may be missing, because either half may be typed on its own.
+    What was not typed is read off the route's own profile at the altitude
+    asked for, so half an entry never quietly zeroes the other half.
+    """
+
+    base: WindsAloft
+    from_deg: float | None = None
+    speed_kt: float | None = None
+
+    def at(self, altitude_ft: float) -> Wind:
+        under = self.base.at(altitude_ft)
+        return Wind(
+            under.from_deg if self.from_deg is None else self.from_deg % 360.0,
+            under.speed_kt if self.speed_kt is None else self.speed_kt,
+        )
 
 
 @dataclass(frozen=True)
@@ -287,7 +316,7 @@ class Aircraft:
     descent_rate_fpm: float = 500.0
     descent_speed_kias: float = 90.0
     # Time in the traffic pattern at each arrival, but assume cruise fuel flow
-    pattern_time_min: float = 20.0
+    pattern_time_min: float = 10.0
     # Pattern altitude above field elevation, for the row's altitude column.
     pattern_height_agl_ft: float = 1000.0
 
@@ -297,11 +326,19 @@ class LegOverride:
     """Manual values for one navlog row, replacing what was computed.
     Captures the leg override made by manual edits
     
-    Overriding a row recomputes everything *downstream* of the value
-    It deliberately does **not** move top of climb or top of descent, and it
-    never changes which rows exist
+    Overriding a row recomputes everything *downstream* of the value, and it
+    never changes which rows exist.
 
-    `altitude_ft` replaces the altitude this leg ends at. 
+    `altitude_ft` replaces the altitude this leg ends at.
+
+    `wind_from_deg` and `wind_speed_kt` are the wind on this leg, and they go
+    in before the profile is solved rather than after it. A wind is a fact
+    about a stretch of the route, so it holds for the whole leg -- all the way
+    up a climb and along all the ground the row covers -- and the tops of climb
+    and descent move under it: into a headwind the same climb covers less
+    ground, so it tops out sooner along the route. Either half may be typed on
+    its own; whatever is not typed is read off the route's own wind profile.
+    See `TypedWind` and `profile.build_segments`.
 
     `cruise_rpm` re-reads the POH cruise chart for this row alone, replacing
     both its true airspeed and its fuel flow. Unlike the other fields it is
@@ -567,7 +604,7 @@ def build_navlog(
 
     # Today, not a fixed date: an unplanned flight is a flight now, and the
     # variation a fixed default gives drifts further out of true every year.
-    flight_date = conditions.flight_date or Date.today()
+    flight_date = conditions.flight_date or DateTime.now(tz=UTC).date()
     decimal_year = decimal_year_for(flight_date.year, flight_date.month, flight_date.day)
     # Fail before any legs are built: an expired magnetic model makes every
     # magnetic course on the log wrong, so there is nothing worth computing.
@@ -590,14 +627,15 @@ def build_navlog(
         # The taxi row goes in before the flight is built so that the row
         # indices an override is keyed by keep matching the finished log.
         if aircraft.taxi_fuel_gal > 0:
-            cumulative_fuel += aircraft.taxi_fuel_gal
+            taxi_fuel = _fuel_written_on_the_log(aircraft.taxi_fuel_gal)
+            cumulative_fuel += taxi_fuel
             legs.append(
                 _ground_leg(
                     phase="taxi",
                     waypoint=flight[0],
                     altitude_ft=flight[0].elevation_ft or 0.0,
                     ete_min=0.0,
-                    fuel_gal=aircraft.taxi_fuel_gal,
+                    fuel_gal=taxi_fuel,
                     aircraft=aircraft,
                     conditions=conditions,
                     travelled=travelled,
@@ -645,7 +683,7 @@ def build_navlog(
             # the flight cruised at. A circuit at 1,100 ft costs what a circuit
             # at 1,100 ft costs, whether the trip there was at 3,500 or 9,500 --
             # and it costs *more*, because the engine makes more power low down.
-            pattern_fuel = (
+            pattern_fuel = _fuel_written_on_the_log(
                 _cruise_point_at(
                     pattern_altitude,
                     aircraft=aircraft,
@@ -711,6 +749,7 @@ def build_navlog(
             _reserve_gph(legs, cruise_point.gph),
             cumulative_fuel,
             margins,
+            decimal_year,
         ),
     )
 
@@ -776,6 +815,41 @@ def _ground_leg(
     )
 
 
+def _field_wind(waypoint: Waypoint, decimal_year: float) -> preflight.SurfaceWind | None:
+    """The field's surface wind, turned from true into magnetic.
+
+    A reported wind is true; a runway designator is magnetic. Comparing them
+    without converting is wrong by the local variation, which is 13 degrees on
+    the US west coast -- a quarter of the way to the next runway designator,
+    and enough to move a crosswind across the demonstrated limit. `None` when
+    the field has no wind on it, which the checklist reports rather than
+    silently reading as calm.
+    """
+    if waypoint.wind_speed_kt is None:
+        return None
+    # A calm wind has no direction to convert, and needs none. Any gust goes
+    # with it: a peak with no direction cannot be resolved onto a runway, and
+    # inventing one to resolve it against would be worse than dropping it.
+    if waypoint.wind_speed_kt == 0:
+        return preflight.SurfaceWind(from_deg=0.0, speed_kt=0.0)
+    if waypoint.wind_from_deg is None:
+        return None
+    var = variation(
+        waypoint.position.lat,
+        waypoint.position.lon,
+        waypoint.elevation_ft or 0.0,
+        decimal_year,
+    )
+    gust = waypoint.gust_kt
+    return preflight.SurfaceWind(
+        from_deg=true_to_magnetic(waypoint.wind_from_deg, var),
+        speed_kt=waypoint.wind_speed_kt,
+        # A gust at or below the steady wind is not a gust; dropping it beats
+        # refusing the whole plan over a rounding in the report.
+        gust_kt=gust if gust is not None and gust > waypoint.wind_speed_kt else None,
+    )
+
+
 def _build_checklist(
     flights: list[list[Waypoint]],
     aircraft: Aircraft,
@@ -783,6 +857,7 @@ def _build_checklist(
     reserve_gph: float,
     burn_gal: float,
     margins: preflight.Margins,
+    decimal_year: float,
 ) -> preflight.GoNoGo:
     """Every takeoff and landing on the route, plus the fuel check.
 
@@ -818,13 +893,16 @@ def _build_checklist(
                     density_altitude_ft=air.density_altitude_ft,
                     weight_lb=aircraft.weight_lb,
                     margin=margins.runway,
+                    wind=_field_wind(waypoint, decimal_year),
                 )
             )
 
     fuel = preflight.check_fuel(
         fuel_on_board_gal=aircraft.fuel_on_board_gal,
         burn_gal=burn_gal,
-        reserve_required_gal=reserve_gph * conditions.reserve_minutes / 60.0,
+        reserve_required_gal=_fuel_written_on_the_log(
+            reserve_gph * conditions.reserve_minutes / 60.0
+        ),
         reserve_minutes=conditions.reserve_minutes,
         margin=margins.fuel,
         night=conditions.night,
@@ -924,13 +1002,20 @@ def _build_flight(
         )
 
     def lay_out(
-        conditions: Conditions, names: PhaseNamer, warnings: list[str]
+        conditions: Conditions,
+        names: PhaseNamer,
+        warnings: list[str],
+        drawn_leg_winds: dict[int, dict[str, TypedWind]] | None = None,
     ) -> tuple[list[Waypoint], list[ProfileSegment]]:
         """Resolve the route and cut it into one segment per leg.
 
         Resolve first -- every leg ends up with a concrete segment type, and in
         automatic mode the TOC/TOD points become real waypoints -- then build
         one segment per leg. Both modes share the second half.
+
+        Typed winds go in twice, keyed two ways, because the two halves walk
+        different routes: the planner walks the legs the pilot drew, and the
+        segment builder walks the resolved route the planner produced.
         """
         route = resolve_route(
             waypoints,
@@ -942,6 +1027,7 @@ def _build_flight(
             conditions=conditions,
             names=names,
             warnings=warnings,
+            leg_winds=drawn_leg_winds,
         )
         return route, build_segments(
             route,
@@ -950,6 +1036,7 @@ def _build_flight(
             conditions=conditions,
             cruise_point=cruise_point,
             altitude_overrides=_altitude_overrides_by_leg(route, overrides, row_offset),
+            leg_winds=_leg_winds_by_leg(route, row_winds, row_offset),
         )
 
     # --- the airmass this flight is planned in ---------------------------
@@ -974,32 +1061,45 @@ def _build_flight(
         for row, override in overrides.items()
         if override.oat_c is not None
     }
+    row_winds = _row_winds(overrides, conditions)
+    # A typed wind needs the draft for the same reason a typed temperature
+    # does, but only in automatic mode: there the planner decides where the
+    # top of climb falls before any row exists, so a wind typed against a row
+    # has to be traced back to the leg the pilot drew it on. In user-driven
+    # mode the rows are the pilot's own legs and `_leg_winds_by_leg` re-keys
+    # them without a rehearsal.
+    drawn_leg_winds: dict[int, dict[str, TypedWind]] | None = None
     draft_segments: list[ProfileSegment] | None = None
-    if row_temperatures:
+    if row_temperatures or (row_winds and planning_mode == "auto"):
         # A throwaway namer and warning list: this pass is scaffolding, and its
         # TOC numbering and warnings would otherwise be emitted twice.
         _, draft_segments = lay_out(conditions, PhaseNamer(), [])
-        conditions = _with_temperatures(
-            conditions,
-            field_samples
-            + _row_temperature_samples(
-                draft_segments, row_temperatures, row_offset, conditions
-            ),
-        )
+        if row_temperatures:
+            conditions = _with_temperatures(
+                conditions,
+                field_samples
+                + _row_temperature_samples(
+                    draft_segments, row_temperatures, row_offset, conditions
+                ),
+            )
+        if row_winds and planning_mode == "auto":
+            drawn_leg_winds = _leg_winds_by_drawn_leg(
+                waypoints, draft_segments, row_winds, row_offset
+            )
 
     if conditions.temperatures is not None:
         warnings.extend(conditions.temperatures.lapse_warnings())
 
-    route, segments = lay_out(conditions, names, warnings)
+    route, segments = lay_out(conditions, names, warnings, drawn_leg_winds)
 
     if draft_segments is not None and _row_count(draft_segments) != _row_count(segments):
         # A leg crossed the tenth-of-a-mile threshold as the tops of climb
-        # moved, so the rows renumbered under the temperatures that were typed
+        # moved, so the rows renumbered under the values that were typed
         # against them. Rare, but silently attributing a pilot's number to a
         # different leg is not something to let pass.
         warnings.append(
-            "the rows renumbered when the entered temperatures were applied; "
-            "check that each temperature is still on the leg you meant"
+            "the rows renumbered when the entered temperatures and winds were "
+            "applied; check that each one is still on the leg you meant"
         )
 
     # --- walk the profile, one row per segment --------------------------
@@ -1098,13 +1198,15 @@ def _build_flight(
             if segment.level_minutes > 0
             else None
         )
-        fuel = _leg_fuel(
-            phase,
-            ete,
-            segment.climb,
-            leg_cruise.gph,
-            level_minutes=segment.level_minutes,
-            level_gph=level_gph,
+        fuel = _fuel_written_on_the_log(
+            _leg_fuel(
+                phase,
+                ete,
+                segment.climb,
+                leg_cruise.gph,
+                level_minutes=segment.level_minutes,
+                level_gph=level_gph,
+            )
         )
 
         travelled += leg_geo.distance_nm
@@ -1346,6 +1448,79 @@ def _altitude_overrides_by_leg(
     return by_leg
 
 
+def _row_winds(
+    overrides: dict[int, LegOverride], conditions: Conditions
+) -> dict[int, TypedWind]:
+    """Every row that carries a wind, as something the profile can be flown in."""
+    return {
+        row: TypedWind(conditions.winds, o.wind_from_deg, o.wind_speed_kt)
+        for row, o in overrides.items()
+        if o.wind_from_deg is not None or o.wind_speed_kt is not None
+    }
+
+
+def _leg_winds_by_leg(
+    route: list[Waypoint], row_winds: dict[int, TypedWind], row_offset: int
+) -> dict[int, dict[str, TypedWind]]:
+    """Re-key row winds onto the legs of a resolved route.
+
+    The same skip rule `_altitude_overrides_by_leg` applies, and for the same
+    reason: a leg too short to earn a row must not shift a typed wind onto its
+    neighbour. Keyed by phase as well as leg because that is the shape
+    `resolve_route` needs, and one map is easier to reason about than two.
+    """
+    by_leg: dict[int, dict[str, TypedWind]] = {}
+    row = row_offset
+    for index, (start, end) in enumerate(pairwise(route)):
+        if inverse(start.position, end.position).distance_nm < _MIN_ROW_NM:
+            continue
+        wind = row_winds.get(row)
+        if wind is not None:
+            by_leg[index] = {end.segment_type: wind}
+        row += 1
+    return by_leg
+
+
+def _leg_winds_by_drawn_leg(
+    waypoints: list[Waypoint],
+    draft_segments: list[ProfileSegment],
+    row_winds: dict[int, TypedWind],
+    row_offset: int,
+) -> dict[int, dict[str, TypedWind]]:
+    """Re-key row winds onto the legs the *pilot* drew, for the planner.
+
+    Automatic planning decides where a top of climb falls before any of its
+    rows exist, walking the pilot's own waypoints -- so a wind typed against a
+    row has to be found a home on the leg that row sits inside. The draft
+    lay-out is what says which that is: each of its segments is placed by
+    ground position, and the leg containing its midpoint is the leg the pilot
+    drew it on.
+
+    Keyed by phase within the leg, because one drawn leg can hold both a climb
+    and the descent off it, each with its own wind typed against its own row.
+    """
+    drawn = list(pairwise(strip_generated(waypoints)))
+    spans = [inverse(start.position, end.position) for start, end in drawn]
+
+    by_leg: dict[int, dict[str, TypedWind]] = {}
+    row = row_offset
+    for segment in draft_segments:
+        geo = inverse(segment.start.position, segment.end.position)
+        if geo.distance_nm < _MIN_ROW_NM:
+            continue
+        wind = row_winds.get(row)
+        row += 1
+        if wind is None:
+            continue
+        midpoint = geo.point_at_fraction(0.5)
+        for index, span in enumerate(spans):
+            along = span.along_track_nm(midpoint)
+            if -_MIN_ROW_NM <= along <= span.distance_nm + _MIN_ROW_NM:
+                by_leg.setdefault(index, {})[segment.phase] = wind
+                break
+    return by_leg
+
+
 def _finish_navlog(
     *,
     legs: list[Leg],
@@ -1384,7 +1559,9 @@ def _finish_navlog(
     # --- reserve check ---------------------------------------------------
     # Measured at the flight's own cruise, not at the altitude typed into the
     # box -- see `_reserve_gph`.
-    reserve_gal = _reserve_gph(legs, cruise_point.gph) * conditions.reserve_minutes / 60.0
+    reserve_gal = _fuel_written_on_the_log(
+        _reserve_gph(legs, cruise_point.gph) * conditions.reserve_minutes / 60.0
+    )
     remaining = aircraft.fuel_on_board_gal - cumulative_fuel
     if remaining < reserve_gal:
         warnings.append(
@@ -1657,6 +1834,24 @@ def _apply_override(
         overridden.append("tas_kt")
 
     return Wind(from_deg, speed_kt), tas_kt, tuple(overridden)
+
+
+def _fuel_written_on_the_log(gallons: float) -> float:
+    """Fuel rounded **up** to the tenth of a gallon a pilot writes in the box.
+
+    Every fuel figure on a paper navigation log is rounded up to the nearest
+    tenth and the column is then added from those figures, so that is what this
+    log does too: each row is rounded as it is emitted and the running total,
+    the landing figure and the reserve check are all built from the rounded
+    rows. Round for display alone and the column stops adding up, which on a
+    log a pilot totals by hand is worse than being a tenth out.
+
+    Up, never to nearest: a plan should not come out of the arithmetic holding
+    less fuel than it started with. The tolerance keeps a figure that is
+    already an exact tenth from being pushed to the next one by the last bit of
+    a float -- 2.6 must not become 2.7.
+    """
+    return math.ceil(gallons * 10.0 - 1e-9) / 10.0
 
 
 def _leg_fuel(

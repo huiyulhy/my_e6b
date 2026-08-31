@@ -20,13 +20,19 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    # matplotlib is used only by tools/plot_*.py, which run on the desktop and
+    # produce diagnostic plots rather than shipped artefacts.
+    "matplotlib>=3.9",
     "playwright>=1.61.0",
     # pyshp and shapely are used only by tools/build_*.py, which run on the
     # desktop; their artefacts in data/ are committed and shipped.
     "pyshp>=2.3.1",
     "shapely>=2.1.2",
     "pytest>=9.1.1",
-    "ruff>=0.16.0",
+    # Pinned exactly, not floored: ruff changes its default rule set between
+    # releases, and an unpinned linter turns an unrelated upgrade into a
+    # red build. See the [tool.ruff.lint] note.
+    "ruff==0.16.0",
 ]
 
 [build-system]
@@ -41,3 +47,42 @@ testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 100
+
+# The rule set is written down rather than inherited. Ruff's *default* selection
+# is not stable across releases -- 0.16 enables flake8-datetimez, which earlier
+# versions did not, so `make lint` started failing on three files that had not
+# been touched since the initial commit. With `ruff>=0.16.0` and no `select`,
+# any future release can break the build without a line of this code changing.
+# Hence both halves: an explicit list here, and an exact pin in the dev group.
+# Upgrading ruff is then a deliberate act with a visible diff.
+[tool.ruff.lint]
+select = [
+    "E4", "E7", "E9",  # pycodestyle: imports, statements, syntax
+    "F",               # pyflakes
+    "I",               # import sorting
+    "UP",              # pyupgrade -- the floor is 3.13, so use it
+    "C4",              # comprehensions
+    "DTZ",             # naive datetimes; every date in this program is Zulu
+    "ISC",             # implicit string concatenation
+    "PIE",             # assorted dead code
+    "A",               # shadowing builtins
+    "YTT",             # sys.version misuse
+    "EXE",             # shebang / executable-bit agreement
+]
+
+# Deliberately *not* selected, having been measured against this repo rather
+# than assumed. Each is a real cleanup, none is a correctness issue, and all of
+# them touch files unrelated to whatever change is being linted:
+#   B905   14 hits -- `zip()` without `strict=`. Worth doing, but each call
+#          needs its own decision about whether unequal lengths should raise.
+#   W291   16 hits -- trailing whitespace. `make fmt` will take these.
+#   SIM300  6 hits -- Yoda conditions.
+#   T20    94 hits -- `print()`, which is how every tools/ script reports.
+# Enable them one at a time with a cleanup pass, not all at once.
+
+[tool.ruff.lint.per-file-ignores]
+# matplotlib.use("Agg") must run before pyplot is imported, and the engine is
+# only importable after sys.path is set -- both force imports below the top.
+"tools/*" = ["E402"]
+# A lambda is the clearest way to write a one-line expectation in a test.
+"tests/*" = ["E731"]

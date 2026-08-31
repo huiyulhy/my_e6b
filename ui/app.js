@@ -37,6 +37,19 @@ const api = {
     const r = await fetch('/api/status');
     return r.json();
   },
+  /** Surface weather at one field, resolved from METAR, TAF and model.
+   *
+   *  No `time`: there is no departure time in the form, so this is the
+   *  weather now. An engine-level refusal ("no observation for this field")
+   *  comes back as ok:false rather than as an HTTP error, so both shapes are
+   *  normalised here into something with an `error` on it or not. */
+  async surface(ident) {
+    const r = await fetch(`/api/wx/surface?ident=${encodeURIComponent(ident)}`);
+    const body = await r.json().catch(() => null);
+    if (!r.ok) return { error: (body && body.detail) || `no weather for ${ident}` };
+    if (body && body.ok === false) return { error: body.error };
+    return body;
+  },
 
   async plan(body) {
     const r = await fetch('/api/plan', {
@@ -45,6 +58,20 @@ const api = {
       body: JSON.stringify(body),
     });
     return r.json();
+  },
+  /** The navlog as a paper-nav-log CSV. Returns the file, not JSON: the
+   *  server owns the format and the filename, so there is nothing to build
+   *  here beyond saving what comes back. */
+  async navlogCsv(body) {
+    const r = await fetch('/api/navlog.csv', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) return { error: (await r.json()).error || 'could not export' };
+    const disposition = r.headers.get('Content-Disposition') || '';
+    const named = /filename="([^"]+)"/.exec(disposition);
+    return { blob: await r.blob(), filename: named ? named[1] : 'navlog.csv' };
   },
   async consistency(body) {
     const r = await fetch('/api/consistency', {
@@ -107,6 +134,15 @@ let consistencyReport = null;
  *  engine computed them on the last plan, indexed by route position. Derived
  *  and never sent back: the inputs live on the waypoints. */
 let fieldAir = [];
+
+/** What the last "Get weather" fetched, keyed by waypoint name.
+ *
+ *  Kept beside the route rather than on it: the values it filled in are the
+ *  pilot's to edit afterwards, and once edited the provenance line would be
+ *  claiming a METAR said something it did not. So each entry also remembers
+ *  what it wrote, and the line disappears from any box that has since moved.
+ */
+let fieldWx = new Map();
 
 const $ = (id) => document.getElementById(id);
 const setStatus = (text) => { $('status').textContent = text; };
@@ -655,6 +691,12 @@ function isFieldPoint(waypoint, index) {
  *  Altimeter setting and temperature both fall back to the route-wide figures
  *  when left blank, which the placeholders say. Departure and destination are
  *  often an hour and a different airmass apart, so each gets its own.
+ *
+ *  The surface wind is entered true, the way the METAR gives it; the engine
+ *  converts it to magnetic to line it up with the runway designators. It picks
+ *  the runway end, corrects the takeoff and landing distances, and its
+ *  crosswind is checked against the maximum demonstrated. Blank leaves the
+ *  go/no-go on the no-wind book figures and says so beside them.
  */
 function fieldBlock(waypoint, index) {
   if (!isFieldPoint(waypoint, index)) return '';
@@ -670,10 +712,69 @@ function fieldBlock(waypoint, index) {
       `<input class="oat" type="number" step="1" min="-40" max="55" ` +
         `placeholder="ISA" value="${waypoint.oat_c ?? ''}"></label>` +
     `</div>` +
+    `<div class="coords field">` +
+    `<label title="Surface wind direction, degrees TRUE as the METAR reports ` +
+      `it. Blank leaves the runway distances at their no-wind figures">Wind` +
+      `<input class="wind-from" type="number" step="10" min="0" max="360" ` +
+        `placeholder="—" value="${waypoint.wind_from_deg ?? ''}"></label>` +
+    `<label title="Surface wind speed, knots. 0 is calm">kt` +
+      `<input class="wind-kt" type="number" step="1" min="0" max="99" ` +
+        `placeholder="—" value="${waypoint.wind_speed_kt ?? ''}"></label>` +
+    `<label title="Peak gust, knots. Used for the crosswind and for a ` +
+      `tailwind, ignored where it would only flatter the numbers">Gust` +
+      `<input class="wind-gust" type="number" step="1" min="0" max="99" ` +
+        `placeholder="—" value="${waypoint.gust_kt ?? ''}"></label>` +
+    `</div>` +
+    fieldWxText(waypoint) +
     // Filled in from the last plan, so the pressure and density altitude the
     // engine computed are the ones shown -- there is no second implementation
     // of the atmosphere in the browser to drift from it.
     `<div class="field-air" data-index="${index}">${fieldAirText(index)}</div>`;
+}
+
+/** Where this field's numbers came from, after a "Get weather".
+ *
+ *  Only for the boxes that still hold what was fetched. A pilot who has since
+ *  typed over the temperature is not flying a METAR temperature, and a line
+ *  that kept saying so would be the kind of quiet lie this whole panel exists
+ *  to avoid. An entry with nothing left to claim disappears.
+ */
+function fieldWxText(waypoint) {
+  const wx = fieldWx.get(waypoint.name);
+  if (!wx) return '';
+  if (wx.error) {
+    return `<div class="field-wx none">No weather for ${waypoint.name}: ` +
+      `${wx.error}</div>`;
+  }
+  const still = (field) => waypoint[field] === wx.wrote[field];
+  const named = [
+    ['wind_from_deg', 'wind'],
+    ['oat_c', 'OAT'],
+    ['altimeter_inhg', 'alt set'],
+  ].filter(([field]) => field in wx.wrote && still(field));
+  if (!named.length) return '';
+  const from = named
+    .map(([field, label]) => `${label} ${wx.sources[wxSourceKey(field)] || '?'}`)
+    .join(' · ');
+  const notes = wx.notes.length ? ` title="${wx.notes.join('; ')}"` : '';
+  return `<div class="field-wx"${notes}>${wx.station} ` +
+    `${zulu(wx.valid_time)} — ${from}</div>`;
+}
+
+/** The `sources` key a filled-in box was resolved under.
+ *
+ *  Direction and speed arrive as one decision in the engine -- a wind is a
+ *  vector or it is nothing -- so both boxes answer to the one source. */
+function wxSourceKey(field) {
+  return field === 'wind_from_deg' || field === 'wind_speed_kt' ? 'wind' : field;
+}
+
+/** An ISO instant as the four-digit Zulu time a report is stamped with. */
+function zulu(iso) {
+  const when = new Date(iso);
+  if (Number.isNaN(when.getTime())) return '';
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${pad(when.getUTCHours())}${pad(when.getUTCMinutes())}Z`;
 }
 
 /** The derived line under one waypoint's field inputs, or empty. */
@@ -811,6 +912,25 @@ function renderWaypointList() {
         return true;
       });
       bind('.oat', (v) => { waypoint.oat_c = v; return true; });
+      // True degrees, as reported. 360 and 0 are the same wind; the engine
+      // wraps it either way.
+      bind('.wind-from', (v) => {
+        if (v !== null && (v < 0 || v > 360)) return false;
+        waypoint.wind_from_deg = v;
+        return true;
+      });
+      bind('.wind-kt', (v) => {
+        if (v !== null && (v < 0 || v > 99)) return false;
+        waypoint.wind_speed_kt = v;
+        return true;
+      });
+      // A "gust" at or below the steady wind is not one; the engine drops it
+      // rather than refusing the plan over it.
+      bind('.wind-gust', (v) => {
+        if (v !== null && (v < 0 || v > 99)) return false;
+        waypoint.gust_kt = v;
+        return true;
+      });
     }
     const picker = li.querySelector('select.segment');
     if (picker) {
@@ -1127,6 +1247,9 @@ function planBody() {
       generated: !!w.generated,
       altimeter_inhg: w.altimeter_inhg ?? null,
       oat_c: w.oat_c ?? null,
+      wind_from_deg: w.wind_from_deg ?? null,
+      wind_speed_kt: w.wind_speed_kt ?? null,
+      gust_kt: w.gust_kt ?? null,
     })),
     planning_mode: planningMode,
     overrides: overridesPayload(),
@@ -1200,10 +1323,24 @@ function adoptFieldAir(resolved) {
  */
 function adoptResolvedRoute(resolved) {
   if (!Array.isArray(resolved) || !resolved.length) return;
+  // A planner-owned point is compared on where it *is*, not just what it is
+  // called: a top of climb moves along the route whenever the plan changes
+  // under it -- a new cruise altitude, or a wind typed on the climb row -- and
+  // the shape of the list does not change with it. Without this the sidebar
+  // keeps showing the previous TOC's position and crossing altitude while the
+  // map draws the current one, which is two answers to the same question.
+  //
+  // Only for generated points. The pilot's own are left alone so that
+  // re-rendering never fights with whatever they are typing into.
+  const settled = (w, existing) =>
+    Math.abs(w.lat - existing.lat) < 1e-6
+    && Math.abs(w.lon - existing.lon) < 1e-6
+    && Math.abs((w.altitude_ft ?? 0) - (existing.altitude_ft ?? 0)) < 1;
   const same = resolved.length === route.length && resolved.every((w, i) =>
     w.name === route[i].name
     && !!w.generated === !!route[i].generated
-    && (w.segment_type || 'automatic') === (route[i].segment_type || 'automatic'));
+    && (w.segment_type || 'automatic') === (route[i].segment_type || 'automatic')
+    && (!w.generated || settled(w, route[i])));
   if (same) return;
   route = resolved.map((w, i) => ({
     // Keep anything of the pilot's the engine does not round-trip.
@@ -1216,6 +1353,9 @@ function adoptResolvedRoute(resolved) {
     generated: !!w.generated,
     altimeter_inhg: w.altimeter_inhg,
     oat_c: w.oat_c,
+    wind_from_deg: w.wind_from_deg,
+    wind_speed_kt: w.wind_speed_kt,
+    gust_kt: w.gust_kt,
   }));
   renderWaypointList();
   renderMarkers();
@@ -1394,6 +1534,16 @@ function renderChecklist(checklist) {
   const ft = (v) => (v == null ? '—' : `${Math.round(v)}`);
   const mark = (p) => (p === true ? 'ok' : p === false ? 'short' : 'unknown');
   const label = (p) => (p === true ? 'OK' : p === false ? 'SHORT' : '?');
+  // Signed, because the sign is the whole story: -6 on the runway you were
+  // going to use is a longer roll, not a shorter one.
+  const kt = (v) => (v == null ? '—' : `${v > 0 ? '+' : ''}${Math.round(v)}`);
+  const windText = (c) => {
+    if (c.wind_speed_kt == null) return 'wind not given';
+    if (c.wind_speed_kt === 0) return 'wind calm';
+    const gust = c.gust_kt == null ? '' : `G${Math.round(c.gust_kt)}`;
+    return `Wind ${String(Math.round(c.wind_from_deg)).padStart(3, '0')}°M at ` +
+      `${Math.round(c.wind_speed_kt)}${gust} kt`;
+  };
 
   for (const check of checklist.airports) {
     const section = document.createElement('div');
@@ -1409,13 +1559,20 @@ function renderChecklist(checklist) {
         `Field ${ft(check.elevation_ft)} ft · OAT ${Math.round(check.oat_c)} °C · ` +
         `Pressure alt ${ft(check.pressure_altitude_ft)} ft · ` +
         `<strong>Density alt ${ft(check.density_altitude_ft)} ft</strong> · ` +
-        `${ft(check.weight_lb)} lb · margin ${Math.round(check.margin * 100)}%` +
+        `${ft(check.weight_lb)} lb · margin ${Math.round(check.margin * 100)}% · ` +
+        `<strong>${windText(check)}</strong>` +
       `</div>`;
 
     const table = document.createElement('table');
     table.className = 'runways';
     table.innerHTML =
       `<thead><tr><th>Runway</th><th>Surface</th>` +
+      `<th title="The end with the better headwind — the one these numbers ` +
+        `are for">Use</th>` +
+      `<th class="num" title="Headwind on that end; negative is a tailwind">` +
+        `Head</th>` +
+      `<th class="num" title="Crosswind, at the gust where there is one">` +
+        `Cross</th>` +
       `<th class="num">Length</th><th class="num">Roll</th>` +
       `<th class="num" title="Book distance over a 50 ft obstacle">Book 50</th>` +
       `<th class="num" title="Book distance plus your margin">Required</th>` +
@@ -1427,20 +1584,32 @@ function renderChecklist(checklist) {
       tr.innerHTML =
         `<td>${runway.runway || '—'}</td>` +
         `<td>${runway.surface || '—'}${runway.dry_grass_applied ? ' (grass)' : ''}</td>` +
+        `<td>${runway.end_used || '—'}</td>` +
+        `<td class="num">${kt(runway.headwind_kt)}</td>` +
+        `<td class="num${runway.crosswind_exceeds_demonstrated ? ' over' : ''}">` +
+          `${ft(runway.crosswind_kt)}` +
+          // A side on a crosswind that rounds to nothing is noise: straight
+          // down the runway has no left or right about it.
+          `${runway.crosswind_kt >= 0.5
+            ? (runway.crosswind_from_right ? ' R' : ' L') : ''}` +
+        `</td>` +
         `<td class="num">${ft(runway.runway_available_ft)}</td>` +
         `<td class="num">${ft(runway.ground_roll_ft)}</td>` +
         `<td class="num">${ft(runway.over_50ft_ft)}</td>` +
         `<td class="num">${ft(runway.required_ft)}</td>` +
         `<td class="num">${ft(runway.spare_ft)}</td>` +
         `<td><span class="pill ${mark(runway.passes)}">` +
-        // A blank chart cell is still a no-go, but calling it SHORT would be
-        // a lie -- nothing was measured against the runway at all.
-        `${runway.outside_envelope ? 'NO DATA' : label(runway.passes)}</span></td>`;
+        // A blank chart cell, a crosswind past the demonstrated maximum and a
+        // runway that is simply too short all read as no-go, but they are not
+        // the same problem and the pilot acts on each differently.
+        `${runway.outside_envelope ? 'NO DATA'
+          : runway.crosswind_exceeds_demonstrated ? 'XWIND'
+            : label(runway.passes)}</span></td>`;
       tbody.appendChild(tr);
       if (runway.note) {
         const note = document.createElement('tr');
         note.className = 'note';
-        note.innerHTML = `<td colspan="8">${runway.note}</td>`;
+        note.innerHTML = `<td colspan="11">${runway.note}</td>`;
         tbody.appendChild(note);
       }
     }
@@ -1591,6 +1760,132 @@ $('reset-edits').addEventListener('click', () => {
 for (const id of ['runway-margin', 'fuel-margin']) {
   $(id).addEventListener('change', requestPlan);
 }
+
+/** Fill every airport on the route from its current surface weather.
+ *
+ *  One button for the whole route rather than one per field: the fields are
+ *  fetched together anyway, and a pilot who wants the weather wants all of it
+ *  before deciding to go. The three requests per station are the server's
+ *  problem -- it caches them -- so this is one round trip per airport.
+ *
+ *  Only what the report actually gives is written. A station with no
+ *  temperature leaves the temperature box alone rather than blanking it, and
+ *  the values are rounded to what a pilot would have typed off the ATIS: the
+ *  half-degree thrown away is under 60 ft of density altitude, well inside the
+ *  margin the checklist already carries.
+ */
+async function getWeather() {
+  const button = $('get-weather');
+  // Airports only: a fix or a private strip has no station to ask about, and
+  // the ident is what the route sends as the waypoint's name.
+  const fields = route.filter((w, i) =>
+    !w.generated && w.kind === 'airport' && isFieldPoint(w, i));
+  if (!fields.length) {
+    flashButton(button, 'No airports on the route');
+    return;
+  }
+
+  button.disabled = true;
+  button.textContent = 'Fetching…';
+  let reports;
+  try {
+    reports = await Promise.all(fields.map((w) => api.surface(w.name)));
+  } catch {
+    // The one thing worse than no weather is a button that stays greyed out
+    // because the network went away mid-fetch.
+    button.disabled = false;
+    flashButton(button, 'Weather unavailable');
+    return;
+  }
+  button.disabled = false;
+
+  let filled = 0;
+  const failed = [];
+  fields.forEach((waypoint, n) => {
+    const report = reports[n];
+    if (!report || report.error) {
+      fieldWx.set(waypoint.name, { error: (report && report.error) || 'no answer' });
+      failed.push(waypoint.name);
+      return;
+    }
+    const wrote = {};
+    if (report.altimeter_inhg != null) {
+      wrote.altimeter_inhg = Math.round(report.altimeter_inhg * 100) / 100;
+    }
+    if (report.oat_c != null) wrote.oat_c = Math.round(report.oat_c);
+    // Direction and speed together or not at all -- half a wind is not one,
+    // and a direction with no speed would read as a calm from the north.
+    if (report.wind_from_deg != null && report.wind_speed_kt != null) {
+      wrote.wind_from_deg = Math.round(report.wind_from_deg);
+      wrote.wind_speed_kt = Math.round(report.wind_speed_kt);
+      // A report with no gust in it says there is no gust. Keeping the last
+      // one would hold a peak that has since dropped against the crosswind
+      // limit, so the wind is replaced whole. What arrives is already known
+      // to belong to this wind -- `weather.resolve_surface` drops a gust
+      // that came from a weaker source than the wind it would attach to.
+      wrote.gust_kt = report.gust_kt == null ? null : Math.round(report.gust_kt);
+    }
+    Object.assign(waypoint, wrote);
+    // The departure setting is the one to fly the route on, on the same
+    // reasoning as typing it by hand -- and only while the route field is
+    // still standard, so it never overwrites a figure somebody chose.
+    if (waypoint === route[0] && wrote.altimeter_inhg != null
+        && +$('altimeter').value === 29.92) {
+      $('altimeter').value = wrote.altimeter_inhg;
+    }
+    fieldWx.set(waypoint.name, {
+      station: report.station,
+      valid_time: report.valid_time,
+      sources: report.sources || {},
+      notes: report.notes || [],
+      wrote,
+    });
+    if (Object.keys(wrote).length) filled += 1;
+  });
+
+  renderWaypointList();
+  requestPlan();
+  flashButton(button, failed.length
+    ? `${filled} filled, ${failed.length} unavailable`
+    : `Filled ${filled} field${filled === 1 ? '' : 's'}`);
+}
+
+const flashTimers = new Map();
+
+/** Say what happened on the button itself, then put its label back.
+ *
+ *  The result belongs where the click was, not in a banner across the panel:
+ *  it is one line of outcome and it stops being interesting immediately. */
+function flashButton(button, message) {
+  button.textContent = message;
+  clearTimeout(flashTimers.get(button));
+  flashTimers.set(button, setTimeout(() => {
+    button.textContent = button.dataset.label;
+  }, 2600));
+}
+
+$('get-weather').dataset.label = 'Get weather';
+$('get-weather').addEventListener('click', getWeather);
+
+$('download-csv').addEventListener('click', async () => {
+  if (!lastPlan?.ok) return;
+  const button = $('download-csv');
+  const { blob, filename, error } = await api.navlogCsv(planBody());
+  if (error) {
+    button.textContent = 'Export failed';
+    setTimeout(() => { button.textContent = 'Download CSV'; }, 1600);
+    return;
+  }
+  // Handed to the browser as a blob URL and revoked straight after: the file
+  // is built per click from the plan on screen, so keeping the URL alive would
+  // only pin a stale copy in memory.
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  link.click();
+  URL.revokeObjectURL(url);
+});
 
 $('copy').addEventListener('click', async () => {
   if (!lastPlan?.ok) return;
