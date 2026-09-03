@@ -109,6 +109,53 @@ class Waypoint:
     wind_speed_kt: float | None = None
     gust_kt: float | None = None
 
+    # The rest of the field's report, for the go/no-go's VFR check. Only the
+    # parts a VFR decision turns on: how far you can see, how low the cloud
+    # is, and what kind of cloud it is -- an overcast has to clear the pattern
+    # and a vertical visibility is not something to fly under at all.
+    #
+    # `sky_reported` is separate from the ceiling on purpose. A clear sky and
+    # a source that does not observe cloud both arrive with no ceiling, and
+    # the checklist has to call the first VFR and the second unknown.
+    visibility_sm: float | None = None
+    ceiling_ft_agl: float | None = None
+    ceiling_cover: str = ""  # BKN | OVC | OVX | VV; "" when there is no ceiling
+    sky_reported: bool = False
+
+    # Whether a report was obtained for this field at all. The distinction the
+    # empty values cannot carry: a model-only forecast answers with no cloud
+    # and no visibility in it, which looks exactly like never having asked.
+    # The first is an unknown the pilot should see; the second is silence.
+    weather_reported: bool = False
+
+    # The field's published traffic pattern altitude in feet AGL, which sets
+    # how high an overcast has to be. `None` takes the standard 1,000 ft.
+    pattern_altitude_agl_ft: float | None = None
+
+    @property
+    def field_weather_report(self) -> preflight.FieldWeather | None:
+        """The report as the go/no-go reads it, or `None` if there is none.
+
+        None only where nothing was ever asked for. A report that arrived
+        saying nothing useful is still a report, and it comes back as an
+        unknown rather than as an absence -- a model forecast observes no
+        cloud, and "no cloud observed" is not "no cloud".
+        """
+        if not (
+            self.weather_reported
+            or self.visibility_sm is not None
+            or self.ceiling_ft_agl is not None
+            or self.ceiling_cover
+            or self.sky_reported
+        ):
+            return None
+        return preflight.FieldWeather(
+            visibility_sm=self.visibility_sm,
+            ceiling_ft_agl=self.ceiling_ft_agl,
+            ceiling_cover=self.ceiling_cover,
+            sky_reported=self.sky_reported,
+        )
+
 
 @dataclass(frozen=True)
 class ProfileSegment:

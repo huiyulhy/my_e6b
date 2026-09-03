@@ -43,10 +43,21 @@ const api = {
    *  weather now. An engine-level refusal ("no observation for this field")
    *  comes back as ok:false rather than as an HTTP error, so both shapes are
    *  normalised here into something with an `error` on it or not. */
-  async surface(ident) {
-    const r = await fetch(`/api/wx/surface?ident=${encodeURIComponent(ident)}`);
+  async surface(ident, isoTime) {
+    const at = isoTime ? `&time=${encodeURIComponent(isoTime)}` : '';
+    const r = await fetch(`/api/wx/surface?ident=${encodeURIComponent(ident)}${at}`);
     const body = await r.json().catch(() => null);
     if (!r.ok) return { error: (body && body.detail) || `no weather for ${ident}` };
+    if (body && body.ok === false) return { error: body.error };
+    return body;
+  },
+
+  async aloft(lat, lon, isoTime) {
+    const p = new URLSearchParams({ lat, lon });
+    if (isoTime) p.set('time', isoTime);
+    const r = await fetch(`/api/wx/aloft?${p}`);
+    const body = await r.json().catch(() => null);
+    if (!r.ok) return { error: (body && body.detail) || 'no forecast for this point' };
     if (body && body.ok === false) return { error: body.error };
     return body;
   },
@@ -143,6 +154,30 @@ let fieldAir = [];
  *  what it wrote, and the line disappears from any box that has since moved.
  */
 let fieldWx = new Map();
+
+/** The forecast column over each leg the pilot drew, from the last fetch.
+ *
+ *  One per leg rather than one for the route: the wind over the coast is not
+ *  the wind over the valley, and a single column stretched across the whole
+ *  trip is the FD product's mistake in a different shape. The engine keys
+ *  them by position, so which row a column ends up on survives the tops of
+ *  climb moving -- which they do, under the very wind being applied.
+ *
+ *  Sent with the plan, not stored on the route: a column is a forecast for a
+ *  piece of sky at a time, and the moment the route changes it is a forecast
+ *  for somewhere else.
+ */
+let windsAloft = [];
+
+/** Where the aloft columns came from, for the line under the navlog. */
+let windsAloftWx = null;
+
+/** Drop the forecast columns. The route they were fetched for is gone. */
+function clearWindsAloft() {
+  if (!windsAloft.length && windsAloftWx === null) return;
+  windsAloft = [];
+  windsAloftWx = null;
+}
 
 const $ = (id) => document.getElementById(id);
 const setStatus = (text) => { $('status').textContent = text; };
@@ -649,6 +684,9 @@ function onRouteChanged() {
   // The derived pressure and density altitudes are
   // indexed by route position, and the next plan is what re-earns them.
   if (fieldAir.length !== route.length) fieldAir = [];
+  // The columns were forecast over the legs that just changed shape, and at
+  // the times the old route reached them. Both claims are now false.
+  clearWindsAloft();
   clearConsistency();
   renderWaypointList();
   renderMarkers();
@@ -663,6 +701,23 @@ function onRouteChanged() {
  *  temperatures, so a field altimeter setting has nothing left to say. */
 const LOW_ALTITUDE_FT = 3000;
 
+/** Whether this waypoint is a field.
+ *
+ *  The database stamps an airport with its size -- `large_airport`,
+ *  `medium_airport`, `small_airport` -- and that is what a search result
+ *  carries into the route. Only the map popup stamps a bare "airport". Every
+ *  test that asked for the bare word therefore missed every airport added
+ *  from the search box: Get weather found no airports on the route, an
+ *  airport's published position was offered as editable lat/lon boxes, and an
+ *  intermediate field had no "stop" checkbox. Size is not a different sort of
+ *  thing, so it is asked about in one place.
+ *
+ *  `server/main.py:_is_airport` is the same predicate on the other side.
+ */
+function isAirport(waypoint) {
+  return waypoint.kind === 'airport' || String(waypoint.kind || '').endsWith('_airport');
+}
+
 /** Whether this waypoint is somewhere the air *at the ground* matters.
  *
  *  Every airport, because one may become a stop and all of them report; the
@@ -674,7 +729,7 @@ const LOW_ALTITUDE_FT = 3000;
 function isFieldPoint(waypoint, index) {
   if (waypoint.generated) return false;
   if (index === 0 || index === route.length - 1) return true;
-  if (waypoint.kind === 'airport' || waypoint.is_landing) return true;
+  if (isAirport(waypoint) || waypoint.is_landing) return true;
   if (waypoint.elevation_ft != null) return true;
   return waypoint.altitude_ft != null && waypoint.altitude_ft < LOW_ALTITUDE_FT;
 }
@@ -703,7 +758,7 @@ function fieldBlock(waypoint, index) {
   return `<div class="coords field">` +
     `<label title="Field or ground elevation, in feet MSL">Elev` +
       `<input class="elev-in" type="number" step="1" min="-1500" max="15000" ` +
-        `placeholder="${waypoint.kind === 'airport' ? 'published' : 'unknown'}" ` +
+        `placeholder="${isAirport(waypoint) ? 'published' : 'unknown'}" ` +
         `value="${waypoint.elevation_ft ?? ''}"></label>` +
     `<label title="Field altimeter setting, off this station's METAR or ATIS">` +
       `Alt&nbsp;set<input class="qnh" type="number" step="0.01" min="27" max="32" ` +
@@ -805,7 +860,6 @@ function renderWaypointList() {
   list.innerHTML = '';
   route.forEach((waypoint, index) => {
     const li = document.createElement('li');
-    li.draggable = true;
     li.dataset.index = index;
     // Colours the identifier magenta for a VFR checkpoint, matching the map.
     li.classList.add(`kind-${waypoint.kind}`);
@@ -813,7 +867,7 @@ function renderWaypointList() {
     if (waypoint.generated) li.classList.add('generated');
     // Only an intermediate airport can be a stop: the first and last points
     // are always a departure and a destination, and are landed at anyway.
-    const canLand = waypoint.kind === 'airport'
+    const canLand = isAirport(waypoint)
       && index > 0 && index < route.length - 1;
     const landing = canLand
       ? `<label class="landing" title="Land here — adds a descent in and a climb out">` +
@@ -842,7 +896,7 @@ function renderWaypointList() {
     // An airport's position comes from the database and is not ours to move.
     // A point dropped on the map is arbitrary, so it can be typed exactly --
     // off a chart, or to place a fix on an airway intersection.
-    const freeform = waypoint.kind !== 'airport';
+    const freeform = !isAirport(waypoint);
     const coords = freeform
       ? `<div class="coords">` +
         `<label>Lat<input class="lat" type="number" step="0.0001" ` +
@@ -857,7 +911,7 @@ function renderWaypointList() {
           `${waypoint.lat.toFixed(4)}, ${waypoint.lon.toFixed(4)}</div>`;
     li.innerHTML =
       `<div class="wp-row">` +
-        `<span class="drag">⠿</span>` +
+        `<span class="drag" title="Drag to reorder">⠿</span>` +
         `<span class="seq">${index + 1}</span>` +
         `<span class="name">${waypoint.name}</span>` +
         segment +
@@ -877,9 +931,6 @@ function renderWaypointList() {
           if (!apply(value)) return;
           onRouteChanged();
         });
-        // Typing in a field must not start a drag-reorder of the row.
-        input.addEventListener('mousedown', (e) => e.stopPropagation());
-        input.draggable = false;
       };
       bind('.lat', (v) => {
         if (v === null || v < -90 || v > 90) return false;
@@ -946,8 +997,6 @@ function renderWaypointList() {
         // row: the next plan drops the edits whose legs actually moved.
         onRouteChanged();
       });
-      picker.addEventListener('mousedown', (e) => e.stopPropagation());
-      picker.draggable = false;
     }
     const box = li.querySelector('.landing input');
     if (box) {
@@ -964,20 +1013,83 @@ function renderWaypointList() {
   $('route-hint').hidden = route.length >= 2;
 }
 
-let dragFrom = null;
+/*  Reordering runs on pointer events rather than HTML5 drag-and-drop: Safari
+ *  on iPadOS never fires dragstart from a finger, so the bar could only be
+ *  reordered with a mouse. Pointer events cover both, and the gesture starts
+ *  on the ⠿ handle alone -- a drag anywhere else in the row would fight the
+ *  text fields and the list's own scrolling.
+ *
+ *  The row is not moved while the finger is down. Only the insertion line
+ *  follows the pointer, and the route is spliced once on release: a live
+ *  reorder would renumber the rows mid-gesture and re-plan on every frame. */
+let dragState = null;
+
+/*  Which slot the pointer is over -- 0..route.length, counting the gaps
+ *  between rows, not the rows. Rows differ in height (a landing row carries
+ *  a weather block), so each is measured rather than assumed. */
+function dropSlotAt(list, clientY) {
+  const rows = [...list.children];
+  for (let i = 0; i < rows.length; i++) {
+    const rect = rows[i].getBoundingClientRect();
+    if (clientY < rect.top + rect.height / 2) return i;
+  }
+  return rows.length;
+}
+
+function showDropLine(list, slot) {
+  const rows = [...list.children];
+  rows.forEach((row) => row.classList.remove('drop-above', 'drop-below'));
+  if (slot === null) return;
+  if (slot < rows.length) rows[slot].classList.add('drop-above');
+  else if (rows.length) rows[rows.length - 1].classList.add('drop-below');
+}
+
+function endReorder(commit) {
+  if (!dragState) return;
+  const { li, list, handle, pointerId, slot } = dragState;
+  dragState = null;
+  li.classList.remove('dragging');
+  showDropLine(list, null);
+  if (handle.hasPointerCapture(pointerId)) handle.releasePointerCapture(pointerId);
+  if (!commit || slot === null) return;
+  const from = +li.dataset.index;
+  // The slot counts gaps in the list as it stands, with the dragged row still
+  // in it; once that row is spliced out every gap below it shifts up one.
+  const to = slot > from ? slot - 1 : slot;
+  if (to !== from) moveWaypoint(from, to);
+}
+
 function bindDragToReorder(li) {
-  li.addEventListener('dragstart', () => {
-    dragFrom = +li.dataset.index;
-    li.classList.add('dragging');
-  });
-  li.addEventListener('dragend', () => li.classList.remove('dragging'));
-  li.addEventListener('dragover', (e) => e.preventDefault());
-  li.addEventListener('drop', (e) => {
+  const handle = li.querySelector('.drag');
+  if (!handle) return;
+  handle.addEventListener('pointerdown', (e) => {
+    // Left button or a finger; a right-click must not start a reorder.
+    if (e.button !== 0) return;
     e.preventDefault();
-    const to = +li.dataset.index;
-    if (dragFrom !== null && dragFrom !== to) moveWaypoint(dragFrom, to);
-    dragFrom = null;
+    handle.setPointerCapture(e.pointerId);
+    dragState = {
+      li, list: li.parentElement, handle, pointerId: e.pointerId,
+      startY: e.clientY, slot: null, active: false,
+    };
   });
+  handle.addEventListener('pointermove', (e) => {
+    if (!dragState || dragState.pointerId !== e.pointerId) return;
+    // A few pixels of slop, so a tap that trembles is still a tap.
+    if (!dragState.active) {
+      if (Math.abs(e.clientY - dragState.startY) < 5) return;
+      dragState.active = true;
+      li.classList.add('dragging');
+    }
+    dragState.slot = dropSlotAt(dragState.list, e.clientY);
+    showDropLine(dragState.list, dragState.slot);
+  });
+  handle.addEventListener('pointerup', (e) => {
+    if (!dragState || dragState.pointerId !== e.pointerId) return;
+    endReorder(dragState.active);
+  });
+  // A cancel is the browser taking the gesture over -- a scroll it decided
+  // was one, or a palm. The route is left as it was.
+  handle.addEventListener('pointercancel', () => endReorder(false));
 }
 
 function renderMarkers() {
@@ -1000,7 +1112,7 @@ function renderMarkers() {
       route[index].lon = +position.lng.toFixed(5);
       // Dragging an airport off its published position makes it a plain
       // waypoint; keeping the identifier would be a lie.
-      if (route[index].kind === 'airport' && index !== 0 && index !== route.length - 1) {
+      if (isAirport(route[index]) && index !== 0 && index !== route.length - 1) {
         route[index].kind = 'waypoint';
       }
       onRouteChanged();
@@ -1250,9 +1362,18 @@ function planBody() {
       wind_from_deg: w.wind_from_deg ?? null,
       wind_speed_kt: w.wind_speed_kt ?? null,
       gust_kt: w.gust_kt ?? null,
+      // The rest of the field's report, for the VFR half of the go/no-go.
+      // `sky_reported` travels with them: without it the engine cannot tell a
+      // reported clear sky from a source that never looked.
+      visibility_sm: w.visibility_sm ?? null,
+      ceiling_ft_agl: w.ceiling_ft_agl ?? null,
+      ceiling_cover: w.ceiling_cover ?? '',
+      sky_reported: !!w.sky_reported,
+      weather_reported: !!w.weather_reported,
     })),
     planning_mode: planningMode,
     overrides: overridesPayload(),
+    winds_aloft: windsAloft,
     runway_margin: +$('runway-margin').value / 100,
     fuel_margin: +$('fuel-margin').value / 100,
     cruise_altitude_ft: +$('altitude').value,
@@ -1534,9 +1655,30 @@ function renderChecklist(checklist) {
   const ft = (v) => (v == null ? '—' : `${Math.round(v)}`);
   const mark = (p) => (p === true ? 'ok' : p === false ? 'short' : 'unknown');
   const label = (p) => (p === true ? 'OK' : p === false ? 'SHORT' : '?');
+  // The field as a whole, where "SHORT" would be a lie: a field can fail on
+  // its sky with 10,000 ft of runway under it.
+  const fieldLabel = (p) => (p === true ? 'OK' : p === false ? 'NO GO' : '?');
   // Signed, because the sign is the whole story: -6 on the runway you were
   // going to use is a longer roll, not a shorter one.
   const kt = (v) => (v == null ? '—' : `${v > 0 ? '+' : ''}${Math.round(v)}`);
+  // What the sky is doing, in the words the report used.
+  const skyText = (wx) => {
+    if (wx.obscured) return `sky obscured (${wx.ceiling_cover})`;
+    if (wx.ceiling_ft_agl != null) {
+      return `${wx.ceiling_cover || 'ceiling'} ${ft(wx.ceiling_ft_agl)} ft AGL`;
+    }
+    return wx.sky_reported ? 'no ceiling' : 'sky not reported';
+  };
+  // What the facts above do not already say. The full reason is spelled out
+  // in the blocker list below -- repeating it here would print the ceiling
+  // twice in one line -- so all this adds is the number the ceiling missed,
+  // and the note for a sky nobody could judge.
+  const weatherDetail = (wx) => {
+    if (wx.passes === null) return ` — ${wx.summary}`;
+    const short = wx.required_ceiling_ft_agl != null && wx.ceiling_ft_agl != null
+      && wx.ceiling_ft_agl < wx.required_ceiling_ft_agl;
+    return short ? ` — needs ${ft(wx.required_ceiling_ft_agl)} ft` : '';
+  };
   const windText = (c) => {
     if (c.wind_speed_kt == null) return 'wind not given';
     if (c.wind_speed_kt === 0) return 'wind calm';
@@ -1553,7 +1695,7 @@ function renderChecklist(checklist) {
     section.innerHTML =
       `<div class="check-head">` +
         `<span class="check-title">${check.airport} ${check.operation}</span>` +
-        `<span class="pill ${mark(check.passes)}">${label(check.passes)}</span>` +
+        `<span class="pill ${mark(check.passes)}">${fieldLabel(check.passes)}</span>` +
       `</div>` +
       `<div class="check-conditions">` +
         `Field ${ft(check.elevation_ft)} ft · OAT ${Math.round(check.oat_c)} °C · ` +
@@ -1562,6 +1704,24 @@ function renderChecklist(checklist) {
         `${ft(check.weight_lb)} lb · margin ${Math.round(check.margin * 100)}% · ` +
         `<strong>${windText(check)}</strong>` +
       `</div>`;
+
+    // The sky, on its own line. It is a gate in its own right -- the longest
+    // runway on the field is no use under an obscuration -- so it gets a
+    // verdict of its own rather than being folded in among the conditions.
+    if (check.weather) {
+      const wx = check.weather;
+      const row = document.createElement('div');
+      row.className = `check-weather ${mark(wx.passes)}`;
+      row.innerHTML =
+        `<span class="pill ${mark(wx.passes)}">` +
+          `${wx.passes === true ? 'VFR' : wx.passes === false ? 'NOT VFR' : '?'}` +
+        `</span> ${skyText(wx)} · ` +
+        `${wx.visibility_sm == null ? 'visibility not reported'
+          : `${wx.visibility_sm} sm visibility`} · ` +
+        `pattern ${ft(wx.pattern_altitude_agl_ft)} ft AGL` +
+        weatherDetail(wx);
+      section.appendChild(row);
+    }
 
     const table = document.createElement('table');
     table.className = 'runways';
@@ -1669,6 +1829,20 @@ function renderSummary(plan) {
   ].map(([k, v]) => `<div><span class="k">${k}</span><span class="v">${v}</span></div>`).join('');
 
   const warnings = $('warnings');
+  // Where the wind on every row came from. A forecast column and a number the
+  // pilot read off a chart look identical in the table, and they are not the
+  // same thing to be flying on -- so the table says which it is holding.
+  if (windsAloftWx) {
+    const div = document.createElement('div');
+    div.className = 'alert model';
+    const missed = windsAloftWx.of - windsAloftWx.legs;
+    div.textContent =
+      `Winds and temperatures aloft: model forecast for `
+      + `${zulu(windsAloftWx.valid_time)}, one column per leg`
+      + (missed ? `; ${missed} leg(s) unavailable and left on the typed wind` : '')
+      + '. A forecast, not an observation — and no substitute for a briefing.';
+    warnings.appendChild(div);
+  }
   // Edits this browser dropped, said in the same place as the engine's own
   // warnings: a number the pilot typed disappearing without a word is what
   // makes a navlog untrustworthy.
@@ -1718,14 +1892,24 @@ function renderSearchResults(found) {
     button.type = 'button';
     const runway = airport.longest_runway_ft
       ? ` · ${Math.round(airport.longest_runway_ft)} ft` : '';
+    // The one box searches airports and published VFR checkpoints together,
+    // and a checkpoint has no elevation -- `Math.round(null)` is 0, which
+    // would read as a field at sea level rather than as a bridge.
+    const elevation = airport.elevation_ft == null
+      ? '' : ` · ${Math.round(airport.elevation_ft)} ft`;
     button.innerHTML =
       `<span class="ident">${airport.ident}</span> ${airport.name}` +
       `<span class="meta">${airport.municipality ?? ''} ${airport.region ?? ''}` +
-      ` · ${Math.round(airport.elevation_ft)} ft${runway}</span>`;
+      `${elevation}${runway}</span>`;
     button.addEventListener('click', () => {
       addWaypoint({
         name: airport.ident, lat: airport.lat, lon: airport.lon,
-        kind: 'airport', elevation_ft: airport.elevation_ft, label: airport.label,
+        // Whatever the result actually is. Stamping every search result as an
+        // airport made a VFR checkpoint claim to be a field: it offered a
+        // "land here" box, and Get weather asked a weather service about a
+        // bridge and got a 404 back.
+        kind: airport.kind || 'airport',
+        elevation_ft: airport.elevation_ft, label: airport.label,
       });
       $('search').value = '';
       box.hidden = true;
@@ -1774,22 +1958,76 @@ for (const id of ['runway-margin', 'fuel-margin']) {
  *  half-degree thrown away is under 60 ft of density altitude, well inside the
  *  margin the checklist already carries.
  */
+/** The off-blocks time as a UTC instant, or null when the box is empty.
+ *
+ *  `datetime-local` has no timezone, and the label says Z, so the typed value
+ *  is read as UTC rather than as the laptop's local time. A pilot planning in
+ *  California for a Zulu departure should not have the browser silently shift
+ *  it by seven hours.
+ */
+function offBlocksUtc() {
+  const typed = $('off-blocks').value;
+  if (!typed) return null;
+  const at = new Date(`${typed}:00Z`);
+  return Number.isNaN(at.getTime()) ? null : at;
+}
+
+/** When each airport on the route is actually reached, from the log's ETEs.
+ *
+ *  Keyed by waypoint name. The departure field is the off-blocks time itself;
+ *  every later field is off-blocks plus the cumulative ETE of the leg that
+ *  *arrives* there, which is what the navlog already computes for the row.
+ *
+ *  Arrival rather than departure time at an intermediate stop: it is the
+ *  landing that the runway check is about, and the pattern and taxi that
+ *  follow are ten minutes against weather published by the hour.
+ *
+ *  Empty when there is no off-blocks time or no plan to read ETEs from, which
+ *  is the caller's signal to fetch current weather instead.
+ */
+function plannedArrivals() {
+  const start = offBlocksUtc();
+  const times = new Map();
+  if (!start || !lastPlan?.ok || !Array.isArray(lastPlan.legs)) return times;
+  for (const leg of lastPlan.legs) {
+    if (!leg.to || times.has(leg.to)) continue;  // first arrival wins
+    const minutes = leg.cumulative_ete_min;
+    if (minutes == null) continue;
+    times.set(leg.to, new Date(start.getTime() + minutes * 60000));
+  }
+  // The departure field is reached at the off-blocks time, not after the
+  // taxi leg that happens to name it as a destination.
+  if (route.length) times.set(route[0].name, start);
+  return times;
+}
+
 async function getWeather() {
   const button = $('get-weather');
   // Airports only: a fix or a private strip has no station to ask about, and
   // the ident is what the route sends as the waypoint's name.
   const fields = route.filter((w, i) =>
-    !w.generated && w.kind === 'airport' && isFieldPoint(w, i));
+    !w.generated && isAirport(w) && isFieldPoint(w, i));
   if (!fields.length) {
     flashButton(button, 'No airports on the route');
     return;
   }
 
   button.disabled = true;
+
+  // Pass one. The ETEs that place each field in time come from the navlog
+  // itself, so there has to be a log before there can be arrival times. Only
+  // when a time was asked for -- fetching the current weather needs no plan.
+  if (offBlocksUtc() && !lastPlan?.ok) {
+    button.textContent = 'Planning…';
+    await runPlan();
+  }
+  const arrivals = plannedArrivals();
+
   button.textContent = 'Fetching…';
   let reports;
   try {
-    reports = await Promise.all(fields.map((w) => api.surface(w.name)));
+    reports = await Promise.all(fields.map(
+      (w) => api.surface(w.name, arrivals.get(w.name)?.toISOString())));
   } catch {
     // The one thing worse than no weather is a button that stays greyed out
     // because the network went away mid-fetch.
@@ -1826,6 +2064,25 @@ async function getWeather() {
       wrote.gust_kt = report.gust_kt == null ? null : Math.round(report.gust_kt);
     }
     Object.assign(waypoint, wrote);
+    // The sky and the visibility go straight onto the waypoint rather than
+    // through `wrote`: they fill no box on the form, so they are not part of
+    // what "filled 2 fields" counts or of what the source line describes.
+    //
+    // Replaced whole, on the same reasoning as the gust. A report that no
+    // longer mentions an overcast is saying the overcast has gone, and
+    // keeping the last one would hold a ceiling against a field that has
+    // cleared. A report with no sky group at all leaves `sky_reported` false,
+    // which the go/no-go reads as unknown rather than as clear.
+    Object.assign(waypoint, {
+      visibility_sm: report.visibility_sm ?? null,
+      ceiling_ft_agl: report.ceiling_ft_agl ?? null,
+      ceiling_cover: report.ceiling_cover ?? '',
+      sky_reported: !!report.sky_reported,
+      // A report came back, whatever was in it. A model-only answer has no
+      // cloud and no visibility in it, and the go/no-go has to be able to
+      // tell that from a field nobody asked about.
+      weather_reported: true,
+    });
     // The departure setting is the one to fly the route on, on the same
     // reasoning as typing it by hand -- and only while the route field is
     // still standard, so it never overwrites a figure somebody chose.
@@ -1844,10 +2101,86 @@ async function getWeather() {
   });
 
   renderWaypointList();
+
+  // The sky between the fields, one column per leg the pilot drew.
+  const aloft = await getWindsAloft(arrivals);
+
+  // Pass two: the fetched conditions change the density altitude, so every
+  // distance and every chart reading has to be taken again -- and the winds
+  // move the tops of climb, so this is the plan that has them in it.
   requestPlan();
+  // Say which weather this was, not just how much of it. "Filled 2 fields"
+  // reads the same whether it was observed now or forecast for tonight, and
+  // those are very different things to be planning on.
+  const when = arrivals.size ? ` for ${zulu(offBlocksUtc().toISOString())}+` : '';
+  const legs = aloft ? `, ${aloft} leg${aloft === 1 ? '' : 's'} aloft` : '';
   flashButton(button, failed.length
-    ? `${filled} filled, ${failed.length} unavailable`
-    : `Filled ${filled} field${filled === 1 ? '' : 's'}`);
+    ? `${filled} filled, ${failed.length} unavailable${legs}`
+    : `Filled ${filled} field${filled === 1 ? '' : 's'}${legs}${when}`);
+}
+
+/** Fetch the wind and temperature column over each leg the pilot drew.
+ *
+ *  One request per leg, at that leg's own midpoint. The alternative -- one
+ *  column for the route -- is the objection `engine/aloft.py` raises against
+ *  the FD product, only with a finer grid: a column over the middle of a
+ *  300 nm trip describes neither end of it.
+ *
+ *  Each leg is asked about for the time it is *reached*, on the same
+ *  reasoning as the fields: an afternoon leg planned on the morning's wind is
+ *  the error this exists to remove. With no off-blocks time every column is
+ *  the current forecast hour.
+ *
+ *  Returns how many legs came back, or 0. A leg that fails is left out rather
+ *  than faked: the engine falls back to the wind typed on that row, and to
+ *  calm where there is none, which is what the plan did before.
+ */
+async function getWindsAloft(arrivals) {
+  // The legs the pilot drew, not the rows: a TOC the planner inserted splits
+  // one leg into two rows without splitting the sky it crosses in two.
+  const drawn = route.filter((w) => !w.generated);
+  if (drawn.length < 2) return 0;
+
+  const legs = [];
+  for (let i = 0; i < drawn.length - 1; i += 1) {
+    const from = drawn[i];
+    const to = drawn[i + 1];
+    legs.push({
+      // A plain average rather than a great-circle midpoint. It only has to
+      // land nearer this leg's column than the next leg's, and over the
+      // distances a light single flies the two are yards apart.
+      lat: (from.lat + to.lat) / 2,
+      lon: (from.lon + to.lon) / 2,
+      // Reached when its far end is reached, which is the arrival time the
+      // navlog already computes for that waypoint.
+      at: arrivals.get(to.name) || null,
+    });
+  }
+
+  let columns;
+  try {
+    columns = await Promise.all(legs.map(
+      (leg) => api.aloft(leg.lat, leg.lon, leg.at ? leg.at.toISOString() : null)));
+  } catch {
+    clearWindsAloft();
+    return 0;
+  }
+
+  const good = [];
+  const notes = new Set();
+  let validTime = null;
+  columns.forEach((column, n) => {
+    if (!column || column.error || !Array.isArray(column.levels)) return;
+    good.push({ lat: legs[n].lat, lon: legs[n].lon, levels: column.levels });
+    (column.notes || []).forEach((note) => notes.add(note));
+    validTime = validTime || column.valid_time;
+  });
+
+  windsAloft = good;
+  windsAloftWx = good.length
+    ? { legs: good.length, of: legs.length, valid_time: validTime, notes: [...notes] }
+    : null;
+  return good.length;
 }
 
 const flashTimers = new Map();

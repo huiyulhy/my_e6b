@@ -11,8 +11,8 @@ route search do not reopen it.
 from __future__ import annotations
 
 import sqlite3
+import threading
 from dataclasses import dataclass
-from functools import lru_cache
 from pathlib import Path
 
 from engine import preflight
@@ -41,6 +41,12 @@ class Airport:
     municipality: str | None = None
     region: str | None = None
     longest_runway_ft: float | None = None
+    # The published traffic pattern altitude, in feet AGL -- NASR gives a
+    # height above the field, not an MSL altitude. `None` for most fields:
+    # NASR only carries one where it is non-standard or somebody filed it, so
+    # the go/no-go falls back to the standard 1,000 ft rather than assuming
+    # the absence means anything.
+    pattern_altitude_agl_ft: float | None = None
 
     @property
     def label(self) -> str:
@@ -48,15 +54,46 @@ class Airport:
         return f"{self.ident} - {self.name}{where}"
 
 
-@lru_cache(maxsize=2)
+# One connection per thread, not one shared between them.
+#
+# A `sqlite3.Connection` is not safe for simultaneous use, and
+# `check_same_thread=False` only removes Python's guard against sharing -- it
+# does not make sharing correct. A single cached connection used from several
+# threads at once interleaves results on its cursor, which shows up as
+# `InterfaceError: bad parameter or other API misuse` if you are lucky and as a
+# row with somebody else's columns in it if you are not. The second is the real
+# hazard: a lookup that quietly returns the wrong airport's position.
+#
+# It went unnoticed while every request was serial. The weather panel fetches
+# every field on the route at once, each worker resolving an identifier, so the
+# lookups genuinely overlap now.
+#
+# Thread-local rather than a lock, because the database is opened read-only and
+# SQLite handles concurrent readers on separate connections perfectly well;
+# serialising them would give back the parallelism the fetch exists for.
+# Connections are closed by the interpreter at exit, and threads here come from
+# a bounded pool, so the map cannot grow without bound.
+_local = threading.local()
+
+
 def _connect(path: Path | None = None) -> sqlite3.Connection:
     db = path or DB_PATH
-    if not db.exists():
-        raise AirportDatabaseMissing(
-            f"{db} not found. Build it with `make airports`."
-        )
-    connection = sqlite3.connect(f"file:{db}?mode=ro", uri=True, check_same_thread=False)
-    connection.row_factory = sqlite3.Row
+    connections = getattr(_local, "connections", None)
+    if connections is None:
+        connections = _local.connections = {}
+
+    key = str(db)
+    connection = connections.get(key)
+    if connection is None:
+        if not db.exists():
+            raise AirportDatabaseMissing(
+                f"{db} not found. Build it with `make airports`."
+            )
+        # `check_same_thread` left at its default: each thread owns its own
+        # connection now, so the guard is a safety net rather than an obstacle.
+        connection = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        connection.row_factory = sqlite3.Row
+        connections[key] = connection
     return connection
 
 
@@ -72,6 +109,7 @@ def _to_airport(row: sqlite3.Row) -> Airport:
         municipality=row["municipality"],
         region=row["region"],
         longest_runway_ft=row["longest_runway_ft"],
+        pattern_altitude_agl_ft=row["pattern_altitude_ft"],
     )
 
 

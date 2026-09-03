@@ -53,6 +53,7 @@ my_e6b/
     alternates.py    [later]  alternate ranking
     airports.py      [built]  airport lookup against the local SQLite
     weather.py       [built]  METAR/TAF/model parsing + source resolution (pure)
+    aloft.py         [built]  pressure-level winds and temperatures aloft (pure)
   data/
     poh/c172s/       [built]  five CSVs + SOURCE.md provenance
     magnetic/        [built]  WMM2025.COF + NOAA's 100-point test set
@@ -69,9 +70,9 @@ my_e6b/
   ui/                [built]  static HTML/JS + MapLibre — same files dev and prod
   server/            [built]  FastAPI dev shim, never shipped
     main.py          [built]  the HTTP surface
-    wx_surface.py    [built]  the only network fetch: AWC METAR/TAF + model (see 4d)
-    wx_aloft.py      [later]  winds aloft at leg midpoints
-  tests/             [built]  672 tests
+    wx_surface.py    [built]  the only network fetch: AWC METAR/TAF + model,
+                              surface and pressure-level (see 4d)
+  tests/             [built]  750 tests
   Makefile           [built]  every recipe clears PYTHONPATH (see §7)
 ```
 
@@ -246,13 +247,17 @@ decisions, all visible in the output:
   which in user-driven mode is only a bound the aeroplane may never reach.
 
 Winds aloft interpolate on **vector components, not direction**: halfway between 350° and 010°
-is 000°, but the arithmetic mean is 180°. The engine still takes a `WindsAloft` profile and
-`profile.py` uses it to place TOC and TOD, but **the app no longer feeds it one**: an FD level
-is a single wind for a quarter of a state, and on a route that crosses a coast range it is
-wrong on one side of the hills or the other. Wind is typed per navlog row instead, as a
-`LegOverride`, where it belongs to the leg it was forecast for. A row with nothing typed on it
-is calm, which also means the vertical profile is placed at zero wind and a wind typed on a row
-does not move the top of climb.
+is 000°, but the arithmetic mean is 180°. `profile.py` uses a `WindsAloft` profile to place TOC
+and TOD, and for a long time the app fed it none: an FD level is a single wind for a quarter of a
+state, and on a route that crosses a coast range it is wrong on one side of the hills or the
+other. Wind was typed per navlog row instead, as a `LegOverride`, where it belongs to the leg it
+was forecast for — and a row with nothing typed on it was calm, so the vertical profile was placed
+at zero wind and a typed wind did not move the top of climb.
+
+**Get weather** now fetches a point-resolved model column per leg, which is the objection
+answered rather than argued with, so a forecast wind *does* move the tops of climb. See §4d, "How
+it reaches the navlog". A typed wind still wins on the row it was typed against, and a route with
+no forecast on it behaves exactly as described above.
 
 Fuel accounting includes the POH taxi allowance and checks the FAR 91.151 reserve (30 min day,
 45 min night at cruise burn). Warnings are data on the `Navlog`, not printed side effects, so
@@ -368,6 +373,13 @@ not an exception:
   labelled rather than silent.
 - **Anything nobody supplies stays `None`**, with a note saying distances cannot be computed.
   Same rule as `OutsidePOHEnvelope`: refuse rather than guess.
+- **The gust is not resolved on its own — it belongs to the wind.** Per-field resolution is right
+  for every other field and wrong for this one: a METAR that gives a wind and omits the gust group
+  is *stating* there is no gust, not leaving a hole. KHAF reporting `00000KT` under a model
+  forecasting 9 kt resolved to "calm, gusting 9" — a peak that appeared in neither source, which
+  the go/no-go then resolved onto a runway as crosswind. A gust whose source is weaker than the
+  wind it would attach to is dropped, and the drop is noted. Same-source gusts (an observed
+  `18015G25KT`, a TAF block with its own `wgst`) are untouched.
 
 ### Two facts that will bite whoever touches this next
 
@@ -391,12 +403,39 @@ airport on the route and fills the boxes the plan already sends: altimeter setti
 and now wind and gust. At KMOD that moved density altitude from 97 ft to 1052 ft and the takeoff
 over a 50 ft obstacle from 1644 ft to 1744 ft.
 
+### Each field is fetched for the time you reach it, not the time you click
+
+**Off blocks**, beside the button, is the departure time in Zulu. Left blank — the common case —
+every field is fetched for now. Set, the fetch becomes a two-pass operation:
+
+1. Plan, to get the ETEs. `plannedArrivals()` walks `lastPlan.legs`, takes the
+   `cumulative_ete_min` of the first leg *arriving* at each airport, and adds it to the
+   off-blocks time. The departure field is the off-blocks time itself.
+2. Fetch each airport at its own ETA, then re-plan on what came back.
+
+The alternative — one time for the whole route — is wrong in exactly the case the feature exists
+for. A three-hour leg landing at 1600Z planned on the 1300Z temperature reads the destination
+several degrees cool, and it is the afternoon arrival at a hot high field where the runway margin
+actually gets thin. The ETEs are already computed and already on the log; using them costs one
+extra plan and removes a whole class of quiet error.
+
+Arrival rather than departure time at an intermediate stop: the runway check there is about the
+landing, and the pattern and taxi that follow are ten minutes against weather published by the
+hour. The provenance line carries the time it used (`KLVK 1116Z — wind taf · OAT model`), so a
+forecast never reads as an observation.
+
+The time is read as **UTC, not browser-local**. `datetime-local` carries no timezone, the label
+says Z, and a pilot planning a Zulu departure should not have the machine's timezone silently
+move it.
+
 Only what the report actually gives is written — a station with no temperature leaves that box
 alone rather than blanking it — and a wind is written whole, direction, speed and gust together,
 because half a wind is not one and a stale gust would be held against the crosswind limit after
-it had dropped. Each field then carries a provenance line (`KSQL 1953Z — wind metar · OAT metar ·
-alt set metar`) that disappears from any box the pilot has since typed over: a line still
-claiming a METAR said something it did not is the failure this panel exists to prevent.
+it had dropped. Whether the gust that arrives belongs to that wind is `resolve_surface`'s
+decision, not the UI's; see above. Each field then carries a provenance line (`KSQL 1953Z — wind
+metar · OAT metar · alt set metar`) that disappears from any box the pilot has since typed over:
+a line still claiming a METAR said something it did not is the failure this panel exists to
+prevent.
 
 The surface wind reaches the distances too. `Waypoint.wind_from_deg` / `wind_speed_kt` /
 `gust_kt` carry it as reported — **true**, the way a METAR gives it — and `navlog._field_wind`
@@ -424,6 +463,38 @@ Two asymmetries are deliberate:
 A field with no wind on it keeps the zero-wind book figures and says so in every runway's note.
 Silently reading "no wind given" as "calm" would be the one failure mode worth avoiding here.
 
+### The sky is a gate of its own
+
+The same report carries the cloud and the visibility, and `preflight.check_weather` decides
+whether the field is VFR. It is a second gate beside the runways, on the same footing as
+crosswind is beside length: the longest runway on the field is no use under an obscuration, and a
+clear sky does not lengthen a short one. `AirportCheck.runways_pass` keeps the old runway-only
+verdict; `AirportCheck.passes` is the two of them together, and `summarise` reports each as its
+own blocker because "no runway is long enough" and "the field is under an overcast" are different
+problems with different answers.
+
+Three rules, in the order they bite:
+
+- **A vertical visibility is not a ceiling.** `VV` in a TAF, `OVX` in a METAR: there is no cloud
+  base to stay under and no horizon, so the height reported is how far up you can *see*, not how
+  far up you can fly. It ends the check and is never compared against a pattern altitude.
+- **An overcast has to clear the pattern by 500 ft.** Basic VFR asks for 1,000 ft, and an
+  overcast at 1,100 ft is legal to take off under and leaves nowhere to fly a circuit. So the
+  requirement is `max(1000, TPA + 500)` — 91.155's cloud clearance, applied at the height the
+  pattern is actually flown. The pattern altitude comes from NASR via
+  `Airport.pattern_altitude_agl_ft` (a height above the field, not an MSL altitude), and only a
+  few hundred US fields publish one; the rest take the standard 1,000 ft. Broken is left at the
+  regulatory 1,000 ft: there are holes in it and the pilot can see through them.
+- **Three statute miles**, from the same report.
+
+The one thing that had to be plumbed for this is `sky_reported`. A clear sky and a source that
+does not observe cloud both arrive with no ceiling in them, and they are opposite answers: the
+first is VFR, the second is unknown. The model tier reports no cloud at all, so without the flag
+a model-only forecast would read as a clear day. It travels with the ceiling and its cover as one
+group through `resolve_surface` — a METAR height wearing a TAF's cover code would describe a sky
+neither source saw — and on through `Waypoint` to the check. A field with no report at all gets
+no weather verdict, so a plan built before pressing **Get weather** reads exactly as it did.
+
 `tools/plot_altimeter_trend.py` is the evidence behind all of this — 24 h of settings for six
 Bay Area fields in one request, plotted in inches and in the pressure altitude error they cause.
 Over a representative day each field moved about 0.10 inHg (~95 ft), and two fields 60 nm apart
@@ -431,16 +502,96 @@ differed by 0.12 inHg (~112 ft) at the same moment. The spread across the area i
 argument than the drift over time: it is why one field's ATIS should not be used for the next
 airport down the route.
 
-### Not built: winds aloft
+### The aloft tier — `engine/aloft.py` + `wx_surface.fetch_aloft`
 
-The aloft tier is designed but unimplemented. When it lands it must request
-`geopotential_height_{level}hPa` alongside the winds and interpolate on **actual height** — the
-`5000 ft ≈ 850 hPa` table is the ISA mapping and isobaric surfaces move with the pressure field.
-Build a `WindsAloft` ladder and let its existing vector interpolation do the work rather than
-hand-rolling u/v. Feed it through `profile.resolve_route(leg_winds=)`, sampling every leg
-midpoint in one batched request. Note that doing so revisits §4b's decision that a typed wind
-does not move the top of climb: the reason given there was that an FD level is too coarse to
-trust, and point-resolved model data is not.
+The surface tier answers what the air is doing at the field. This answers what it is doing at
+cruise, which is what decides ground speed, fuel and every time on the log. Same split as
+everywhere else: `engine/aloft.py` is pure parsing and interpolation, `fetch_aloft` is the
+network.
+
+Not the FD product, deliberately. An FD level is one number for a quarter of a state, and the
+wind on the coast is not the wind over the valley twenty miles inland — §4b's reason for keeping
+route-wide winds out of the plan. A gridded model is interpolated to the position asked about,
+which answers that objection rather than arguing with it. `GET /api/wx/aloft` therefore takes a
+**lat/lon, not an ident**: reading the cruise wind off the departure airport would reproduce the
+exact mistake.
+
+**The two products are keyed by different altitudes, and it matters.**
+
+- **Temperature → pressure altitude**, exactly, from the level's own pressure. A constant-pressure
+  surface *has* a pressure altitude by definition: 850 hPa is 4781 ft PA over the desert and over
+  the sea and in a hurricane, and only its geometric height moves. So the temperature profile is
+  built with no altimeter setting involved and cannot be wrong by one — and it lands in the
+  coordinate the POH charts are read at, and the coordinate `TemperatureSample` already uses.
+- **Wind → geopotential height**, the level's true altitude MSL, because that is what a pilot
+  holding an indicated altitude on a correct setting is near, and it is what `WindsAloft.at()`
+  is called with. The `5000 ft ≈ 850 hPa` table is the ISA mapping; isobaric surfaces move with
+  the pressure field, so the height is read from the model rather than assumed.
+
+**Levels below ground are dropped.** A model reports 1000 hPa everywhere, including where the
+terrain is at 6000 ft, by extrapolating a fictional atmosphere underneath the mountain. Over
+Truckee that discards six levels — 1000 through 850 hPa — and says so in `notes` rather than
+interpolating invented air into the bottom of a climb. The ground it compares against is the
+`elevation` Open-Meteo returns, which is a 90 m DEM height for the point (5899 ft at Truckee
+against a 5900 ft field) and identical across models — not the weather model's own smoothed
+terrain, which at 25 km flattens the Sierra by thousands of feet and would keep levels that are
+underground in fact.
+
+**Why `models=gfs_seamless` and not `gfs_hrrr`.** Over CONUS, seamless *is* HRRR at 3 km for
+roughly the first 48 hours — byte-identical output, verified at 850 hPa over KSQL — and hands off
+to GFS beyond it. Pinning HRRR would gain nothing inside that window and would turn a plan made
+three days ahead into a refusal rather than coarser data: outside its horizon `gfs_hrrr` returns
+nulls. The resolution is worth having where it applies; at Truckee, 700 hPa reads 3.5 °C from
+HRRR against 1.8 °C from `gfs_global`, which is real density altitude over exactly the terrain
+that punishes getting it wrong. This app is CONUS-only by decision, so HRRR's geographic domain
+is not a constraint — its forecast horizon is.
+
+**Feed a plan `temperature_samples()`, not `temperatures()`.** `build_navlog` builds one
+temperature curve for the whole route from every sample it can find and would discard a finished
+profile, so the samples go in through `Conditions.temperatures_aloft` and merge with the fields'
+own METAR temperatures. No conversion is needed on the way in — that is the payoff of keying by
+pressure altitude, where a field temperature has to be converted through its own station's
+altimeter setting first.
+
+### How it reaches the navlog: one column per leg
+
+**Get weather** fetches a column at each leg's own midpoint, for the time that leg is reached, and
+sends them back with the plan. Not one column for the route: a single column stretched across a
+300 nm trip is the objection above with a finer grid, describing neither end of it.
+
+The engine takes them on `Conditions`:
+
+- **Wind** goes in as a `WindField` — a bag of `WindColumn`s, each a `WindsAloft` and the point it
+  was forecast over. `_RouteColumns` files each column under the leg the pilot drew it over, and
+  then hands each row the column of the leg it flies along.
+- **Temperature** goes in as `temperatures_aloft`, route-wide, merging with the fields' own METAR
+  temperatures into the single curve `build_navlog` builds. Route-wide because a pressure altitude
+  is a coordinate every station shares, which is exactly what one curve through all of them needs.
+
+**Both mappings are by position, and that is the whole design.** The obvious key is the row, and
+it does not work: a forecast wind moves the tops of climb — into a headwind the same climb covers
+less ground and tops out sooner — which renumbers the very rows the wind would have been keyed to.
+A point on the earth does not move. So `_RouteColumns.build` asks where each column *is*, and
+`over()` asks where each row *is*, and the answer survives the profile being re-solved underneath.
+
+**Containment, not nearest.** `_drawn_leg_of` puts a point on the leg it lies *on*, using the
+along-track and cross-track distances `engine/geo.Segment` already computes. Nearest-column is the
+tempting shortcut and it is wrong at exactly one place: the first ten miles of a 130 nm leg are
+sixty miles nearer the *previous* leg's column, which sits at that leg's midpoint. The row is
+still unambiguously on the second leg.
+
+Where a column is missing the leg falls back to whatever was typed on its row, and to calm below
+that — which is what a plan with nothing entered has always meant. A wind the pilot typed still
+wins on its own row, and a half-typed wind now takes its other half from **that leg's** column
+rather than from a route-wide profile.
+
+This settles §4b's open question about whether a wind should move the top of climb. It does: the
+reason it did not was that an FD level is too coarse to trust that far, and a point-resolved model
+column is not. The planner gets the forecast on the first pass, since a column belongs to a leg by
+where it was forecast and needs no draft lay-out to find its home.
+
+The navlog says so under the table — a model forecast and a number read off a chart look identical
+in a wind column, and they are not the same thing to be flying on.
 
 ---
 

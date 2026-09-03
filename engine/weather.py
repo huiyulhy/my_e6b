@@ -1,38 +1,13 @@
-"""Decoded weather for a point on the ground, and the rule for choosing a source.
+"""Decoded weather for a point on the ground
+Fetching takes place in server/wx_surface.py
 
-This module is **pure**: every function takes an already-decoded payload and
-returns a frozen dataclass. Nothing here opens a socket, reads a file or knows
-what an HTTP request is. That is not fastidiousness -- `engine/` runs under
-Pyodide with no network at all, and a fetch in here would take the whole engine
-with it. The fetching lives in `server/wx_surface.py`; this is the half that
-has to keep working when there is nothing to fetch from.
+3 possible sources:
+1. METAR - real time observation (wind, vis, cloud, temperature, pressure)
+2. TAF - 24-30 hour forecast (wind and vis only)
+3. Model - GFS global or HRRR (high res) via open meteo. Weather
+for a given point (pos and alt) at any time
 
-**Three sources answer the same question and none of them answers all of it.**
-
-* A **METAR** is an observation. It has wind, visibility, cloud, temperature
-  and an altimeter setting, and it is true for the moment it was taken and
-  nowhere else in time.
-* A **TAF** is a forecast, in blocks, out to 24-30 hours. It has wind,
-  visibility and cloud -- and **no temperature and no altimeter setting**. Not
-  "sometimes missing": the fields are structurally absent. So a TAF on its own
-  cannot produce a pressure altitude, which means it cannot produce a takeoff
-  or landing distance, which is the thing we wanted it for.
-* A **model** (GFS/HRRR, via Open-Meteo) will answer at any coordinate and any
-  hour, including temperature and mean-sea-level pressure. It is a model
-  though, not an observation, and at a field with a real METAR it should not
-  be preferred to one.
-
-`resolve_surface` is where those three are reconciled, and it is deliberately
-the only place that decision is made. Every field it emits carries a `Source`
-saying where that particular number came from, because "wind from the TAF,
-temperature from the model" is the normal case rather than an exception, and a
-pilot looking at a density altitude is entitled to know it came from a model.
-
-**A field nobody can supply stays `None`.** It is never interpolated from a
-neighbouring hour or carried forward from an older observation. The rest of the
-engine already refuses rather than guesses -- `OutsidePOHEnvelope` over a
-plausible number -- and a fabricated altimeter setting would come back as a
-confident runway length.
+resolve_surface blends these observations and selects a value
 """
 
 from __future__ import annotations
@@ -47,6 +22,8 @@ from engine.navlog import Wind
 
 __all__ = [
     "HPA_PER_INHG",
+    "OBSCURATION_COVERS",
+    "Ceiling",
     "Source",
     "SurfaceWeather",
     "WeatherUnavailable",
@@ -58,7 +35,6 @@ __all__ = [
     "resolve_surface",
 ]
 
-
 class WeatherUnavailable(RuntimeError):
     """No source could be reached, or none of them answered for this station.
 
@@ -69,25 +45,15 @@ class WeatherUnavailable(RuntimeError):
 
 # The Aviation Weather Center reports `altim` in hectopascals -- 1012.6, not
 # 29.92 -- while the raw METAR text beside it says `A2990` and every altimeter
-# in a US cockpit is set in inches. Getting this backwards is not a rounding
-# error: it reads as an altimeter setting thirty-four times too large, and the
-# pressure altitude that falls out of it is nonsense in the unsafe direction.
+# in a US cockpit is set in inches.
 HPA_PER_INHG = 33.863886666667
 
-# A plausibility band for a US altimeter setting. The record extremes are
-# roughly 25.7 (Pacific typhoon) and 32.0 (Siberian high); anything outside
-# this is a unit mistake or a corrupt field, not weather.
+# Acceptable limits for altimeter setting
 _MIN_PLAUSIBLE_INHG = 25.0
 _MAX_PLAUSIBLE_INHG = 32.5
 
 
 def hpa_to_inhg(hpa: float) -> float:
-    """Hectopascals to inches of mercury, refusing implausible results.
-
-    The refusal is here rather than at the call site because every caller of
-    this function is converting a pressure that is about to become a pressure
-    altitude, and a silently wrong one is worse than no number at all.
-    """
     inhg = hpa / HPA_PER_INHG
     if not _MIN_PLAUSIBLE_INHG <= inhg <= _MAX_PLAUSIBLE_INHG:
         raise ValueError(
@@ -112,11 +78,8 @@ class Source(StrEnum):
 
 @dataclass(frozen=True)
 class SurfaceWeather:
-    """The air at one field, at one time, with its provenance attached.
-
-    Every measurement is optional, because every source is missing at least
-    one of them and the honest representation of "the TAF does not say" is
-    `None` rather than a plausible default.
+    """The air at one field at a given time. Each measurement is optional
+    (e.g. TAF contains missing pressure and temp)
     """
 
     station: str
@@ -125,6 +88,15 @@ class SurfaceWeather:
     gust_kt: float | None = None
     visibility_sm: float | None = None
     ceiling_ft_agl: float | None = None
+    # What made that height a ceiling: BKN, OVC, or the OVX/VV of an
+    # obscuration. Carried because the go/no-go treats them differently -- an
+    # overcast has to sit high enough to fly a pattern under, and a vertical
+    # visibility means there is no sky to fly under at all.
+    ceiling_cover: str | None = None
+    # Whether the report carried a sky-condition group at all. A clear sky and
+    # a source that does not observe cloud both leave `ceiling_ft_agl` empty,
+    # and they are opposite answers: the first is VFR, the second is unknown.
+    sky_reported: bool = False
     oat_c: float | None = None
     altimeter_inhg: float | None = None
     sources: Mapping[str, Source] = None  # type: ignore[assignment]
@@ -137,9 +109,7 @@ class SurfaceWeather:
     @property
     def has_field_conditions(self) -> bool:
         """True when a density altitude can be computed from this.
-
-        The go/no-go check needs both halves; either one alone is not enough
-        to put a runway distance on the screen.
+        The go/no-go check needs both halves
         """
         return self.oat_c is not None and self.altimeter_inhg is not None
 
@@ -150,7 +120,7 @@ class SurfaceWeather:
 # numeric field may be absent or null. These normalise without inventing.
 
 
-def _number(value: Any) -> float | None:
+def as_float(value: Any) -> float | None:
     """A float, or None -- never a guess."""
     if value is None or isinstance(value, bool):
         return None
@@ -167,7 +137,7 @@ def _visibility_sm(value: Any) -> float | None:
     Fractions like `"1 1/2"` appear in low visibility and are parsed rather
     than dropped, since those are exactly the reports a go/no-go turns on.
     """
-    number = _number(value)
+    number = as_float(value)
     if number is not None:
         return number
     if not isinstance(value, str):
@@ -196,21 +166,57 @@ def _visibility_sm(value: Any) -> float | None:
 _CEILING_COVERS = frozenset({"BKN", "OVC", "OVX", "VV"})
 
 
-def _ceiling_ft_agl(clouds: Any, vert_vis: Any = None) -> float | None:
-    vertical = _number(vert_vis)
+# The covers that mean the sky is not visible at all, only a vertical
+# visibility into it. AWC writes `VV` in a TAF and `OVX` in a METAR.
+OBSCURATION_COVERS = frozenset({"OVX", "VV"})
+
+
+@dataclass(frozen=True)
+class Ceiling:
+    """The lowest ceiling in a report, and what kind of ceiling it is."""
+
+    ft_agl: float | None = None
+    cover: str | None = None
+    # True when the report said something about the sky, including "clear".
+    reported: bool = False
+
+
+def _ceiling(clouds: Any, vert_vis: Any = None) -> Ceiling:
+    """The lowest broken, overcast or obscured layer, with its cover.
+
+    A vertical visibility is reported as a height into an obscuration rather
+    than as a cloud base, and it is the ceiling whenever it is the lowest
+    thing in the report -- you cannot fly VFR under a sky you cannot see.
+    """
+    vertical = as_float(vert_vis)
+    reported = isinstance(clouds, list) or vertical is not None
     lowest: float | None = None
+    cover: str | None = None
     if isinstance(clouds, list):
         for layer in clouds:
             if not isinstance(layer, dict):
                 continue
-            if str(layer.get("cover") or "").upper() not in _CEILING_COVERS:
+            this_cover = str(layer.get("cover") or "").upper()
+            if this_cover not in _CEILING_COVERS:
                 continue
-            base = _number(layer.get("base"))
-            if base is not None and (lowest is None or base < lowest):
-                lowest = base
+            base = as_float(layer.get("base"))
+            # An obscuration group with no height on it is still an
+            # obscuration: it is reported, it is a ceiling, and only its
+            # height is missing.
+            if base is None:
+                if this_cover in OBSCURATION_COVERS and cover is None:
+                    cover = this_cover
+                continue
+            if lowest is None or base < lowest:
+                lowest, cover = base, this_cover
     if vertical is not None and (lowest is None or vertical < lowest):
-        lowest = vertical
-    return lowest
+        lowest, cover = vertical, "VV"
+    return Ceiling(ft_agl=lowest, cover=cover, reported=reported)
+
+
+def _ceiling_ft_agl(clouds: Any, vert_vis: Any = None) -> float | None:
+    """Just the height, for callers that do not care what kind it is."""
+    return _ceiling(clouds, vert_vis).ft_agl
 
 
 def _wind(wdir: Any, wspd: Any) -> Wind | None:
@@ -221,10 +227,10 @@ def _wind(wdir: Any, wspd: Any) -> Wind | None:
     one for a wind triangle, so it becomes `None` rather than a made-up
     heading; the speed alone cannot be flown.
     """
-    speed = _number(wspd)
+    speed = as_float(wspd)
     if speed is None:
         return None
-    direction = _number(wdir)
+    direction = as_float(wdir)
     if direction is None:
         # "VRB" or absent. Calm is the one case where no direction is fine.
         return Wind(0.0, 0.0) if speed == 0.0 else None
@@ -232,7 +238,7 @@ def _wind(wdir: Any, wspd: Any) -> Wind | None:
 
 
 def _utc(epoch: Any) -> datetime | None:
-    seconds = _number(epoch)
+    seconds = as_float(epoch)
     if seconds is None:
         return None
     return datetime.fromtimestamp(seconds, tz=UTC)
@@ -267,7 +273,7 @@ def parse_metar(payload: Any) -> SurfaceWeather | None:
         return None
 
     altimeter: float | None = None
-    hpa = _number(record.get("altim"))
+    hpa = as_float(record.get("altim"))
     if hpa is not None:
         try:
             altimeter = hpa_to_inhg(hpa)
@@ -275,17 +281,17 @@ def parse_metar(payload: Any) -> SurfaceWeather | None:
             altimeter = None
 
     wind = _wind(record.get("wdir"), record.get("wspd"))
-    oat = _number(record.get("temp"))
+    oat = as_float(record.get("temp"))
     visibility = _visibility_sm(record.get("visib"))
-    ceiling = _ceiling_ft_agl(record.get("clouds"))
+    ceiling = _ceiling(record.get("clouds"))
 
     sources = {
         name: Source.METAR
         for name, value in (
             ("wind", wind),
-            ("gust_kt", _number(record.get("wgst"))),
+            ("gust_kt", as_float(record.get("wgst"))),
             ("visibility_sm", visibility),
-            ("ceiling_ft_agl", ceiling),
+            ("ceiling_ft_agl", ceiling.ft_agl),
             ("oat_c", oat),
             ("altimeter_inhg", altimeter),
         )
@@ -296,9 +302,11 @@ def parse_metar(payload: Any) -> SurfaceWeather | None:
         station=str(record.get("icaoId") or "").upper(),
         valid_time=observed,
         wind=wind,
-        gust_kt=_number(record.get("wgst")),
+        gust_kt=as_float(record.get("wgst")),
         visibility_sm=visibility,
-        ceiling_ft_agl=ceiling,
+        ceiling_ft_agl=ceiling.ft_agl,
+        ceiling_cover=ceiling.cover,
+        sky_reported=ceiling.reported,
         oat_c=oat,
         altimeter_inhg=altimeter,
         sources=sources,
@@ -359,7 +367,7 @@ def parse_taf(payload: Any, target: datetime) -> SurfaceWeather | None:
     if not isinstance(forecasts, list):
         return None
 
-    target = _as_utc(target)
+    target = as_utc(target)
     station = str(record.get("icaoId") or "").upper()
 
     chosen: dict | None = None
@@ -386,8 +394,8 @@ def parse_taf(payload: Any, target: datetime) -> SurfaceWeather | None:
 
     wind = _wind(chosen.get("wdir"), chosen.get("wspd"))
     visibility = _visibility_sm(chosen.get("visib"))
-    ceiling = _ceiling_ft_agl(chosen.get("clouds"), chosen.get("vertVis"))
-    gust = _number(chosen.get("wgst"))
+    ceiling = _ceiling(chosen.get("clouds"), chosen.get("vertVis"))
+    gust = as_float(chosen.get("wgst"))
 
     sources = {
         name: Source.TAF
@@ -395,7 +403,7 @@ def parse_taf(payload: Any, target: datetime) -> SurfaceWeather | None:
             ("wind", wind),
             ("gust_kt", gust),
             ("visibility_sm", visibility),
-            ("ceiling_ft_agl", ceiling),
+            ("ceiling_ft_agl", ceiling.ft_agl),
         )
         if value is not None
     }
@@ -406,7 +414,9 @@ def parse_taf(payload: Any, target: datetime) -> SurfaceWeather | None:
         wind=wind,
         gust_kt=gust,
         visibility_sm=visibility,
-        ceiling_ft_agl=ceiling,
+        ceiling_ft_agl=ceiling.ft_agl,
+        ceiling_cover=ceiling.cover,
+        sky_reported=ceiling.reported,
         oat_c=None,  # a TAF does not carry temperature
         altimeter_inhg=None,  # nor an altimeter setting
         sources=sources,
@@ -446,8 +456,8 @@ def parse_model_surface(
     if not isinstance(times, list) or not times:
         return None
 
-    target = _as_utc(target)
-    slot = _nearest_hour_index(times, target)
+    target = as_utc(target)
+    slot = nearest_hour_index(times, target)
     if slot is None:
         return None
 
@@ -455,7 +465,7 @@ def parse_model_surface(
         values = hourly.get(name)
         if not isinstance(values, list) or slot >= len(values):
             return None
-        return _number(values[slot])
+        return as_float(values[slot])
 
     altimeter: float | None = None
     hpa = series("pressure_msl")
@@ -480,7 +490,7 @@ def parse_model_surface(
         if value is not None
     }
 
-    valid = _parse_iso_utc(times[slot]) or target
+    valid = parse_iso_utc(times[slot]) or target
     return SurfaceWeather(
         station=station.upper(),
         valid_time=valid,
@@ -492,8 +502,14 @@ def parse_model_surface(
     )
 
 
-def _parse_iso_utc(text: Any) -> datetime | None:
-    """Open-Meteo hours are naive ISO strings; the request pins them to GMT."""
+def parse_iso_utc(text: Any) -> datetime | None:
+    """Open-Meteo hours are naive ISO strings; the request pins them to GMT.
+
+    Public, with `as_float`, `as_utc` and `nearest_hour_index`: `engine/aloft.py`
+    reads the same hourly payload a level at a time, and a second copy of "an
+    hour more than an hour away is not this hour" would be a correctness fork
+    rather than a convenience.
+    """
     if not isinstance(text, str):
         return None
     try:
@@ -503,7 +519,7 @@ def _parse_iso_utc(text: Any) -> datetime | None:
     return moment.replace(tzinfo=UTC) if moment.tzinfo is None else moment.astimezone(UTC)
 
 
-def _nearest_hour_index(times: list, target: datetime) -> int | None:
+def nearest_hour_index(times: list, target: datetime) -> int | None:
     """The hourly slot closest to `target`, refusing a distant one.
 
     Model output is hourly, so the worst honest error is half an hour. A
@@ -514,7 +530,7 @@ def _nearest_hour_index(times: list, target: datetime) -> int | None:
     best: int | None = None
     best_gap: float | None = None
     for slot, text in enumerate(times):
-        moment = _parse_iso_utc(text)
+        moment = parse_iso_utc(text)
         if moment is None:
             continue
         gap = abs((moment - target).total_seconds())
@@ -528,7 +544,7 @@ def _nearest_hour_index(times: list, target: datetime) -> int | None:
 # --- the decider ----------------------------------------------------------
 
 
-def _as_utc(moment: datetime) -> datetime:
+def as_utc(moment: datetime) -> datetime:
     """A naive time is read as UTC -- every source here publishes in Zulu."""
     return moment.replace(tzinfo=UTC) if moment.tzinfo is None else moment.astimezone(UTC)
 
@@ -567,7 +583,13 @@ def resolve_surface(
     4. **Anything still missing stays `None`.** Nothing is carried forward
        from a stale observation or interpolated across a gap.
 
-    One field is not resolved independently: **the gust belongs to the wind**.
+    Two things are not resolved field by field. **The gust belongs to the
+    wind**, and **the sky is one observation**: a ceiling height from the TAF
+    wearing a cover code from the METAR would describe a sky that neither
+    source reported, so the height, the cover and the fact that cloud was
+    observed at all move together or not at all.
+
+    On the gust:
     A METAR that gives a wind and no gust group is stating that there is no
     gust, not leaving a hole for a model to fill -- KHAF reporting `00000KT`
     while the model says 9 kt would otherwise resolve to "calm, gusting 9",
@@ -582,8 +604,8 @@ def resolve_surface(
     as this field's own forecast.
     """
     station = station.upper()
-    now = _as_utc(now) if now is not None else datetime.now(tz=UTC)
-    target = _as_utc(target) if target is not None else now
+    now = as_utc(now) if now is not None else datetime.now(tz=UTC)
+    target = as_utc(target) if target is not None else now
 
     borrowed = bool(taf_station) and taf_station.upper() != station
     taf_source = Source.NEAREST_TAF if borrowed else Source.TAF
@@ -612,9 +634,15 @@ def resolve_surface(
                     f"before this time and was not used"
                 )
 
-    fields = ("wind", "gust_kt", "visibility_sm", "ceiling_ft_agl", "oat_c", "altimeter_inhg")
+    fields = ("wind", "gust_kt", "visibility_sm", "oat_c", "altimeter_inhg")
     values: dict[str, Any] = dict.fromkeys(fields)
     sources: dict[str, Source] = {}
+    # The sky group, taken whole from the strongest source that observed one.
+    sky: dict[str, Any] = {
+        "ceiling_ft_agl": None,
+        "ceiling_cover": None,
+        "sky_reported": False,
+    }
 
     for report, source in ladder:
         if report is None:
@@ -626,6 +654,18 @@ def resolve_surface(
                 continue
             values[name] = value
             sources[name] = source
+        if report.sky_reported:
+            sky = {
+                "ceiling_ft_agl": report.ceiling_ft_agl,
+                "ceiling_cover": report.ceiling_cover,
+                "sky_reported": True,
+            }
+            # Only a ceiling has a source to name. A reported clear sky is an
+            # answer, but it is not a value any box is filled from.
+            sources.pop("ceiling_ft_agl", None)
+            if report.ceiling_ft_agl is not None:
+                sources["ceiling_ft_agl"] = source
+    values.update(sky)
 
     # The gust travels with the wind that was measured alongside it, or not
     # at all. Same report, or nothing: two sources of one wind is not a wind.

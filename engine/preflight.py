@@ -5,8 +5,18 @@ Preflight check should consist of:
 2. Landing distance at destination airport < runway length with a margin
 3. Total fuel reserve is > 30 min for day VFR and > 45 min for night
 4. Weight and balance within limits
+5. The weather at the departure and landing fields is VFR
 
 Check is performed against all runways at the airports
+
+**The field has to be VFR, not merely legal.** A ceiling is checked against
+the height the pattern is flown at rather than against the 1,000 ft in the
+regulation: an overcast at 1,100 ft is legal to take off under and leaves
+nowhere to fly a circuit, so an overcast has to sit at least 500 ft above the
+pattern -- the same clearance 91.155 asks for below a cloud. A vertical
+visibility is not a ceiling to fly under at all and ends the check. Weather is
+only checked where there is weather to check: a field with no report gets the
+verdict it got before, which is one about runways and nothing else.
 
 **Wind is part of every distance.** A runway is not a length, it is a length
 pointing somewhere: the same 2500 ft strip is comfortable into 12 kt and
@@ -32,6 +42,27 @@ from engine import performance as perf
 # Safety factor on runway and fuel reserves
 DEFAULT_RUNWAY_MARGIN = 0.20
 DEFAULT_FUEL_MARGIN = 0.10
+
+# Basic VFR at the field: 3 statute miles and a 1,000 ft ceiling, which is
+# what 14 CFR 91.155 asks for in the surface area of controlled airspace and
+# what 91.157 asks for before special VFR is even on the table.
+VFR_VISIBILITY_SM = 3.0
+VFR_CEILING_FT_AGL = 1000.0
+
+# How far below an overcast the pattern still has to fit. 91.155 wants 500 ft
+# of clearance below a cloud, and the pattern is flown at pattern altitude, so
+# an overcast lower than the two added together cannot be operated under
+# legally however high it is above the runway.
+PATTERN_CLEARANCE_FT = 500.0
+
+# Where the field database publishes no traffic pattern altitude. 1,000 ft AGL
+# is the AC 90-66 figure for a light single, and it is the height the fuel
+# burn for the pattern is already charged at in `engine/navlog.py`.
+DEFAULT_PATTERN_HEIGHT_AGL_FT = 1000.0
+
+# The sky is not visible, only a vertical visibility into it: `VV` in a TAF,
+# `OVX` in a METAR. There is no cloud base to stay below and no horizon.
+OBSCURATION_COVERS = frozenset({"OVX", "VV"})
 
 # The dry-grass correction is applied to every unpaved surface. Gravel and
 # dirt are not grass, and the POH publishes no figure for them, so the grass
@@ -76,7 +107,6 @@ class Margins:
 # optional side letter for parallel runways. "09L", "9", "27R", "36".
 _DESIGNATOR = re.compile(r"^(\d{1,2})([LRCWE]?)$")
 
-
 @dataclass(frozen=True)
 class RunwayEnd:
     """One direction of a runway, and the heading it points."""
@@ -88,11 +118,7 @@ class RunwayEnd:
 @dataclass(frozen=True)
 class SurfaceWind:
     """The wind over a field, referenced to MAGNETIC north.
-
-    Magnetic because that is the frame runway designators are in, and lining
-    the two up is the entire point. `gust_kt` is the peak when the report has
-    one; it is used where a gust makes the answer worse and ignored where it
-    would flatter it -- see `wind_components`.
+    `gust_kt` is the peak when the report has one
     """
 
     from_deg: float
@@ -115,7 +141,7 @@ class SurfaceWind:
 
 @dataclass(frozen=True)
 class WindComponents:
-    """The wind resolved onto one runway end."""
+    """The wind resolved onto one runway direction."""
 
     headwind_kt: float  # negative for a tailwind
     crosswind_kt: float  # magnitude
@@ -128,12 +154,7 @@ class WindComponents:
 
 def wind_components(runway_heading_deg: float, wind: SurfaceWind) -> WindComponents:
     """Resolve a wind onto a runway heading, taking the unfavourable reading.
-
-    Gusts are not symmetric in what they mean. A gusting headwind is a bonus
-    that may not be there on the roll, so the distance is read at the steady
-    wind; a gusting tailwind is a penalty that may well be there, so the
-    distance is read at the gust. The crosswind is always taken at the peak,
-    because the gust is exactly the part that runs out of rudder.
+    Take the worst case scenario in gusts to calculate wind
     """
     off_rad = math.radians(wind.from_deg - runway_heading_deg)
     steady_head = wind.speed_kt * math.cos(off_rad)
@@ -148,7 +169,7 @@ def wind_components(runway_heading_deg: float, wind: SurfaceWind) -> WindCompone
 
 @dataclass(frozen=True)
 class Runway:
-    """One runway at an airport, as the checklist needs it."""
+    """One runway at an airport"""
 
     designation: str  # "12/30", or "" if unknown
     length_ft: float | None
@@ -160,10 +181,7 @@ class Runway:
         """Both directions of the strip, with their magnetic headings.
 
         The heading comes from the designator rather than from a published
-        alignment, so it is quantised to ten degrees and can be five degrees
-        out. That is far inside the error of a reported surface wind -- and it
-        means the check runs off the airport database as it already ships,
-        with no runway-alignment column to build and keep current.
+        alignment, so it is quantised to ten degrees
         """
         found: list[RunwayEnd] = []
         for part in self.designation.replace("-", "/").split("/"):
@@ -231,6 +249,150 @@ class RunwayCheck:
 
 
 @dataclass(frozen=True)
+class FieldWeather:
+    """What a field's report says about flying VFR out of or into it.
+
+    Built from a resolved `engine.weather.SurfaceWeather`, and deliberately
+    only the parts the go/no-go decides on. `sky_reported` is the one that is
+    easy to lose: a clear sky and a source that does not observe cloud both
+    arrive with no ceiling in them, and they are opposite answers.
+    """
+
+    visibility_sm: float | None = None
+    ceiling_ft_agl: float | None = None
+    ceiling_cover: str = ""  # BKN | OVC | OVX | VV; "" when there is no ceiling
+    sky_reported: bool = False
+
+    @property
+    def is_obscuration(self) -> bool:
+        return self.ceiling_cover.upper() in OBSCURATION_COVERS
+
+
+@dataclass(frozen=True)
+class WeatherCheck:
+    """The field weather against VFR, for one operation at one airport."""
+
+    airport: str
+    operation: str  # takeoff | landing
+
+    visibility_sm: float | None
+    ceiling_ft_agl: float | None
+    ceiling_cover: str
+    obscured: bool
+    # Whether the report said anything about the sky at all -- the difference
+    # between a clear sky and a source that does not observe cloud.
+    sky_reported: bool
+
+    # The pattern this field flies, and the ceiling that follows from it. The
+    # requirement is carried rather than recomputed, because it depends on the
+    # cover as well as the pattern and the pilot is owed the number that was
+    # actually applied.
+    pattern_altitude_agl_ft: float
+    required_ceiling_ft_agl: float | None
+
+    passes: bool | None  # None when there was not enough of a report to say
+    # Every gate that closed, not just the first. A field can be below
+    # minimums on visibility *and* under an overcast, and waiting out one of
+    # them is not waiting out the other.
+    reasons: tuple[str, ...] = ()
+    notes: tuple[str, ...] = ()
+
+    @property
+    def summary(self) -> str:
+        """The verdict in one line, for the checklist and the blocker list."""
+        if self.reasons:
+            return "; ".join(self.reasons)
+        if self.passes is None:
+            return "; ".join(self.notes) or "not enough weather to judge VFR"
+        return "VFR"
+
+
+def check_weather(
+    *,
+    airport: str,
+    operation: str,
+    weather: FieldWeather | None,
+    pattern_altitude_agl_ft: float = DEFAULT_PATTERN_HEIGHT_AGL_FT,
+) -> WeatherCheck | None:
+    """The field against VFR minimums, plus room to fly the pattern.
+
+    `None` in, `None` out: with no report there is nothing to check, and the
+    checklist says nothing about the weather
+
+    Any ceiling has to clear the 1,000 ft in the regulation (we need to fly 1000ft above); 
+    an overcast has additionally to clear the pattern by 500 ft
+    """
+    if weather is None:
+        return None
+
+    cover = weather.ceiling_cover.upper()
+    obscured = weather.is_obscuration
+    reasons: list[str] = []
+    notes: list[str] = []
+    unknown = False
+
+    required: float | None = None
+    if obscured: # this means IFR
+        height = (
+            ""
+            if weather.ceiling_ft_agl is None
+            else f" at {weather.ceiling_ft_agl:.0f} ft"
+        )
+        reasons.append(
+            f"sky obscured ({cover}{height}); this is not a ceiling to fly "
+            f"VFR under"
+        )
+    elif weather.ceiling_ft_agl is not None:
+        required = VFR_CEILING_FT_AGL
+        if cover == "OVC":
+            required = max(
+                required, pattern_altitude_agl_ft + PATTERN_CLEARANCE_FT
+            )
+        if weather.ceiling_ft_agl < required:
+            reasons.append(
+                f"{cover or 'ceiling'} {weather.ceiling_ft_agl:.0f} ft AGL is "
+                f"below the {required:.0f} ft needed"
+                + (
+                    f" to fly the {pattern_altitude_agl_ft:.0f} ft pattern "
+                    f"{PATTERN_CLEARANCE_FT:.0f} ft below an overcast"
+                    if cover == "OVC"
+                    and required > VFR_CEILING_FT_AGL
+                    else " for VFR"
+                )
+            )
+    elif not weather.sky_reported:
+        # No cloud group at all. Common on a model-only forecast, which
+        # observes no sky -- and a forecast that cannot see cloud is not a
+        # forecast of no cloud.
+        unknown = True
+        notes.append("no sky condition in this report; the ceiling is unknown")
+
+    if weather.visibility_sm is None:
+        notes.append("no visibility in this report; it was not checked")
+        unknown = True
+    elif weather.visibility_sm < VFR_VISIBILITY_SM:
+        reasons.append(
+            f"visibility {weather.visibility_sm:g} sm is below the "
+            f"{VFR_VISIBILITY_SM:g} sm VFR minimum"
+        )
+
+    return WeatherCheck(
+        airport=airport,
+        operation=operation,
+        visibility_sm=weather.visibility_sm,
+        ceiling_ft_agl=weather.ceiling_ft_agl,
+        ceiling_cover=cover,
+        obscured=obscured,
+        sky_reported=weather.sky_reported,
+        pattern_altitude_agl_ft=pattern_altitude_agl_ft,
+        required_ceiling_ft_agl=required,
+        passes=False if reasons else (None if unknown else True),
+        reasons=tuple(reasons),
+        notes=tuple(notes),
+    )
+
+
+@dataclass(frozen=True)
 class AirportCheck:
     """Every runway at one airport, for one operation, and the verdict.
 
@@ -255,8 +417,13 @@ class AirportCheck:
 
     runways: tuple[RunwayCheck, ...]
 
+    # The field's weather against VFR. `None` where no report was given, which
+    # is not the same as a report that could not be judged -- see
+    # `check_weather`.
+    weather: WeatherCheck | None = None
+
     @property
-    def passes(self) -> bool | None:
+    def runways_pass(self) -> bool | None:
         """True if any runway works, False if none does, None if unknown.
 
         None only when nothing could be determined at all -- if one runway is
@@ -267,6 +434,23 @@ class AirportCheck:
         if any(r.passes is False for r in self.runways):
             return False
         return None
+
+    @property
+    def passes(self) -> bool | None:
+        """The field as a whole: the runways and the weather over them.
+
+        Both are gates, and on the same footing as length and crosswind are on
+        a single runway. The longest runway on the field is no use under an
+        obscuration, and a clear sky does not lengthen a short one.
+        """
+        verdicts = [self.runways_pass]
+        if self.weather is not None:
+            verdicts.append(self.weather.passes)
+        if any(v is False for v in verdicts):
+            return False
+        if any(v is None for v in verdicts):
+            return None
+        return True
 
     @property
     def best(self) -> RunwayCheck | None:
@@ -339,6 +523,8 @@ def check_airport(
     weight_lb: float,
     margin: float,
     wind: SurfaceWind | None = None,
+    weather: FieldWeather | None = None,
+    pattern_altitude_agl_ft: float = DEFAULT_PATTERN_HEIGHT_AGL_FT,
 ) -> AirportCheck:
     """Book distances for one operation, against every runway on the field.
 
@@ -346,6 +532,9 @@ def check_airport(
     book figures, which is what the charts publish and what the checklist did
     before wind was modelled. Every runway then says so in its note, because a
     distance read without a wind is a distance read at an assumption.
+
+    `weather` is optional on the same terms, and omitted leaves the field's
+    VFR check out of the verdict entirely rather than failing it.
     """
     shared = {
         "airport": airport,
@@ -357,6 +546,12 @@ def check_airport(
         "weight_lb": weight_lb,
         "margin": margin,
         "wind": wind,
+        "weather": check_weather(
+            airport=airport,
+            operation=operation,
+            weather=weather,
+            pattern_altitude_agl_ft=pattern_altitude_agl_ft,
+        ),
     }
 
     if not runways:
@@ -551,13 +746,25 @@ def summarise(airports: list[AirportCheck], fuel: FuelCheck) -> GoNoGo:
     unknowns: list[str] = []
 
     for check in airports:
-        if check.passes is False:
-            blockers.append(f"{check.airport} {check.operation}: {_why_no_runway(check)}")
-        elif check.passes is None:
+        where = f"{check.airport} {check.operation}"
+        # Weather and runways are reported separately even though either one
+        # sinks the field. "No runway is long enough" and "the field is under
+        # an overcast" are different problems with different answers, and a
+        # pilot who fixes one by taking less fuel still needs to know about
+        # the other.
+        if check.weather is not None:
+            if check.weather.passes is False:
+                blockers.append(f"{where} weather: {check.weather.summary}")
+            elif check.weather.passes is None:
+                unknowns.append(f"{where} weather: {check.weather.summary}")
+
+        if check.runways_pass is False:
+            blockers.append(f"{where}: {_why_no_runway(check)}")
+        elif check.runways_pass is None:
             reason = next(
                 (r.note for r in check.runways if r.note), "could not be checked"
             )
-            unknowns.append(f"{check.airport} {check.operation}: {reason}")
+            unknowns.append(f"{where}: {reason}")
 
     if not fuel.passes:
         blockers.append(
@@ -577,12 +784,6 @@ def summarise(airports: list[AirportCheck], fuel: FuelCheck) -> GoNoGo:
 
 def _why_no_runway(check: AirportCheck) -> str:
     """Why no runway on this field works, in the terms that actually decided it.
-
-    Length, crosswind and a blank chart cell all end in "no", and a pilot does
-    something different about each -- take less fuel, wait for the wind, do not
-    go at all. So the reason names the gate that closed rather than always
-    reporting length, and a field where different runways failed differently
-    says so instead of picking one story.
     """
     crosswind_out = [r for r in check.runways if r.crosswind_exceeds_demonstrated]
     no_data = [r for r in check.runways if r.outside_envelope]
@@ -660,6 +861,8 @@ def format_checklist(result: GoNoGo) -> str:
             f"{check.weight_lb:.0f} lb, margin {check.margin:.0%}, "
             f"wind {_format_wind(check.wind)}"
         )
+        if check.weather is not None:
+            lines.append(f"  Weather: {_format_weather(check.weather)}")
         lines.append(
             f"  {'RWY':<10}{'SURFACE':<12}{'USE':>5}{'HEAD':>7}{'XWIND':>7}"
             f"{'LENGTH':>8}{'ROLL':>8}"
@@ -706,6 +909,29 @@ def format_checklist(result: GoNoGo) -> str:
         lines.append(f"UNKNOWN: {unknown}")
 
     return "\n".join(lines)
+
+
+def _format_weather(check: WeatherCheck) -> str:
+    """The sky and the visibility, then what the checklist made of them."""
+    if check.obscured:
+        sky = f"sky obscured ({check.ceiling_cover})"
+    elif check.ceiling_ft_agl is not None:
+        sky = f"{check.ceiling_cover or 'ceiling'} {check.ceiling_ft_agl:.0f} ft AGL"
+    elif check.sky_reported:
+        sky = "no ceiling"
+    else:
+        sky = "sky not reported"
+    visibility = (
+        "visibility not reported"
+        if check.visibility_sm is None
+        else f"{check.visibility_sm:g} sm visibility"
+    )
+    verdict = "VFR" if check.passes else ("NOT VFR" if check.passes is False else "?")
+    detail = "" if check.passes else f" -- {check.summary}"
+    return (
+        f"{sky}, {visibility}, pattern {check.pattern_altitude_agl_ft:.0f} ft AGL. "
+        f"{verdict}{detail}"
+    )
 
 
 def _or_dash(value: float | None, width: int) -> str:

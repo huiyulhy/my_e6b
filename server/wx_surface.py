@@ -38,11 +38,12 @@ from pathlib import Path
 from typing import Any
 
 from engine import airports as apt
+from engine import aloft as al
 from engine import weather as wx
 from engine.geo import LatLon
 from engine.weather import SurfaceWeather, WeatherUnavailable
 
-__all__ = ["WeatherUnavailable", "fetch_surface"]
+__all__ = ["WeatherUnavailable", "fetch_aloft", "fetch_surface"]
 
 AWC = "https://aviationweather.gov/api/data"
 OPEN_METEO = "https://api.open-meteo.com/v1/forecast"
@@ -173,6 +174,60 @@ def _model_url(position: LatLon, target: datetime) -> str:
         "models": "gfs_seamless",
     }
     return f"{OPEN_METEO}?{urllib.parse.urlencode(query)}"
+
+
+def _aloft_url(position: LatLon, target: datetime, levels: tuple[int, ...]) -> str:
+    """The same forecast as `_model_url`, asked on pressure levels.
+
+    A separate request rather than more `hourly=` names on the surface one:
+    the two have different lifetimes in the cache and different failure
+    consequences. A field with no wind aloft still has a usable altimeter
+    setting, and losing the go/no-go because the cruise wind was unavailable
+    would be the wrong trade.
+    """
+    day = target.astimezone(UTC).date()
+    query = {
+        "latitude": f"{position.lat:.4f}",
+        "longitude": f"{position.lon:.4f}",
+        "hourly": ",".join(al.hourly_fields(levels)),
+        "wind_speed_unit": "kn",
+        "temperature_unit": "celsius",
+        "timezone": "GMT",
+        "start_date": day.isoformat(),
+        "end_date": (day + timedelta(days=1)).isoformat(),
+        "models": "gfs_seamless",
+    }
+    return f"{OPEN_METEO}?{urllib.parse.urlencode(query)}"
+
+
+def fetch_aloft(
+    position: LatLon,
+    target: datetime | None = None,
+    *,
+    ceiling_ft: float = 14000.0,
+    refresh: bool = False,
+) -> al.AloftForecast:
+    """Winds and temperatures aloft over one point, for now or for a time.
+
+    Keyed by position, not by identifier: the wind at cruise belongs to the
+    piece of sky the leg crosses, and asking about the departure airport would
+    reproduce the very thing the FD product gets wrong.
+
+    Raises `WeatherUnavailable` when the model cannot be reached, or when it
+    answers with nothing usable for this hour -- an empty forecast would read
+    as "calm and standard", which is a claim about the day rather than the
+    absence of one.
+    """
+    target = datetime.now(tz=UTC) if target is None else _as_utc(target)
+    levels = al.levels_up_to(ceiling_ft)
+    payload = _get_json(_aloft_url(position, target, levels), TTL_MODEL, refresh=refresh)
+    forecast = al.parse_aloft(payload, target, levels=levels)
+    if forecast is None:
+        raise WeatherUnavailable(
+            f"the model returned no hour near {target:%Y-%m-%d %H:%MZ} "
+            f"for {position.lat:.3f}, {position.lon:.3f}"
+        )
+    return forecast
 
 
 def _nearest_taf_candidates(position: LatLon) -> list[apt.Airport]:

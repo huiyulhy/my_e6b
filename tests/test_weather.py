@@ -435,3 +435,124 @@ class TestTimezones:
     def test_resolved_times_always_carry_a_timezone(self):
         resolved = wx.resolve_surface(station="KSQL", metar=wx.parse_metar(METAR_KSQL))
         assert resolved.valid_time.tzinfo is not None
+
+
+class TestSky:
+    """The cloud group, which the go/no-go reads as more than a height.
+
+    A ceiling height on its own cannot answer "is this field VFR": an overcast
+    has to clear the traffic pattern, a broken layer only has to clear the
+    regulation, and a vertical visibility is not a ceiling to fly under at
+    all. So the cover comes back with the height -- and so does whether the
+    sky was looked at, because a clear sky and a source that does not observe
+    cloud both arrive with no ceiling in them.
+    """
+
+    def observed(self, **groups):
+        record = dict(METAR_KSQL[0])
+        record.update(groups)
+        return wx.parse_metar([record])
+
+    def forecast(self, **groups):
+        payload = json.loads(json.dumps(TAF_KSFO))
+        payload[0]["fcsts"][0].update(groups)
+        return wx.parse_taf(payload, block_time(payload, 0))
+
+    def test_an_empty_cloud_list_is_a_reported_clear_sky(self):
+        # The KSQL fixture reports `"clouds": []`: looked at, nothing there.
+        observation = wx.parse_metar(METAR_KSQL)
+        assert observation.sky_reported is True
+        assert observation.ceiling_ft_agl is None
+        assert observation.ceiling_cover is None
+
+    def test_a_record_with_no_cloud_group_is_not_a_clear_sky(self):
+        record = {k: v for k, v in METAR_KSQL[0].items() if k != "clouds"}
+        assert wx.parse_metar([record]).sky_reported is False
+
+    def test_the_cover_that_made_the_ceiling_comes_back_with_it(self):
+        observation = self.observed(
+            clouds=[{"cover": "SCT", "base": 1200}, {"cover": "OVC", "base": 2500}]
+        )
+        assert observation.ceiling_ft_agl == pytest.approx(2500.0)
+        assert observation.ceiling_cover == "OVC"
+
+    def test_the_lowest_layer_that_is_a_ceiling_wins_not_the_lowest_layer(self):
+        observation = self.observed(
+            clouds=[{"cover": "FEW", "base": 500}, {"cover": "BKN", "base": 3000}]
+        )
+        assert observation.ceiling_ft_agl == pytest.approx(3000.0)
+        assert observation.ceiling_cover == "BKN"
+
+    def test_an_obscuration_is_reported_as_one(self):
+        observation = self.observed(clouds=[{"cover": "OVX", "base": 200}])
+        assert observation.ceiling_ft_agl == pytest.approx(200.0)
+        assert observation.ceiling_cover == "OVX"
+
+    def test_an_obscuration_with_no_height_is_still_an_obscuration(self):
+        """The sky is hidden whether or not anybody measured how far up."""
+        observation = self.observed(clouds=[{"cover": "OVX", "base": None}])
+        assert observation.ceiling_cover == "OVX"
+        assert observation.ceiling_ft_agl is None
+        assert observation.sky_reported is True
+
+    def test_a_taf_vertical_visibility_is_the_ceiling(self):
+        forecast = self.forecast(vertVis=300, clouds=[])
+        assert forecast.ceiling_ft_agl == pytest.approx(300.0)
+        assert forecast.ceiling_cover == "VV"
+
+    def test_a_vertical_visibility_under_a_cloud_layer_wins(self):
+        forecast = self.forecast(vertVis=200, clouds=[{"cover": "BKN", "base": 1500}])
+        assert forecast.ceiling_cover == "VV"
+
+    def test_the_sky_is_resolved_whole_rather_than_field_by_field(self):
+        """A METAR height must not end up wearing a TAF's cover code.
+
+        The two describe different moments. Mixing them would report a sky
+        that neither source saw, and the go/no-go would then decide on it.
+        """
+        metar = self.observed(clouds=[{"cover": "BKN", "base": 4000}])
+        taf = wx.SurfaceWeather(
+            station="KSQL",
+            valid_time=metar.valid_time,
+            ceiling_ft_agl=300.0,
+            ceiling_cover="OVC",
+            sky_reported=True,
+        )
+        resolved = wx.resolve_surface(
+            station="KSQL", target=metar.valid_time, now=metar.valid_time,
+            metar=metar, taf=taf,
+        )
+        # The observation is current, so it wins -- and it wins entire.
+        assert resolved.ceiling_ft_agl == pytest.approx(4000.0)
+        assert resolved.ceiling_cover == "BKN"
+
+    def test_a_source_that_never_looked_does_not_overwrite_one_that_did(self):
+        """A model has no cloud group, so it cannot clear a forecast sky."""
+        taf = wx.SurfaceWeather(
+            station="KSQL",
+            valid_time=datetime(2026, 6, 1, 12, tzinfo=UTC),
+            ceiling_ft_agl=800.0,
+            ceiling_cover="OVC",
+            sky_reported=True,
+        )
+        model = wx.SurfaceWeather(
+            station="KSQL", valid_time=taf.valid_time, oat_c=18.0
+        )
+        resolved = wx.resolve_surface(
+            station="KSQL", target=taf.valid_time, now=taf.valid_time,
+            taf=taf, model=model,
+        )
+        assert resolved.ceiling_cover == "OVC"
+        assert resolved.sky_reported is True
+
+    def test_a_model_only_answer_reports_no_sky_at_all(self):
+        model = wx.SurfaceWeather(
+            station="KSQL",
+            valid_time=datetime(2026, 6, 1, 12, tzinfo=UTC),
+            oat_c=18.0,
+        )
+        resolved = wx.resolve_surface(
+            station="KSQL", target=model.valid_time, now=model.valid_time, model=model
+        )
+        assert resolved.sky_reported is False
+        assert resolved.ceiling_ft_agl is None

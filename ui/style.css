@@ -127,8 +127,21 @@ input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 }
 .waypoints .seq { font-family: var(--mono); font-size: 11px; color: var(--ink-dim); width: 16px; }
 .waypoints .name { flex: 1; font-family: var(--mono); font-weight: 600; }
-.waypoints .drag { cursor: grab; color: var(--ink-dim); }
+.waypoints .drag {
+  cursor: grab; color: var(--ink-dim);
+  /* A finger needs more than the glyph to aim at. */
+  padding: 4px 6px; margin: -4px -2px;
+  /* iPad: a long press on the handle must start a drag, not the text
+     selection / copy callout that grabbing a glyph would otherwise trigger. */
+  user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+  touch-action: none;
+}
 .waypoints li.dragging { opacity: .4; }
+.waypoints li.dragging .drag { cursor: grabbing; }
+/* Where the row would land on release. Drawn on the neighbouring row's edge
+   rather than as an element of its own, so the list does not reflow mid-drag. */
+.waypoints li.drop-above { box-shadow: 0 -2px 0 var(--accent); }
+.waypoints li.drop-below { box-shadow: 0 2px 0 var(--accent); }
 .waypoints button.remove {
   background: none; border: none; color: var(--ink-dim); cursor: pointer;
   font-size: 16px; line-height: 1; padding: 0 2px;
@@ -153,6 +166,14 @@ input:disabled { opacity: .45; cursor: not-allowed; }
 .alert {
   margin-top: 10px; padding: 8px 10px; border-radius: 6px; font-size: 12px; line-height: 1.5;
   background: rgba(255,123,114,.12); border: 1px solid rgba(255,123,114,.4); color: #ffc9c5;
+}
+
+/* Provenance, not a problem: the winds aloft came from a model. Same shape as
+   an alert so it sits in the same column, but blue rather than red -- nothing
+   is wrong, the table is just saying what it is holding. */
+.alert.model {
+  background: rgba(88, 166, 255, .10); border-color: rgba(88, 166, 255, .35);
+  color: var(--ink-dim);
 }
 
 /* --- map -------------------------------------------------------------- */
@@ -256,7 +277,26 @@ tr.row-ground td.num:nth-last-child(3) { color: var(--ink); }
 
 /* --- manual row edits -------------------------------------------------- */
 
-.navlog-actions { display: flex; gap: 8px; }
+.navlog-actions { display: flex; gap: 8px; align-items: center; }
+
+/* The off-blocks time sits inline with the buttons it feeds, so the row reads
+   left to right as one sentence: a time, then the action that uses it. */
+#off-blocks-label {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 12px; color: var(--ink-dim); white-space: nowrap;
+}
+#off-blocks {
+  background: var(--panel-2); color: var(--ink);
+  border: 1px solid var(--line); border-radius: 4px;
+  padding: 3px 6px; font: inherit; font-size: 12px;
+}
+#off-blocks:focus { outline: none; border-color: var(--accent); }
+/* Empty is the normal state -- current weather -- so it should not shout.
+   A time actually set is what changes the meaning of the button beside it. */
+#off-blocks:not(:placeholder-shown), #off-blocks:valid:not([value=""]) {
+  color: var(--ink);
+}
+#off-blocks-label .unit { color: var(--ink-dim); font-size: 11px; }
 
 #navlog td.editable { padding: 0; }
 #navlog td.editable input {
@@ -289,6 +329,13 @@ tr.row-ground td.num:nth-last-child(3) { color: var(--ink); }
 .check-title { font-family: var(--mono); font-weight: 600; }
 .check-conditions { font-size: 11px; color: var(--ink-dim); line-height: 1.6; margin: 2px 0 6px; }
 .check-conditions strong { color: var(--ink); }
+
+/* The VFR verdict, between the conditions and the runway table. Tinted like
+   the runway rows it sits above, because it fails the field the same way. */
+.check-weather { font-size: 11px; line-height: 1.6; margin: 0 0 6px;
+  display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap;
+  color: var(--ink-dim); }
+.check-weather.short { color: var(--warn); }
 
 .pill { font-size: 10px; font-weight: 700; letter-spacing: 0.06em;
   padding: 1px 7px; border-radius: 999px; }

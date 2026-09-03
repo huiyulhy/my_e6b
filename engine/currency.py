@@ -5,7 +5,7 @@ no server to tell it. So the two datasets that expire on a clock carry their
 own dates, and the UI shows them:
 
 * FAA NASR, reissued every 28 days. Treated as good for one month from the
-  effective date printed in `data/nasr/README.txt`.
+  effective date printed in `data/README.txt`.
 * NOAA World Magnetic Model, reissued every five years. The window comes
   from the epoch in the coefficient file itself.
 
@@ -25,7 +25,7 @@ from pathlib import Path
 from engine import magnetic
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
-NASR_README = DATA_DIR / "nasr" / "README.txt"
+NASR_README = DATA_DIR / "README.txt"
 AIRPORT_DB = DATA_DIR / "aero" / "airports.sqlite"
 
 NASR_VALID_MONTHS = 1
@@ -123,7 +123,7 @@ def nasr(
         # README degrades to a stale-looking date
         effective = built
         note = (
-            "No effective date in data/nasr/README.txt; using the date the "
+            "No effective date in data/README.txt; using the date the "
             "airport database was built from."
             if built
             else "No NASR effective date found."
@@ -131,7 +131,7 @@ def nasr(
     elif built and built != effective:
         note = (
             f"Airport database was built from the {built.isoformat()} cycle; "
-            f"data/nasr holds {effective.isoformat()}. Re-run "
+            f"data/README.txt holds {effective.isoformat()}. Re-run "
             f"tools/build_airports.py."
         )
 

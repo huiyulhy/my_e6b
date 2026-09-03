@@ -45,6 +45,7 @@ from engine.atmosphere import (
 )
 from engine.geo import (
     LatLon,
+    Segment,
     WindTooStrong,
     inverse,
     solve_wind_triangle,
@@ -85,6 +86,8 @@ __all__ = [
     "TypedWind",
     "Waypoint",
     "Wind",
+    "WindColumn",
+    "WindField",
     "WindsAloft",
     "build_navlog",
     "build_segments",
@@ -169,6 +172,39 @@ def _wind_components(wind: Wind) -> tuple[float, float]:
 
 
 @dataclass(frozen=True)
+class WindColumn:
+    """One forecast column of wind, and the point it was forecast over."""
+
+    position: LatLon
+    winds: WindsAloft
+
+
+@dataclass(frozen=True)
+class WindField:
+    """Several columns of wind across a route, each over its own point.
+
+    A `WindsAloft` is one column: it answers by altitude, and it is the whole
+    sky as far as the plan is concerned. That is the FD product's shape, and
+    the objection `engine/aloft.py` raises against it -- the wind on the coast
+    is not the wind over the valley -- applies just as much to one gridded
+    column stretched over a 300 nm route.
+
+    So a leg is flown in the column nearest the ground it covers. Nearest
+    rather than blended between the two: each column is fetched *for* a leg,
+    so a leg's own column is the nearest one to its own midpoint by
+    construction, and averaging two would smear across a front the model had
+    resolved sharply.
+
+    Keyed by position rather than by row or leg index on purpose. A forecast
+    wind moves the tops of climb and descent, which renumbers the very rows it
+    would have been keyed to; a point on the earth does not move. Which leg a
+    column belongs to is worked out from where it is -- see `_RouteColumns`.
+    """
+
+    columns: tuple[WindColumn, ...] = ()
+
+
+@dataclass(frozen=True)
 class TypedWind:
     """One leg's wind, as far as the pilot typed it.
 
@@ -205,6 +241,10 @@ class Conditions:
     night: bool = False
     temperatures: TemperatureProfile | None = None
     temperatures_aloft: tuple[TemperatureSample, ...] = ()
+    # Forecast columns across the route, when any were fetched. Where there
+    # are none every leg reads `winds`, which is what a plan with nothing
+    # entered has always meant.
+    wind_field: WindField | None = None
 
     def oat_c(self, altitude_ft: float) -> float:
         """Temperature at an indicated altitude, observed where it was reported.
@@ -863,7 +903,9 @@ def _build_checklist(
 
     An intermediate stop is checked twice -- once landing in, once taking off
     again -- because the runway that is long enough to get into is not always
-    long enough to get out of on a hot afternoon.
+    long enough to get out of on a hot afternoon. The weather is checked at
+    both ends for the same reason: it is checked at the time the field is
+    used, and a stop landed into at noon is departed from at four.
     """
     checks: list[preflight.AirportCheck] = []
     seen: set[tuple[str, str]] = set()
@@ -894,6 +936,16 @@ def _build_checklist(
                     weight_lb=aircraft.weight_lb,
                     margin=margins.runway,
                     wind=_field_wind(waypoint, decimal_year),
+                    # Only what the field actually reported. A waypoint with
+                    # no weather on it leaves the VFR check out rather than
+                    # failing it, so a plan built without fetching weather
+                    # reads exactly as it did before.
+                    weather=waypoint.field_weather_report,
+                    pattern_altitude_agl_ft=(
+                        waypoint.pattern_altitude_agl_ft
+                        if waypoint.pattern_altitude_agl_ft is not None
+                        else preflight.DEFAULT_PATTERN_HEIGHT_AGL_FT
+                    ),
                 )
             )
 
@@ -1036,7 +1088,9 @@ def _build_flight(
             conditions=conditions,
             cruise_point=cruise_point,
             altitude_overrides=_altitude_overrides_by_leg(route, overrides, row_offset),
-            leg_winds=_leg_winds_by_leg(route, row_winds, row_offset),
+            leg_winds=_leg_winds_by_leg(
+                route, row_winds, row_offset, conditions, columns
+            ),
         )
 
     # --- the airmass this flight is planned in ---------------------------
@@ -1061,14 +1115,21 @@ def _build_flight(
         for row, override in overrides.items()
         if override.oat_c is not None
     }
-    row_winds = _row_winds(overrides, conditions)
+    row_winds = _row_winds(overrides)
     # A typed wind needs the draft for the same reason a typed temperature
     # does, but only in automatic mode: there the planner decides where the
     # top of climb falls before any row exists, so a wind typed against a row
     # has to be traced back to the leg the pilot drew it on. In user-driven
     # mode the rows are the pilot's own legs and `_leg_winds_by_leg` re-keys
     # them without a rehearsal.
-    drawn_leg_winds: dict[int, dict[str, TypedWind]] | None = None
+    #
+    # The forecast needs no rehearsal either way: a column belongs to a leg by
+    # where it was forecast, so it can be handed to the planner before
+    # anything has been laid out.
+    columns = _RouteColumns.build(waypoints, conditions.wind_field)
+    drawn_leg_winds: dict[int, dict[str, object]] | None = (
+        _forecast_winds_by_drawn_leg(columns) or None
+    )
     draft_segments: list[ProfileSegment] | None = None
     if row_temperatures or (row_winds and planning_mode == "auto"):
         # A throwaway namer and warning list: this pass is scaffolding, and its
@@ -1084,7 +1145,7 @@ def _build_flight(
             )
         if row_winds and planning_mode == "auto":
             drawn_leg_winds = _leg_winds_by_drawn_leg(
-                waypoints, draft_segments, row_winds, row_offset
+                waypoints, draft_segments, row_winds, row_offset, conditions, columns
             )
 
     if conditions.temperatures is not None:
@@ -1119,7 +1180,11 @@ def _build_flight(
         altitude = segment.altitude_ft
         tas = segment.tas_kt
 
-        wind = conditions.winds.at(altitude)
+        # The wind over the ground this row covers: the column over the leg
+        # it flies along where one was fetched, the route's single profile
+        # where none was.
+        column = None if columns is None else columns.over(start, end)
+        wind = (column or conditions.winds).at(altitude)
         # The index this row takes in the finished navlog: rows already
         # emitted by earlier flights, plus rows emitted by this one. Zero
         # length legs are skipped above, so it matches what the caller sees.
@@ -1448,45 +1513,155 @@ def _altitude_overrides_by_leg(
     return by_leg
 
 
-def _row_winds(
-    overrides: dict[int, LegOverride], conditions: Conditions
-) -> dict[int, TypedWind]:
-    """Every row that carries a wind, as something the profile can be flown in."""
+def _row_winds(overrides: dict[int, LegOverride]) -> dict[int, tuple]:
+    """Every row that carries a wind, as the halves the pilot actually typed.
+
+    Halves rather than a finished `TypedWind`, because what an untyped half
+    falls back to depends on the leg: with a forecast column over that leg it
+    is that column, and only without one is it the route's own profile. The
+    base is therefore chosen where the leg is known, not here.
+    """
     return {
-        row: TypedWind(conditions.winds, o.wind_from_deg, o.wind_speed_kt)
+        row: (o.wind_from_deg, o.wind_speed_kt)
         for row, o in overrides.items()
         if o.wind_from_deg is not None or o.wind_speed_kt is not None
     }
 
 
-def _leg_winds_by_leg(
-    route: list[Waypoint], row_winds: dict[int, TypedWind], row_offset: int
-) -> dict[int, dict[str, TypedWind]]:
-    """Re-key row winds onto the legs of a resolved route.
+def _drawn_leg_of(spans: tuple[Segment, ...], point: LatLon) -> int | None:
+    """Which leg the pilot drew a point sits on, or `None` if it sits on none.
 
-    The same skip rule `_altitude_overrides_by_leg` applies, and for the same
-    reason: a leg too short to earn a row must not shift a typed wind onto its
-    neighbour. Keyed by phase as well as leg because that is the shape
-    `resolve_route` needs, and one map is easier to reason about than two.
+    Containment, not nearest: a point belongs to the stretch of route it is
+    *on*. Measuring to the nearest column instead hands the first ten miles of
+    a 130 nm leg to the leg before it, because that leg's column -- sitting at
+    its own midpoint, sixty miles back -- really is the closer of the two. The
+    row is still unambiguously on the second leg.
+
+    Where two legs both contain the point, which happens at the waypoint
+    joining them, the one it deviates from least wins.
     """
-    by_leg: dict[int, dict[str, TypedWind]] = {}
+    on = [
+        (abs(span.cross_track_nm(point)), index)
+        for index, span in enumerate(spans)
+        if -_MIN_ROW_NM <= span.along_track_nm(point) <= span.distance_nm + _MIN_ROW_NM
+    ]
+    return min(on)[1] if on else None
+
+
+@dataclass(frozen=True)
+class _RouteColumns:
+    """One flight's forecast columns, filed under the legs the pilot drew.
+
+    Both halves of the filing are done by position: a column is put on the leg
+    it was forecast over, and a row is given the column of the leg it flies
+    along. Nothing is keyed by row or by index into the resolved route, which
+    is what lets the forecast move the tops of climb -- and it does -- without
+    moving out from under itself.
+    """
+
+    spans: tuple[Segment, ...]
+    by_leg: dict[int, WindsAloft]
+
+    @classmethod
+    def build(
+        cls, waypoints: list[Waypoint], field: WindField | None
+    ) -> _RouteColumns | None:
+        """`None` where there is no forecast, or none of it is on this flight.
+
+        A route with a stop is planned as several flights, and each gets only
+        the columns over its own legs.
+        """
+        if field is None or not field.columns:
+            return None
+        spans = tuple(
+            inverse(start.position, end.position)
+            for start, end in pairwise(strip_generated(waypoints))
+        )
+        by_leg: dict[int, WindsAloft] = {}
+        for column in field.columns:
+            index = _drawn_leg_of(spans, column.position)
+            if index is not None:
+                by_leg[index] = column.winds
+        return cls(spans, by_leg) if by_leg else None
+
+    def over(self, start: Waypoint, end: Waypoint) -> WindsAloft | None:
+        """The column over a stretch of route, found by where that stretch is."""
+        midpoint = inverse(start.position, end.position).point_at_fraction(0.5)
+        index = _drawn_leg_of(self.spans, midpoint)
+        return None if index is None else self.by_leg.get(index)
+
+    def all_phases(self, winds: WindsAloft) -> dict[str, object]:
+        """One column, offered to every phase the leg might be flown in.
+
+        A resolved leg has exactly one phase and a drawn leg can hold three,
+        and the lookup is by phase either way -- so the column answers to all
+        of them and the leg takes the one it needs.
+        """
+        return dict.fromkeys(CONCRETE_SEGMENT_TYPES, winds)
+
+
+def _leg_winds_by_leg(
+    route: list[Waypoint],
+    row_winds: dict[int, tuple],
+    row_offset: int,
+    conditions: Conditions,
+    columns: _RouteColumns | None,
+) -> dict[int, dict[str, object]]:
+    """The wind each leg of a resolved route is flown in.
+
+    Two things arrive here. The forecast column over the leg, which belongs to
+    it by position and needs no keying; and a wind the pilot typed against a
+    row, which does. The same skip rule `_altitude_overrides_by_leg` applies
+    to the second, and for the same reason: a leg too short to earn a row must
+    not shift a typed wind onto its neighbour.
+
+    Typed beats forecast on the phase it was typed against, and a half-typed
+    wind reads its other half off that leg's own column. Keyed by phase as
+    well as leg because that is the shape `resolve_route` needs.
+    """
+    by_leg: dict[int, dict[str, object]] = {}
     row = row_offset
     for index, (start, end) in enumerate(pairwise(route)):
         if inverse(start.position, end.position).distance_nm < _MIN_ROW_NM:
             continue
-        wind = row_winds.get(row)
-        if wind is not None:
-            by_leg[index] = {end.segment_type: wind}
+        column = None if columns is None else columns.over(start, end)
+        entry: dict[str, object] = (
+            columns.all_phases(column) if column is not None else {}
+        )
+        typed = row_winds.get(row)
+        if typed is not None:
+            entry[end.segment_type] = TypedWind(column or conditions.winds, *typed)
+        if entry:
+            by_leg[index] = entry
         row += 1
     return by_leg
+
+
+def _forecast_winds_by_drawn_leg(
+    columns: _RouteColumns | None,
+) -> dict[int, dict[str, object]]:
+    """The forecast column over each leg the *pilot* drew.
+
+    Needs no lay-out at all, unlike a typed wind: a column belongs to a leg by
+    where it was forecast, and the legs the pilot drew are known before
+    anything has been planned. So the planner places the tops of climb in the
+    forecast wind from the first pass rather than the second.
+    """
+    if columns is None:
+        return {}
+    return {
+        index: columns.all_phases(winds) for index, winds in columns.by_leg.items()
+    }
 
 
 def _leg_winds_by_drawn_leg(
     waypoints: list[Waypoint],
     draft_segments: list[ProfileSegment],
-    row_winds: dict[int, TypedWind],
+    row_winds: dict[int, tuple],
     row_offset: int,
-) -> dict[int, dict[str, TypedWind]]:
+    conditions: Conditions,
+    columns: _RouteColumns | None,
+) -> dict[int, dict[str, object]]:
     """Re-key row winds onto the legs the *pilot* drew, for the planner.
 
     Automatic planning decides where a top of climb falls before any of its
@@ -1498,25 +1673,30 @@ def _leg_winds_by_drawn_leg(
 
     Keyed by phase within the leg, because one drawn leg can hold both a climb
     and the descent off it, each with its own wind typed against its own row.
+    The forecast for that leg goes underneath, so a typed direction with no
+    speed takes its speed from the column over that leg.
     """
     drawn = list(pairwise(strip_generated(waypoints)))
     spans = [inverse(start.position, end.position) for start, end in drawn]
 
-    by_leg: dict[int, dict[str, TypedWind]] = {}
+    by_leg = _forecast_winds_by_drawn_leg(columns)
     row = row_offset
     for segment in draft_segments:
         geo = inverse(segment.start.position, segment.end.position)
         if geo.distance_nm < _MIN_ROW_NM:
             continue
-        wind = row_winds.get(row)
+        typed = row_winds.get(row)
         row += 1
-        if wind is None:
+        if typed is None:
             continue
         midpoint = geo.point_at_fraction(0.5)
         for index, span in enumerate(spans):
             along = span.along_track_nm(midpoint)
             if -_MIN_ROW_NM <= along <= span.distance_nm + _MIN_ROW_NM:
-                by_leg.setdefault(index, {})[segment.phase] = wind
+                column = None if columns is None else columns.by_leg.get(index)
+                by_leg.setdefault(index, {})[segment.phase] = TypedWind(
+                    column or conditions.winds, *typed
+                )
                 break
     return by_leg
 

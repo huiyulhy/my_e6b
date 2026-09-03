@@ -22,6 +22,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from engine import airports as apt
+from engine import aloft as al
 from engine import atmosphere as atm
 from engine import consistency as consistency_checks
 from engine import csv_download as csv_export
@@ -78,6 +79,47 @@ class WaypointIn(BaseModel):
     wind_from_deg: float | None = None
     wind_speed_kt: float | None = None
     gust_kt: float | None = None
+    # The rest of the field's report, for the go/no-go's VFR check. Sent
+    # together or not at all: `sky_reported` is what separates a reported
+    # clear sky from a source that does not observe cloud, and without it a
+    # missing ceiling could not be told from a missing report.
+    visibility_sm: float | None = None
+    ceiling_ft_agl: float | None = None
+    ceiling_cover: str = ""  # BKN | OVC | OVX | VV
+    sky_reported: bool = False
+    # True once a report was obtained for this field, whatever was in it. A
+    # model-only answer carries no cloud and no visibility, and without this
+    # it would be indistinguishable from never having fetched at all.
+    weather_reported: bool = False
+
+
+class AloftLevelIn(BaseModel):
+    """One pressure level of a forecast column, as `/api/wx/aloft` gave it.
+
+    Sent back rather than re-fetched, so a plan is still one offline call: the
+    UI fetched the column, and the plan endpoint stays a pure function of what
+    it is handed.
+
+    Both keys travel, because they are different altitudes for the same level.
+    The wind is read at the geopotential height -- what a pilot holding 6500 ft
+    on a correct setting is actually at -- and the temperature at the level's
+    own pressure altitude, which is the coordinate the POH charts and every
+    other station's report have in common.
+    """
+
+    height_ft: float | None = None
+    wind_from_deg: float | None = None
+    wind_speed_kt: float | None = None
+    pressure_altitude_ft: float | None = None
+    isa_deviation_c: float | None = None
+
+
+class WindColumnIn(BaseModel):
+    """A forecast column, and the point on the route it was forecast over."""
+
+    lat: float
+    lon: float
+    levels: list[AloftLevelIn] = []
 
 
 class LegOverrideIn(BaseModel):
@@ -122,6 +164,10 @@ class PlanRequest(BaseModel):
     night: bool = False
     flight_date: date | None = None
     overrides: list[LegOverrideIn] = Field(default_factory=list)
+    # One forecast column per leg the pilot drew, from "Get weather". Empty is
+    # the ordinary case and means every leg reads the winds typed on its row,
+    # or calm -- which is what a plan with nothing entered has always meant.
+    winds_aloft: list[WindColumnIn] = Field(default_factory=list)
     # Fractions: 0.20 means "require 20% more than the book distance".
     runway_margin: float = pf.DEFAULT_RUNWAY_MARGIN
     fuel_margin: float = pf.DEFAULT_FUEL_MARGIN
@@ -263,6 +309,11 @@ def _surface_json(report: wx.SurfaceWeather) -> dict:
         "gust_kt": report.gust_kt,
         "visibility_sm": report.visibility_sm,
         "ceiling_ft_agl": report.ceiling_ft_agl,
+        # What kind of ceiling, and whether the sky was reported at all. The
+        # go/no-go needs both: an overcast has to clear the pattern, and a
+        # report with no sky group in it cannot say the field is VFR.
+        "ceiling_cover": report.ceiling_cover,
+        "sky_reported": report.sky_reported,
         # Rounded to what a pilot actually sets and reads: hundredths on the
         # Kollsman window, whole degrees on the ATIS.
         "oat_c": None if report.oat_c is None else round(report.oat_c, 1),
@@ -273,6 +324,70 @@ def _surface_json(report: wx.SurfaceWeather) -> dict:
         "sources": {name: str(source) for name, source in report.sources.items()},
         "notes": list(report.notes),
     }
+
+
+def _aloft_json(forecast: al.AloftForecast) -> dict:
+    """A forecast column, level by level, plus what it interpolates to.
+
+    Both keys are given per level -- the geopotential height the wind is read
+    at and the pressure altitude the temperature is read at -- because they are
+    different altitudes for the same level and a caller comparing this against
+    a navlog row needs to know which one it is looking at.
+    """
+    return {
+        "ok": True,
+        "valid_time": forecast.valid_time.isoformat(),
+        "terrain_elevation_ft": forecast.terrain_elevation_ft,
+        "levels": [
+            {
+                "pressure_hpa": level.pressure_hpa,
+                "height_ft": round(level.height_ft, 1),
+                "pressure_altitude_ft": round(level.pressure_altitude_ft, 1),
+                "wind_from_deg": None if level.wind is None else round(level.wind.from_deg, 1),
+                "wind_speed_kt": None if level.wind is None else round(level.wind.speed_kt, 1),
+                "oat_c": None if level.oat_c is None else round(level.oat_c, 1),
+                "isa_deviation_c": (
+                    None if level.isa_deviation_c is None
+                    else round(level.isa_deviation_c, 1)
+                ),
+            }
+            for level in forecast.levels
+        ],
+        "notes": list(forecast.notes),
+    }
+
+
+@app.get("/api/wx/aloft")
+def winds_aloft(
+    lat: float,
+    lon: float,
+    time: str | None = None,
+    ceiling_ft: float = 14000.0,
+) -> dict:
+    """Winds and temperatures aloft over one point.
+
+    By position rather than by identifier, unlike the surface endpoint: the
+    wind at cruise belongs to the sky the leg crosses, and reading it off the
+    departure airport is the FD product's mistake rather than a shortcut.
+    """
+    target: datetime | None = None
+    if time:
+        try:
+            target = datetime.fromisoformat(time)
+        except ValueError:
+            raise HTTPException(400, f"could not read {time!r} as an ISO 8601 time")
+
+    try:
+        forecast = wx_surface.fetch_aloft(
+            LatLon(lat, lon), target, ceiling_ft=ceiling_ft
+        )
+    except ValueError as exc:
+        # LatLon refuses an impossible position; that is a bad request, not a
+        # weather outage.
+        raise HTTPException(400, str(exc))
+    except wx.WeatherUnavailable as exc:
+        return {"ok": False, "error": str(exc)}
+    return _aloft_json(forecast)
 
 
 @app.get("/api/wx/surface")
@@ -363,7 +478,16 @@ def _build_from_request(request: PlanRequest):
             wind_from_deg=w.wind_from_deg,
             wind_speed_kt=w.wind_speed_kt,
             gust_kt=w.gust_kt,
+            visibility_sm=w.visibility_sm,
+            ceiling_ft_agl=w.ceiling_ft_agl,
+            ceiling_cover=w.ceiling_cover,
+            sky_reported=w.sky_reported,
+            weather_reported=w.weather_reported,
             runways=_runways_for(w),
+            # Looked up here rather than sent, for the same reason the runways
+            # are: it is a fact about the field, not about the plan, and the
+            # database already on disk is a better source than a round trip.
+            pattern_altitude_agl_ft=_pattern_altitude_for(w),
         )
         for w in request.waypoints
     ]
@@ -373,11 +497,23 @@ def _build_from_request(request: PlanRequest):
     # leg it was forecast for, and temperature comes from the fields plus any
     # row the pilot typed one on. Calm here is what a row with no wind on it
     # means, not a claim about the day.
+    columns = [_wind_column(c) for c in request.winds_aloft]
     conditions = nl.Conditions(
         altimeter_inhg=request.altimeter_inhg,
         isa_deviation_c=request.isa_deviation_c,
         flight_date=request.flight_date,
         night=request.night,
+        # Winds by position, temperatures by pressure altitude. The wind
+        # belongs to the piece of sky one leg crosses; the temperature does
+        # not -- it goes into the one curve the whole route is planned on,
+        # beside the fields' own observations, which is what a pressure
+        # altitude being a shared coordinate buys.
+        wind_field=nl.WindField(tuple(columns)) if columns else None,
+        temperatures_aloft=tuple(
+            sample
+            for column in request.winds_aloft
+            for sample in _aloft_temperature_samples(column)
+        ),
     )
     aircraft = nl.Aircraft(
         weight_lb=request.weight_lb,
@@ -578,15 +714,78 @@ def plan(request: PlanRequest) -> dict:
     }
 
 
+# What the UI can send as a waypoint's kind when it means "a field". The map
+# popup stamps a bare "airport"; a search result carries the database's own
+# `large_airport` / `medium_airport` / `small_airport`, which is the size of
+# the place and not a different sort of thing. Matching only the bare word
+# silently skipped the runway lookup for every airport added from the search
+# box, and the go/no-go reported "no runway data on file" for fields whose
+# runways are in the database it had just searched.
+def _is_airport(waypoint: WaypointIn) -> bool:
+    return waypoint.kind == "airport" or waypoint.kind.endswith("_airport")
+
+
 def _runways_for(waypoint: WaypointIn) -> tuple[pf.Runway, ...]:
     """Runways for a waypoint, if it is an airport we know about."""
     ident = waypoint.ident or waypoint.name
-    if waypoint.kind != "airport":
+    if not _is_airport(waypoint):
         return ()
     try:
         return tuple(apt.runways(ident))
     except apt.AirportDatabaseMissing:
         return ()
+
+
+def _wind_column(column: WindColumnIn) -> nl.WindColumn:
+    """One fetched column as the engine's own type.
+
+    Levels with half a wind are dropped rather than half-read: a direction
+    with no speed would interpolate as a calm from that bearing, which is a
+    claim about the air rather than the absence of one.
+    """
+    layers = tuple(
+        (level.height_ft, nl.Wind(level.wind_from_deg, level.wind_speed_kt))
+        for level in column.levels
+        if level.height_ft is not None
+        and level.wind_from_deg is not None
+        and level.wind_speed_kt is not None
+    )
+    return nl.WindColumn(
+        position=LatLon(column.lat, column.lon), winds=nl.WindsAloft(layers)
+    )
+
+
+def _aloft_temperature_samples(column: WindColumnIn) -> list[nl.TemperatureSample]:
+    """The column's temperatures, keyed by the pressure altitude they are at.
+
+    No conversion, which is the point of the pressure-level frame: a field
+    temperature has to be read through its station's altimeter setting before
+    it can be compared with anything, and a constant-pressure surface is
+    already in the coordinate they all share.
+    """
+    return [
+        nl.TemperatureSample(level.pressure_altitude_ft, level.isa_deviation_c)
+        for level in column.levels
+        if level.pressure_altitude_ft is not None and level.isa_deviation_c is not None
+    ]
+
+
+def _pattern_altitude_for(waypoint: WaypointIn) -> float | None:
+    """The field's published pattern altitude in feet AGL, where there is one.
+
+    `None` for anything that is not an airport we know, and for the great
+    majority of airports that are: NASR only carries a pattern altitude where
+    somebody filed one. The checklist takes the standard 1,000 ft in that case
+    rather than reading the silence as a low pattern.
+    """
+    ident = waypoint.ident or waypoint.name
+    if not _is_airport(waypoint):
+        return None
+    try:
+        airport = apt.find(ident)
+    except apt.AirportDatabaseMissing:
+        return None
+    return None if airport is None else airport.pattern_altitude_agl_ft
 
 
 def _checklist_json(checklist: pf.GoNoGo | None) -> dict | None:
@@ -612,6 +811,10 @@ def _checklist_json(checklist: pf.GoNoGo | None) -> dict | None:
                 "wind_from_deg": None if check.wind is None else check.wind.from_deg,
                 "wind_speed_kt": None if check.wind is None else check.wind.speed_kt,
                 "gust_kt": None if check.wind is None else check.wind.gust_kt,
+                # Null where the field had no report at all, which is not the
+                # same as a report the check could not judge -- that one comes
+                # back with `passes: null` and says why.
+                "weather": _weather_check_json(check.weather),
                 "runways": [
                     {
                         "runway": runway.runway,
@@ -651,6 +854,24 @@ def _checklist_json(checklist: pf.GoNoGo | None) -> dict | None:
             "spare_minutes": checklist.fuel.spare_minutes,
             "passes": checklist.fuel.passes,
         },
+    }
+
+
+def _weather_check_json(check: pf.WeatherCheck | None) -> dict | None:
+    if check is None:
+        return None
+    return {
+        "visibility_sm": check.visibility_sm,
+        "ceiling_ft_agl": check.ceiling_ft_agl,
+        "ceiling_cover": check.ceiling_cover,
+        "obscured": check.obscured,
+        "sky_reported": check.sky_reported,
+        "pattern_altitude_agl_ft": check.pattern_altitude_agl_ft,
+        "required_ceiling_ft_agl": check.required_ceiling_ft_agl,
+        "passes": check.passes,
+        "reasons": list(check.reasons),
+        "notes": list(check.notes),
+        "summary": check.summary,
     }
 
 

@@ -14,7 +14,7 @@ from typing import ClassVar
 import pytest
 
 from engine import navlog as nl
-from engine.geo import LatLon
+from engine.geo import LatLon, inverse
 
 KSQL = nl.Waypoint("KSQL", LatLon(37.5119, -122.2495), "airport", elevation_ft=5)
 KMRY = nl.Waypoint("KMRY", LatLon(36.5870, -121.8429), "airport", elevation_ft=257)
@@ -1312,3 +1312,235 @@ class TestFuelIsRoundedUpToTheTenth:
         assert log.reserve_required_gal * 10 == pytest.approx(
             round(log.reserve_required_gal * 10)
         )
+
+
+class TestFieldWeatherReachesTheGoNoGo:
+    """The sky at each end of the route, and whether the checklist sees it.
+
+    The go/no-go's VFR gate is only as good as the report that reaches it, and
+    the route is the only thing that knows which report belongs to which
+    field. So what is tested here is the plumbing, not the rule.
+    """
+
+    OVERCAST = replace(
+        KSQL,
+        visibility_sm=10.0,
+        ceiling_ft_agl=900.0,
+        ceiling_cover="OVC",
+        sky_reported=True,
+    )
+
+    def _check(self, log, airport, operation):
+        return next(
+            c for c in log.checklist.airports
+            if c.airport == airport and c.operation == operation
+        )
+
+    def test_a_route_with_no_weather_on_it_has_no_weather_verdict(self):
+        """The plan a pilot gets before pressing "Get weather" is unchanged."""
+        log = nl.build_navlog([KSQL, KMRY], 6500, conditions=CALM, planning_mode="auto")
+        assert all(c.weather is None for c in log.checklist.airports)
+
+    def test_a_report_that_arrived_saying_nothing_is_an_unknown_not_a_silence(self):
+        """A model-only answer observes no cloud, which is not "no cloud".
+
+        It comes back with every sky field empty -- identical to a field
+        nobody asked about -- so the fact that it was asked has to travel
+        with it, or the VFR gate silently skips the field.
+        """
+        asked = replace(KSQL, weather_reported=True)
+        log = nl.build_navlog([asked, KMRY], 6500, conditions=CALM, planning_mode="auto")
+        weather = self._check(log, "KSQL", "takeoff").weather
+        assert weather is not None
+        assert weather.passes is None
+        assert any("weather" in u for u in log.checklist.unknowns)
+
+    def test_a_ceiling_on_the_departure_field_sinks_the_departure(self):
+        log = nl.build_navlog(
+            [self.OVERCAST, KMRY], 6500, conditions=CALM, planning_mode="auto"
+        )
+        departure = self._check(log, "KSQL", "takeoff")
+        assert departure.weather.passes is False
+        # The sky is what failed, not the tarmac: these fixtures carry no
+        # runway data, so the runway half of the check is merely unknown.
+        assert departure.runways_pass is None
+        assert departure.passes is False
+        assert any("weather" in b and "OVC" in b for b in log.checklist.blockers)
+
+    def test_and_leaves_the_destination_alone(self):
+        """Weather belongs to the field it was reported at, and to no other."""
+        log = nl.build_navlog(
+            [self.OVERCAST, KMRY], 6500, conditions=CALM, planning_mode="auto"
+        )
+        assert self._check(log, "KMRY", "landing").weather is None
+
+    def test_a_field_flies_the_pattern_it_publishes(self):
+        """900 ft of overcast is below an 800 ft pattern plus 500 as well.
+
+        The point is the requirement, not the verdict: a field that publishes
+        an 800 ft pattern must be held to 1,300 ft, not to the standard 1,500.
+        """
+        published = replace(self.OVERCAST, pattern_altitude_agl_ft=800.0)
+        log = nl.build_navlog(
+            [published, KMRY], 6500, conditions=CALM, planning_mode="auto"
+        )
+        weather = self._check(log, "KSQL", "takeoff").weather
+        assert weather.pattern_altitude_agl_ft == pytest.approx(800.0)
+        assert weather.required_ceiling_ft_agl == pytest.approx(1300.0)
+
+    def test_a_field_with_no_published_pattern_takes_the_standard_one(self):
+        log = nl.build_navlog(
+            [self.OVERCAST, KMRY], 6500, conditions=CALM, planning_mode="auto"
+        )
+        weather = self._check(log, "KSQL", "takeoff").weather
+        assert weather.pattern_altitude_agl_ft == pytest.approx(1000.0)
+        assert weather.required_ceiling_ft_agl == pytest.approx(1500.0)
+
+    def test_a_stop_is_judged_on_its_own_weather_at_both_ends(self):
+        """Landing in and taking off again are two checks of the same sky."""
+        stop = replace(
+            KMRY,
+            is_landing=True,
+            visibility_sm=1.0,
+            sky_reported=True,
+        )
+        log = nl.build_navlog(
+            [KSQL, stop, KSBP], 6500, conditions=CALM, planning_mode="auto"
+        )
+        assert self._check(log, "KMRY", "landing").weather.passes is False
+        assert self._check(log, "KMRY", "takeoff").weather.passes is False
+
+
+class TestWindsAloftByLeg:
+    """A forecast column per leg, and which leg each one lands on.
+
+    The alternative -- one column for the whole route -- is the objection
+    `engine/aloft.py` raises against the FD product, only with a finer grid.
+    What is tested here is that a leg is flown in the sky above it, that a
+    number the pilot typed still beats a forecast, and that the keying
+    survives the thing that makes row keys unusable: the forecast moves the
+    tops of climb, which renumbers the rows it would have been keyed to.
+    """
+
+    WEST = nl.WindsAloft.uniform(270.0, 30.0)
+    EAST = nl.WindsAloft.uniform(90.0, 30.0)
+
+    def field(self, *columns):
+        return nl.WindField(tuple(nl.WindColumn(p, w) for p, w in columns))
+
+    def two_legs(self, **conditions):
+        """KSQL to KMRY to KSBP: two legs the pilot drew, down the coast."""
+        return nl.build_navlog(
+            [KSQL, replace(KMRY, is_landing=True), KSBP],
+            6500,
+            conditions=nl.Conditions(flight_date=date(2026, 9, 2), **conditions),
+            planning_mode="auto",
+        )
+
+    def rows(self, log):
+        return [leg for leg in log.legs if leg.covers_ground]
+
+    def first_flying_row(self, log):
+        """The index of the first row that goes anywhere.
+
+        Overrides are keyed by navlog row, and row zero is the taxi -- which
+        has no course, no wind and nothing to override.
+        """
+        return next(i for i, leg in enumerate(log.legs) if leg.covers_ground)
+
+    def test_each_leg_is_flown_in_the_column_over_it(self):
+        """A westerly over the first leg, an easterly over the second."""
+        first = inverse(KSQL.position, KMRY.position).point_at_fraction(0.5)
+        second = inverse(KMRY.position, KSBP.position).point_at_fraction(0.5)
+        log = self.two_legs(
+            wind_field=self.field((first, self.WEST), (second, self.EAST))
+        )
+        rows = self.rows(log)
+        # Rows before the stop belong to the first leg, rows after it to the
+        # second -- including the climb out of KMRY, which is sixty miles
+        # nearer the first leg's column than the second leg's.
+        stop = next(i for i, r in enumerate(rows) if r.to_name == "KMRY")
+        assert all(r.wind_from_deg == pytest.approx(270.0) for r in rows[: stop + 1])
+        assert all(r.wind_from_deg == pytest.approx(90.0) for r in rows[stop + 1 :])
+
+    def test_a_route_with_no_field_is_untouched(self):
+        """Calm, exactly as a plan with nothing entered has always been."""
+        for row in self.rows(self.two_legs()):
+            assert row.wind_speed_kt == pytest.approx(0.0)
+
+    def test_the_column_moves_the_tops_of_climb_it_is_keyed_past(self):
+        """Why the columns are keyed by position and not by row.
+
+        A headwind makes the climb cover less ground, so the top of climb
+        arrives sooner and every row after it renumbers -- under the very
+        forecast being applied. A point on the earth does not move.
+        """
+        first = inverse(KSQL.position, KMRY.position).point_at_fraction(0.5)
+        calm = self.two_legs()
+        blown = self.two_legs(wind_field=self.field((first, self.WEST)))
+        toc = [r for r in self.rows(calm) if r.end_role == "TOC"][0]
+        blown_toc = [r for r in self.rows(blown) if r.end_role == "TOC"][0]
+        assert blown_toc.distance_nm != pytest.approx(toc.distance_nm)
+        # And the wind still landed on it, having been found by where it is.
+        assert blown_toc.wind_from_deg == pytest.approx(270.0)
+
+    def test_a_typed_wind_still_beats_the_forecast_on_its_own_row(self):
+        first = inverse(KSQL.position, KMRY.position).point_at_fraction(0.5)
+        field = self.field((first, self.WEST))
+        conditions = nl.Conditions(flight_date=date(2026, 9, 2), wind_field=field)
+        row = self.first_flying_row(
+            nl.build_navlog([KSQL, KMRY], 6500, conditions=conditions,
+                            planning_mode="auto")
+        )
+        log = nl.build_navlog(
+            [KSQL, KMRY],
+            6500,
+            conditions=conditions,
+            overrides={row: nl.LegOverride(wind_from_deg=180.0, wind_speed_kt=12.0)},
+            planning_mode="auto",
+        )
+        first_row = self.rows(log)[0]
+        assert first_row.wind_from_deg == pytest.approx(180.0)
+        assert first_row.wind_speed_kt == pytest.approx(12.0)
+        assert "wind_from_deg" in first_row.overridden
+
+    def test_a_half_typed_wind_takes_its_other_half_from_that_legs_column(self):
+        """Not from the route's profile: the leg has a better answer.
+
+        A direction typed with no speed used to read its speed off the
+        route-wide wind, which with a per-leg forecast is the wrong column.
+        """
+        first = inverse(KSQL.position, KMRY.position).point_at_fraction(0.5)
+        conditions = nl.Conditions(
+            flight_date=date(2026, 9, 2), wind_field=self.field((first, self.WEST))
+        )
+        row = self.first_flying_row(
+            nl.build_navlog([KSQL, KMRY], 6500, conditions=conditions,
+                            planning_mode="auto")
+        )
+        log = nl.build_navlog(
+            [KSQL, KMRY],
+            6500,
+            conditions=conditions,
+            overrides={row: nl.LegOverride(wind_from_deg=180.0)},
+            planning_mode="auto",
+        )
+        first_row = self.rows(log)[0]
+        assert first_row.wind_from_deg == pytest.approx(180.0)
+        assert first_row.wind_speed_kt == pytest.approx(30.0)  # off the column
+
+    def test_the_columns_temperatures_reach_the_density_altitudes(self):
+        """Winds by position, temperature into the one route-wide curve."""
+        first = inverse(KSQL.position, KMRY.position).point_at_fraction(0.5)
+        warm = nl.build_navlog(
+            [KSQL, KMRY],
+            6500,
+            conditions=nl.Conditions(
+                flight_date=date(2026, 9, 2),
+                wind_field=self.field((first, self.WEST)),
+                temperatures_aloft=(nl.TemperatureSample(6500.0, 15.0),),
+            ),
+            planning_mode="auto",
+        )
+        cruise = next(r for r in self.rows(warm) if r.phase == "cruise")
+        assert cruise.density_altitude_ft > cruise.pressure_altitude_ft + 1500

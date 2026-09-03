@@ -275,3 +275,159 @@ def test_a_field_where_each_runway_failed_differently_says_so():
     assert "crosswind" in blocker
     assert "tailwind" in blocker
     assert "long enough" not in blocker
+
+
+# --- the sky over the field -----------------------------------------------
+#
+# The other half of a go/no-go at a field: the runway can be long enough and
+# into wind and still be under a sky there is no flying out of. What is tested
+# here is which sky closes the gate and which one only reads as unknown.
+
+LONG_RUNWAY = [pf.Runway("18/36", 10000.0, "ASPH")]
+
+
+def sky(**fields):
+    """A field report, defaulting to a sky that was looked at."""
+    return pf.FieldWeather(**{"sky_reported": True, "visibility_sm": 10.0, **fields})
+
+
+def weather_check(weather, pattern_altitude_agl_ft=1000.0):
+    return check(
+        LONG_RUNWAY, weather=weather, pattern_altitude_agl_ft=pattern_altitude_agl_ft
+    ).weather
+
+
+def test_a_clear_day_is_vfr():
+    result = weather_check(sky())
+    assert result.passes is True
+    assert result.summary == "VFR"
+
+
+def test_a_high_overcast_clears_the_pattern():
+    result = weather_check(sky(ceiling_ft_agl=3500.0, ceiling_cover="OVC"))
+    assert result.passes is True
+    assert result.required_ceiling_ft_agl == 1500.0
+
+
+def test_an_overcast_below_the_pattern_plus_five_hundred_is_a_no_go():
+    """1,200 ft is legal VFR and leaves nowhere to fly a circuit."""
+    result = weather_check(sky(ceiling_ft_agl=1200.0, ceiling_cover="OVC"))
+    assert result.passes is False
+    assert result.required_ceiling_ft_agl == 1500.0
+    assert "1500 ft" in result.summary
+    assert "pattern" in result.summary
+
+
+def test_the_overcast_a_field_needs_follows_its_own_pattern_altitude():
+    """A field with a 1,500 ft pattern needs 2,000 ft of overcast, not 1,500."""
+    low = weather_check(
+        sky(ceiling_ft_agl=1800.0, ceiling_cover="OVC"), pattern_altitude_agl_ft=1500.0
+    )
+    assert low.required_ceiling_ft_agl == 2000.0
+    assert low.passes is False
+    # The same sky over a field that flies an 800 ft pattern is fine.
+    assert weather_check(
+        sky(ceiling_ft_agl=1800.0, ceiling_cover="OVC"), pattern_altitude_agl_ft=800.0
+    ).passes is True
+
+
+def test_a_broken_ceiling_is_held_to_the_regulation_not_to_the_pattern():
+    """There are holes in a broken layer, and the pilot can see through them."""
+    assert weather_check(sky(ceiling_ft_agl=1200.0, ceiling_cover="BKN")).passes is True
+    assert weather_check(sky(ceiling_ft_agl=800.0, ceiling_cover="BKN")).passes is False
+
+
+@pytest.mark.parametrize("cover", ["VV", "OVX"])
+def test_an_obscuration_is_a_no_go_however_high_it_is_reported(cover):
+    """A vertical visibility is not a ceiling to fly under.
+
+    2,500 ft would clear any pattern in the country if it were a cloud base.
+    It is not one: there is no sky above it and no horizon under it.
+    """
+    result = weather_check(sky(ceiling_ft_agl=2500.0, ceiling_cover=cover))
+    assert result.passes is False
+    assert result.obscured
+    assert "obscured" in result.summary
+    # Not measured against a pattern it was never going to be flown under.
+    assert result.required_ceiling_ft_agl is None
+
+
+def test_an_obscuration_with_no_height_still_fails():
+    assert weather_check(sky(ceiling_cover="VV")).passes is False
+
+
+def test_visibility_below_three_miles_fails_under_a_clear_sky():
+    result = weather_check(sky(visibility_sm=2.0))
+    assert result.passes is False
+    assert "visibility" in result.summary
+
+
+def test_both_gates_are_reported_not_just_the_first():
+    """Waiting out the fog does not raise the overcast."""
+    result = weather_check(
+        sky(visibility_sm=1.0, ceiling_ft_agl=600.0, ceiling_cover="OVC")
+    )
+    assert result.passes is False
+    assert len(result.reasons) == 2
+
+
+def test_a_report_with_no_sky_group_is_unknown_rather_than_clear():
+    """A model forecast does not observe cloud, which is not "no cloud"."""
+    result = weather_check(pf.FieldWeather(visibility_sm=10.0, sky_reported=False))
+    assert result.passes is None
+    assert "unknown" in result.summary
+
+
+def test_a_gate_that_closed_beats_a_gate_that_could_not_be_read():
+    """Below minimums on visibility is a no-go whatever the cloud is doing."""
+    result = weather_check(pf.FieldWeather(visibility_sm=1.0, sky_reported=False))
+    assert result.passes is False
+
+
+def test_no_report_at_all_leaves_the_weather_out_of_the_verdict():
+    result = check(LONG_RUNWAY, weather=None)
+    assert result.weather is None
+    assert result.passes is True
+
+
+def test_the_sky_sinks_a_field_whose_runways_are_fine():
+    result = check(
+        LONG_RUNWAY, weather=sky(ceiling_ft_agl=400.0, ceiling_cover="OVC")
+    )
+    assert result.runways_pass is True
+    assert result.passes is False
+
+
+def test_the_weather_blocker_is_reported_separately_from_the_runways():
+    """Two problems, two lines: fixing one does not fix the other."""
+    result = pf.summarise(
+        [
+            check(
+                [pf.Runway("18/36", 900.0, "ASPH")],
+                weather=sky(ceiling_ft_agl=400.0, ceiling_cover="OVC"),
+            )
+        ],
+        _fuel(),
+    )
+    assert len(result.blockers) == 2
+    assert any("weather" in b and "OVC" in b for b in result.blockers)
+    assert any("long enough" in b for b in result.blockers)
+
+
+def test_an_unjudgeable_sky_is_an_unknown_and_not_a_go():
+    result = pf.summarise(
+        [check(LONG_RUNWAY, weather=pf.FieldWeather(sky_reported=False))], _fuel()
+    )
+    assert not result.blockers
+    assert result.unknowns
+    assert result.is_go is False
+
+
+def test_the_text_checklist_shows_the_sky_it_judged():
+    result = pf.summarise(
+        [check(LONG_RUNWAY, weather=sky(ceiling_ft_agl=900.0, ceiling_cover="OVC"))],
+        _fuel(),
+    )
+    text = pf.format_checklist(result)
+    assert "OVC 900 ft AGL" in text
+    assert "NOT VFR" in text

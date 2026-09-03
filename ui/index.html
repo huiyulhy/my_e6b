@@ -219,8 +219,18 @@
       <h2>Navigation log</h2>
       <div class="navlog-actions">
         <button id="reset-edits" type="button" hidden>Reset manual edits</button>
+        <!-- Beside the button that uses it, not in the sidebar with the other
+             conditions: it is an argument to "Get weather" and means nothing
+             on its own. Blank fetches the current weather, which is the
+             common case and so is the default. -->
+        <label id="off-blocks-label" for="off-blocks"
+               title="Departure time, UTC. Each airport is then fetched for the time you actually reach it, using the log's own ETEs — the destination gets its arrival forecast, not the departure hour. Leave blank for current weather.">
+          Off blocks
+          <input id="off-blocks" type="datetime-local" step="900">
+          <span class="unit">Z</span>
+        </label>
         <button id="get-weather" type="button"
-                title="Fetch the current surface weather for every airport on the route and fill in its altimeter setting, temperature and wind">
+                title="Fetch surface weather for every airport on the route and fill in its altimeter setting, temperature and wind. With an off-blocks time set, each field is fetched for its own ETA.">
           Get weather
         </button>
         <button id="copy" type="button">Copy as text</button>
