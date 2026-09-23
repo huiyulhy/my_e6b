@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import math
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 from engine import performance as perf
@@ -223,12 +224,27 @@ class RunwayCheck:
     over_50ft_ft: float | None = None  # the book distance checked against
     required_ft: float | None = None  # over_50ft_ft with the margin applied
 
+    # Cells read from somewhere other than where the query asked, straight
+    # from the chart layer. Empty is the normal case: the whole reading came
+    # off the published chart.
+    off_chart: tuple[perf.OffChart, ...] = ()
+
     passes: bool | None = None  # None when it could not be determined
     note: str = ""
     # True when the POH simply does not publish a number for these conditions.
     # That is a no-go rather than an unknown: the aeroplane is being asked to
     # operate outside the envelope the manufacturer tested it in.
     outside_envelope: bool = False
+
+    @property
+    def extrapolated(self) -> bool:
+        """Whether any number on this row came from off the chart."""
+        return bool(self.off_chart)
+
+    @property
+    def optimistic(self) -> bool:
+        """Whether any substitution here errs on the unsafe side."""
+        return any(not entry.conservative for entry in self.off_chart)
 
     @property
     def spare_ft(self) -> float | None:
@@ -443,6 +459,25 @@ class AirportCheck:
         return True
 
     @property
+    def off_chart(self) -> tuple[perf.OffChart, ...]:
+        """Every off-chart reading behind this field's distances, deduped.
+
+        Deduped because the conditions are the field's, not the runway's: a
+        pressure altitude below the bottom row produces the identical record on
+        every runway on the field, and listing it once per runway would bury
+        the one that differs.
+        """
+        seen: dict[tuple[str, str], perf.OffChart] = {}
+        for runway in self.runways:
+            for entry in runway.off_chart:
+                seen.setdefault((entry.what, entry.detail), entry)
+        return tuple(seen.values())
+
+    @property
+    def extrapolated(self) -> bool:
+        return bool(self.off_chart)
+
+    @property
     def best(self) -> RunwayCheck | None:
         """The runway to use: one that works, with the most room to spare.
 
@@ -487,6 +522,28 @@ class FuelCheck:
 
 
 @dataclass(frozen=True)
+class Extrapolation:
+    """One off-chart reading, and where in the plan it happened.
+
+    `perf.OffChart` says what was read instead; this adds where. Kept
+    structured rather than flattened to a sentence because the renderers need
+    to sort and colour by `conservative`, and re-deriving that from prose is
+    the kind of thing that works until the prose changes.
+    """
+
+    where: str  # "KSQL takeoff", "leg 3 (TOC to TOD)"
+    what: str
+    detail: str
+    conservative: bool
+
+    @property
+    def summary(self) -> str:
+        """The one-line form, for the text checklist."""
+        tail = "" if self.conservative else " -- this one can read optimistic"
+        return f"{self.where}: {self.detail}{tail}"
+
+
+@dataclass(frozen=True)
 class GoNoGo:
     """The whole checklist, and the single verdict that follows from it."""
 
@@ -494,11 +551,45 @@ class GoNoGo:
     fuel: FuelCheck
     blockers: tuple[str, ...]  # every reason this is a no-go
     unknowns: tuple[str, ...]  # checks that could not be made at all
+    # Readings that came from somewhere other than where the query asked --
+    # see `perf.OffChart`. Conservative ones first, so the ones that matter
+    # are the ones the list finishes on.
+    extrapolations: tuple[Extrapolation, ...] = ()
 
     @property
     def is_go(self) -> bool:
-        """True only when every check was made and every check passed."""
+        """True only when every check was made and every check passed.
+
+        Off-chart readings do not enter this. They are not failures -- every
+        one of them is a published cell standing in for a query beside it --
+        and letting them decide would put "NO GO" on an ordinary high-pressure
+        morning at a sea-level field, which is both wrong and the fastest way
+        to teach a pilot to ignore the word. They change `verdict` instead.
+        """
         return not self.blockers and not self.unknowns
+
+    @property
+    def optimistic_extrapolations(self) -> tuple[Extrapolation, ...]:
+        """The subset whose substitution errs on the unsafe side."""
+        return tuple(e for e in self.extrapolations if not e.conservative)
+
+    @property
+    def all_from_the_book(self) -> bool:
+        """True when every number behind this verdict is a published one."""
+        return not self.extrapolations
+
+    @property
+    def verdict(self) -> str:
+        """The single line at the top of the checklist.
+
+        Three states, not two. "GO" means every number came off the chart as
+        printed; "GO -- EXTRAPOLATED" means the answer is yes but some of it
+        was read from air the POH does not publish for this operating point,
+        and the reader is owed the list before they act on it.
+        """
+        if not self.is_go:
+            return "NO GO"
+        return "GO" if self.all_from_the_book else "GO -- EXTRAPOLATED"
 
 
 def check_airport(
@@ -637,16 +728,12 @@ def _check_one_runway(
         )
 
     # A high altimeter setting at a low field puts the pressure altitude below
-    # sea level, which is off the bottom of the POH chart. Read it at sea
-    # level instead: the chart does not go lower, and the sea-level figure is
-    # the longer of the two, so the error is in the safe direction.
-    if pressure_altitude_ft < 0.0:
-        notes.append(
-            f"pressure altitude {pressure_altitude_ft:.0f} ft is below the "
-            f"chart; read at sea level, which is conservative"
-        )
-        pressure_altitude_ft = 0.0
-
+    # the bottom of the POH chart, and a strong wind puts the headwind past the
+    # end of the correction. Both used to be clamped here; both are now the
+    # chart layer's business, which reads the nearest published cell and hands
+    # back an `OffChart` saying it did. One place decides what the chart can
+    # answer, and nothing downstream has to guess whether a number is the
+    # book's.
     try:
         if operation == "takeoff":
             distance = perf.takeoff_distance(
@@ -697,6 +784,7 @@ def _check_one_runway(
         ground_roll_ft=distance.ground_roll_ft,
         over_50ft_ft=distance.total_over_50ft_ft,
         required_ft=required,
+        off_chart=distance.off_chart,
         # Length and crosswind are both gates: passing one does not excuse the
         # other, and the crosswind verdict is known even where the length is
         # not, so it decides an otherwise-unknown runway.
@@ -730,8 +818,19 @@ def check_fuel(
     )
 
 
-def summarise(airports: list[AirportCheck], fuel: FuelCheck) -> GoNoGo:
-    """Collect the checks into a verdict with its reasons."""
+def summarise(
+    airports: list[AirportCheck],
+    fuel: FuelCheck,
+    *,
+    off_chart: Iterable[tuple[str, perf.OffChart]] = (),
+) -> GoNoGo:
+    """Collect the checks into a verdict with its reasons.
+
+    `off_chart` carries readings from outside this module -- the cruise chart
+    substitutions the navlog hits on a hot day, each paired with the leg it
+    happened on. The airports' own off-chart readings are collected from the
+    checks themselves and do not need passing in.
+    """
     blockers: list[str] = []
     unknowns: list[str] = []
 
@@ -764,11 +863,31 @@ def summarise(airports: list[AirportCheck], fuel: FuelCheck) -> GoNoGo:
             f"{fuel.reserve_minutes:.0f}-minute reserve plus {fuel.margin:.0%})"
         )
 
+    # Conservative readings first, optimistic last: the list is read top down
+    # and the one worth stopping on should be the one it ends on.
+    found: list[tuple[str, perf.OffChart]] = [
+        (f"{check.airport} {check.operation}", entry)
+        for check in airports
+        for entry in check.off_chart
+    ]
+    found.extend(off_chart)
+    found.sort(key=lambda pair: pair[1].conservative, reverse=True)
+    extrapolations = tuple(
+        Extrapolation(
+            where=where,
+            what=entry.what,
+            detail=entry.detail,
+            conservative=entry.conservative,
+        )
+        for where, entry in found
+    )
+
     return GoNoGo(
         airports=tuple(airports),
         fuel=fuel,
         blockers=tuple(blockers),
         unknowns=tuple(unknowns),
+        extrapolations=extrapolations,
     )
 
 
@@ -839,7 +958,7 @@ def _is_are(count: int) -> str:
 def format_checklist(result: GoNoGo) -> str:
     """Render the checklist as text, for the copyable navlog."""
     lines = [
-        f"GO / NO-GO: {'GO' if result.is_go else 'NO GO'}",
+        f"GO / NO-GO: {result.verdict}",
         "-" * 123,
     ]
 
@@ -897,6 +1016,11 @@ def format_checklist(result: GoNoGo) -> str:
         lines.append(f"NO GO: {blocker}")
     for unknown in result.unknowns:
         lines.append(f"UNKNOWN: {unknown}")
+    # Last, under the verdict they qualify. These are not failures, so they do
+    # not belong among the blockers; they are the reason the word above them
+    # may say GO with a qualifier on it.
+    for entry in result.extrapolations:
+        lines.append(f"EXTRAPOLATED: {entry.summary}")
 
     return "\n".join(lines)
 

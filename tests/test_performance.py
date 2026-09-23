@@ -606,13 +606,33 @@ class TestBelowSeaLevel:
 
     @pytest.mark.parametrize("below", [-1.0, -167.0, -500.0, -2000.0])
     def test_takeoff_reads_the_sea_level_row(self, below):
-        assert perf.takeoff_distance(2550, below, 20) == perf.takeoff_distance(
-            2550, 0.0, 20
-        )
+        low = perf.takeoff_distance(2550, below, 20)
+        at_sea_level = perf.takeoff_distance(2550, 0.0, 20)
+        assert low.ground_roll_ft == at_sea_level.ground_roll_ft
+        assert low.total_over_50ft_ft == at_sea_level.total_over_50ft_ft
 
     @pytest.mark.parametrize("below", [-1.0, -167.0, -500.0, -2000.0])
     def test_landing_reads_the_sea_level_row(self, below):
-        assert perf.landing_distance(below, 20) == perf.landing_distance(0.0, 20)
+        low = perf.landing_distance(below, 20)
+        at_sea_level = perf.landing_distance(0.0, 20)
+        assert low.ground_roll_ft == at_sea_level.ground_roll_ft
+        assert low.total_over_50ft_ft == at_sea_level.total_over_50ft_ft
+
+    @pytest.mark.parametrize("below", [-1.0, -167.0, -500.0, -2000.0])
+    def test_the_sea_level_reading_is_reported_as_off_chart(self, below):
+        """Conservative, but still not the row the query asked for."""
+        for distance in (
+            perf.takeoff_distance(2550, below, 20),
+            perf.landing_distance(below, 20),
+        ):
+            assert distance.extrapolated
+            assert not distance.optimistic
+            assert distance.off_chart[0].what == "pressure altitude"
+
+    def test_a_reading_on_the_chart_carries_nothing(self):
+        distance = perf.takeoff_distance(2550, 2000.0, 20)
+        assert distance.off_chart == ()
+        assert not distance.extrapolated
 
     @pytest.mark.parametrize("below", [-1.0, -167.0, -500.0, -2000.0])
     def test_climb_rate_reads_the_sea_level_row(self, below):

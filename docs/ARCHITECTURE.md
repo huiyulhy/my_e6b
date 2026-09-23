@@ -162,6 +162,58 @@ behaviour, obtained structurally rather than by a bounds check.
 `available_cruise_rpm(alt, temp)` enumerates settings that actually exist at an altitude, so
 the altitude optimiser can iterate real options instead of guessing and being refused.
 
+### What counts as an extrapolation, and what happens to it — `perf.OffChart`
+
+The rule is one sentence: a query past the edge of a chart is **refused**, or answered from a
+**published cell beside it** — never from a curve fitted past the last row. `_bracket` raises
+outside an axis, `_Grid`'s mask refuses a query drawing on a blank cell, the ragged cruise
+pages refuse an RPM they do not publish, and a tailwind past the 10 kt the correction covers is
+refused rather than projected down a slope that compounds at 10% per 2 kt.
+
+But refusing *everything* off the edge fails ordinary days for ordinary reasons. A high-pressure
+morning at a sea-level field is below the bottom row of every takeoff chart; ISA+25 over
+California in July is off the right of the cruise chart's temperature band. Both have a
+published cell that can honestly stand in, so one is read — and `OffChart` records that it
+happened, with the field that decides what to do about it:
+
+- **`conservative=True`** — the substitute errs safe. Below the bottom row the air is denser
+  than the chart admits, so the distance reads long and the climb reads flat. A plan built on it
+  is still a plan you can fly.
+- **`conservative=False`** — the substitute errs the other way, or both ways. The equal-density
+  cruise reading is accurate to about 1% on fuel flow and TAS *in either direction*; a level
+  stretch below the chart's 2000 ft floor is read where the engine makes less power than it
+  really will, so the fuel flow reads low and the reserve looks better than it is.
+
+**The cruise band is the rule: ISA ±20 at the queried pressure altitude.** The chart prints
+three columns per altitude page — ISA−20, ISA, ISA+20 — and a query inside that band is the
+chart's own reading. Outside it there is no column for the operating point, and
+`cruise_at_density` answers from air of the same *density* found elsewhere on the chart, at a
+different pressure altitude and a different temperature. However carefully that is done, the POH
+does not publish this aeroplane's cruise performance at the altitude and temperature asked for,
+and the number standing in for it was measured somewhere else — so it is an **extrapolation**
+and is labelled one. `cruise_isa_band()` reads the band off the digitized data rather than a
+constant, so a re-digitized chart widens it instead of disagreeing silently.
+`CRUISE_ISA_TOLERANCE_C` is **0**: the line sits exactly at the chart's edge, so ISA+21 counts
+and ISA+20 does not. Past the point where no page covers the density at all, the answer is a
+refusal rather than an extrapolation.
+
+The record travels: `GroundDistance.off_chart` → `RunwayCheck` → `AirportCheck` (deduped, since
+a field's pressure altitude produces the identical record on every runway) → `GoNoGo`. The
+cruise side travels `CruiseLookup.off_chart` → the navlog's per-row collector → `Leg.off_chart`
+→ the same `GoNoGo`.
+
+**Three verdicts, not two.** `is_go` is unchanged — blockers and unknowns only. Letting an
+off-chart reading force `NO GO` would put it on a high-pressure morning at Palo Alto, which is
+both wrong and the fastest way to teach a pilot to ignore the word. `verdict` carries the third
+state instead: `GO`, `GO -- EXTRAPOLATED`, `NO GO`. Conservative entries are listed first so
+the list ends on the ones worth stopping for.
+
+**The first row is the one that matters.** Time and fuel are cumulative, so a substitution on
+row 3 is in every total from row 3 on whether or not rows 4 and 5 were read off-chart
+themselves. `Navlog.first_extrapolated_leg` is that row; the printed log marks affected rows
+with `+` and says where the totals stop being the book's, and the checklist groups repeats
+behind the first occurrence rather than repeating one sentence per row.
+
 ### Chart notes implemented — all need verification against your POH
 
 Wind and surface corrections (10% per 9 kt headwind, 10% per 2 kt tailwind, +15% of ground roll

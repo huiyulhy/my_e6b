@@ -1,5 +1,8 @@
 """The weather list beside the navigation log, and the loop that settles them.
 
+This part manages the weather list by iterating in a forward and backward pass
+1 list: the one drawn by the pilot
+2nd list: the weather list that the plane flies through, so we can get performance
 Two lists, one entry per leg the pilot drew: the navlog rows, and the weather
 each of them was planned in. `solve` produces both, and they agree -- which is
 the whole difficulty, because each is an input to the other.
@@ -12,17 +15,6 @@ planning on the average is a wind that was forecast nowhere. So each leg is
 costed under both and planned in whichever costs more fuel. A plan that comes
 in early on the day is a good day; a plan that comes in late is a diversion.
 
-The column is taken whole -- its wind *and* its temperature -- rather than the
-worst wind from one end and the worst temperature from the other. Half of one
-forecast against half of another describes air that neither of them reported,
-which is the same objection `weather.resolve_surface` makes about mixing a
-METAR's ceiling with a TAF's cover.
-
-**Why a loop.** The weather a leg is flown in depends on when the leg is
-reached; when the leg is reached depends on the wind it is flown in. Planning
-once on the departure hour and stopping is the error the whole thing exists to
-remove -- a three-hour leg planned on the 1300Z forecast is not the leg you
-fly at 1600Z. So the two lists are settled against each other:
 
 1. Plan with no forecast, to learn roughly when each waypoint is reached.
 2. Choose each leg's weather from the forecasts at its two ends, at those
@@ -30,14 +22,6 @@ fly at 1600Z. So the two lists are settled against each other:
 3. Plan again on that weather, which moves the times -- and the tops of climb.
 4. Re-choose. If nothing changed, the two lists agree and it is done.
 
-**What "no more changes" means.** Not that the numbers stopped moving: they
-move by seconds forever. What has to stop moving is the *choice* -- which end
-of each leg won, and which forecast hour it was read at. Both are discrete, so
-settling is a real event rather than a tolerance, and the run either reaches
-it or says it did not.
-
-Pure, like the rest of `engine/`. The forecast hours are handed in already
-fetched; `server/wx_surface.fetch_aloft_series` is the network half.
 """
 
 from __future__ import annotations
@@ -61,16 +45,8 @@ __all__ = [
     "solve",
 ]
 
-# How many times the two lists may be settled against each other before the
-# attempt is abandoned. Three is the usual number -- one to learn the times,
-# one to apply the weather, one to confirm nothing moved -- and a route that
-# has not settled by six is oscillating between two answers rather than
-# converging on one.
+# Max allowable number of forward and backward passes
 MAX_PASSES = 6
-
-# A leg that cannot be flown at all -- the wind is stronger than the aeroplane
-# and no heading holds the course -- costs infinite fuel, which makes it the
-# conservative choice by definition and keeps the comparison total.
 _UNFLYABLE = math.inf
 
 
