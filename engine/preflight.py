@@ -49,25 +49,15 @@ DEFAULT_FUEL_MARGIN = 0.10
 VFR_VISIBILITY_SM = 3.0
 VFR_CEILING_FT_AGL = 1000.0
 
-# How far below an overcast the pattern still has to fit. 91.155 wants 500 ft
-# of clearance below a cloud, and the pattern is flown at pattern altitude, so
-# an overcast lower than the two added together cannot be operated under
-# legally however high it is above the runway.
+# How far below an overcast the pattern still has to fit. 500 ft below for VFR
 PATTERN_CLEARANCE_FT = 500.0
 
-# Where the field database publishes no traffic pattern altitude. 1,000 ft AGL
-# is the AC 90-66 figure for a light single, and it is the height the fuel
-# burn for the pattern is already charged at in `engine/navlog.py`.
 DEFAULT_PATTERN_HEIGHT_AGL_FT = 1000.0
 
-# The sky is not visible, only a vertical visibility into it: `VV` in a TAF,
-# `OVX` in a METAR. There is no cloud base to stay below and no horizon.
+# Effectively IFR sky cover
 OBSCURATION_COVERS = frozenset({"OVX", "VV"})
 
-# The dry-grass correction is applied to every unpaved surface. Gravel and
-# dirt are not grass, and the POH publishes no figure for them, so the grass
-# penalty is used as the nearest published number and the runway is flagged.
-# Anything unrecognised is treated as paved
+# The dry-grass correction is applied to every unpaved surface. 
 _UNPAVED_CODES = frozenset(
     {
         "turf", "grass", "gras", "grs", "sod",

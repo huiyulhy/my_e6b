@@ -43,7 +43,12 @@ from engine import weather as wx
 from engine.geo import LatLon
 from engine.weather import SurfaceWeather, WeatherUnavailable
 
-__all__ = ["WeatherUnavailable", "fetch_aloft", "fetch_surface"]
+__all__ = [
+    "WeatherUnavailable",
+    "fetch_aloft",
+    "fetch_aloft_series",
+    "fetch_surface",
+]
 
 AWC = "https://aviationweather.gov/api/data"
 OPEN_METEO = "https://api.open-meteo.com/v1/forecast"
@@ -228,6 +233,48 @@ def fetch_aloft(
             f"for {position.lat:.3f}, {position.lon:.3f}"
         )
     return forecast
+
+
+def fetch_aloft_series(
+    position: LatLon,
+    start: datetime | None = None,
+    *,
+    hours: int = 1,
+    ceiling_ft: float = 14000.0,
+    refresh: bool = False,
+) -> list[al.AloftForecast]:
+    """Consecutive forecast hours over one point, from a single request.
+
+    One network call however many hours are asked for: the Open-Meteo URL is
+    keyed by day and already carries 48 of them, so the extra hours cost only
+    the parsing. That is what makes `engine/planwx.solve` affordable -- it
+    re-reads the column at a different hour on every pass, and going back to
+    the network each time would put a fetch inside a loop.
+
+    Hours the model has nothing for are left out rather than repeated. A short
+    series is a real answer; a padded one would claim a forecast exists.
+    """
+    start = datetime.now(tz=UTC) if start is None else _as_utc(start)
+    levels = al.levels_up_to(ceiling_ft)
+    payload = _get_json(_aloft_url(position, start, levels), TTL_MODEL, refresh=refresh)
+
+    series: list[al.AloftForecast] = []
+    seen: set[datetime] = set()
+    for step in range(max(1, hours)):
+        forecast = al.parse_aloft(payload, start + timedelta(hours=step), levels=levels)
+        # `parse_aloft` snaps to the nearest hour it has, so a window running
+        # off the end of the payload returns the last hour over and over.
+        if forecast is None or forecast.valid_time in seen:
+            continue
+        seen.add(forecast.valid_time)
+        series.append(forecast)
+
+    if not series:
+        raise WeatherUnavailable(
+            f"the model returned no hour near {start:%Y-%m-%d %H:%MZ} "
+            f"for {position.lat:.3f}, {position.lon:.3f}"
+        )
+    return series
 
 
 def _nearest_taf_candidates(position: LatLon) -> list[apt.Airport]:

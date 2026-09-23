@@ -8,16 +8,18 @@ an error. That silence is why they are tested directly.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 
 from server.main import (
     AloftLevelIn,
+    ForecastHourIn,
     WaypointIn,
-    WindColumnIn,
     _aloft_temperature_samples,
     _pattern_altitude_for,
     _runways_for,
-    _wind_column,
+    _winds_aloft,
 )
 
 KSQL = {"name": "KSQL", "lat": 37.5119, "lon": -122.2495, "elevation_ft": 5.5}
@@ -65,7 +67,7 @@ class TestAloftColumns:
     conversions that happen on the way in.
     """
 
-    def column(self, **level):
+    def hour(self, **level):
         base = {
             "height_ft": 6000.0,
             "wind_from_deg": 270.0,
@@ -73,33 +75,35 @@ class TestAloftColumns:
             "pressure_altitude_ft": 5900.0,
             "isa_deviation_c": 4.0,
         }
-        return WindColumnIn(lat=37.0, lon=-122.0, levels=[AloftLevelIn(**{**base, **level})])
+        return ForecastHourIn(
+            valid_time=datetime(2026, 9, 3, 17, tzinfo=UTC),
+            levels=[AloftLevelIn(**{**base, **level})],
+        )
 
     def test_a_level_becomes_a_layer_at_its_geopotential_height(self):
         """Height, not pressure altitude: it is where the aeroplane is."""
-        column = _wind_column(self.column())
-        assert column.position.lat == pytest.approx(37.0)
-        assert column.winds.layers[0][0] == pytest.approx(6000.0)
-        assert column.winds.at(6000.0).speed_kt == pytest.approx(25.0)
+        winds = _winds_aloft(self.hour())
+        assert winds.layers[0][0] == pytest.approx(6000.0)
+        assert winds.at(6000.0).speed_kt == pytest.approx(25.0)
 
     @pytest.mark.parametrize("missing", ["wind_from_deg", "wind_speed_kt", "height_ft"])
     def test_half_a_wind_is_dropped_rather_than_half_read(self, missing):
         """A direction with no speed would interpolate as a calm from that
         bearing, which is a claim about the air rather than the absence of one."""
-        assert _wind_column(self.column(**{missing: None})).winds.layers == ()
+        assert _winds_aloft(self.hour(**{missing: None})).layers == ()
 
     def test_a_temperature_keeps_the_pressure_altitude_it_was_read_at(self):
         """Not the geopotential height: the charts are read at pressure altitude,
         and it is the coordinate every other station's report shares."""
-        samples = _aloft_temperature_samples(self.column())
+        samples = _aloft_temperature_samples(self.hour())
         assert len(samples) == 1
         assert samples[0].pressure_altitude_ft == pytest.approx(5900.0)
         assert samples[0].isa_deviation_c == pytest.approx(4.0)
 
     def test_a_level_with_no_temperature_contributes_no_sample(self):
-        assert _aloft_temperature_samples(self.column(isa_deviation_c=None)) == []
+        assert _aloft_temperature_samples(self.hour(isa_deviation_c=None)) == []
 
-    def test_an_empty_column_is_harmless(self):
-        empty = WindColumnIn(lat=37.0, lon=-122.0, levels=[])
-        assert _wind_column(empty).winds.layers == ()
+    def test_an_empty_hour_is_harmless(self):
+        empty = ForecastHourIn(valid_time=datetime(2026, 9, 3, 17, tzinfo=UTC))
+        assert _winds_aloft(empty).layers == ()
         assert _aloft_temperature_samples(empty) == []

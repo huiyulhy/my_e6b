@@ -250,6 +250,54 @@ tr.row-ground td.num:nth-last-child(3) { color: var(--ink); }
 
 #navlog-empty { padding: 14px; }
 
+/* --- NOTAMs ------------------------------------------------------------ */
+/* A list rather than a table: the text is the notice, and it is the one thing
+   here that cannot be truncated into a column. */
+#notam-block { border-top: 1px solid var(--line); flex: none; }
+#notam-block .navlog-head { padding-top: 8px; }
+#notam-note { font-size: 11px; }
+#notam-list { padding: 0 14px 10px; max-height: 40vh; overflow: auto; }
+.notam-none { padding: 4px 0 8px; }
+
+.notam {
+  padding: 7px 0; border-bottom: 1px solid rgba(42, 54, 68, .5);
+  font-size: 12px; line-height: 1.5;
+}
+.notam-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+/* Their own colours rather than the go/no-go's. Green on "operational" would
+   read as "fine", and a closed taxiway is not fine -- it is just not the
+   thing that stops the flight. */
+.pill.critical { background: rgba(255, 123, 114, .16); color: var(--warn); }
+.pill.operational { background: rgba(230, 184, 106, .16); color: #e6b86a; }
+.pill.information { background: rgba(139, 155, 173, .16); color: var(--ink-dim); }
+.notam-id { font-family: var(--mono); font-weight: 600; }
+.notam-where { color: var(--ink-dim); font-size: 11px; margin-left: auto; }
+/* The notice itself, in the monospace the raw text was written for. */
+.notam-text { font-family: var(--mono); margin-top: 3px; white-space: pre-wrap; }
+/* Why the filter kept it. Quieter than the notice, because it is this
+   program's reasoning and not the FAA's words. */
+.notam-why { color: var(--ink-dim); font-size: 11px; margin-top: 3px; }
+/* A closed runway should be findable by eye in a list of twenty. */
+.notam.critical .notam-text { color: var(--warn); }
+.notam.information .notam-text { color: var(--ink-dim); }
+
+/* --- weather by leg ---------------------------------------------------- */
+/* The second list, under the first. It does not scroll with the navlog: it is
+   one row per leg the pilot drew, so it is always the shorter of the two and
+   there is nothing to gain by hiding it. */
+#weather-block { border-top: 1px solid var(--line); flex: none; }
+#weather-block .navlog-head { padding-top: 8px; }
+#weather-block .table-scroll { flex: none; max-height: 40vh; }
+#weather-note { font-size: 11px; }
+/* The end that won the comparison. Marking it in the table is what makes the
+   four numbers read as a comparison rather than as four separate readings. */
+#legwx td.chosen { color: var(--ink); font-weight: 600; }
+#legwx td.num { color: var(--ink-dim); }
+#legwx tr.note td {
+  color: var(--ink-dim); font-size: 11px; font-family: inherit;
+  border-bottom: none; padding-top: 0;
+}
+
 .airport-label {
   font-family: var(--mono); font-size: 10px; color: #8ea3ba;
   text-shadow: 0 0 3px #0d1218, 0 0 3px #0d1218;

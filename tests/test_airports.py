@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from engine import airports as apt
+from engine.geo import LatLon
 
 IDENTS = ("KSQL", "KLVK", "KMOD", "KSFO", "KSJC", "KPAO", "CN44")
 
@@ -131,3 +132,51 @@ class TestConcurrentLookups:
 
         failures = [r for r in self._hammer(work, count=300) if r]
         assert not failures, f"{len(failures)} concurrent failures: {set(failures)}"
+
+
+class TestRouteDesignators:
+    """The identifiers an identifier-based NOTAM search has to ask about.
+
+    A closed runway is filed against the aerodrome; a TFR, an MOA or an
+    airspace closure is filed against the ARTCC. A search that asks only about
+    the airports on the route gets the taxiway closures and misses the
+    restricted airspace, which is the wrong half to miss.
+    """
+
+    BAY_TO_MONTEREY = (LatLon(37.5119, -122.2495), LatLon(36.5870, -121.8429))
+
+    def test_the_aerodromes_near_the_route_come_back(self):
+        found = apt.designators_along_route(self.BAY_TO_MONTEREY, 20.0)
+        assert "KSQL" in found.airports
+        assert "KMRY" in found.airports
+
+    def test_and_the_centre_whose_airspace_it_crosses(self):
+        found = apt.designators_along_route(self.BAY_TO_MONTEREY, 20.0)
+        assert found.artccs == ("ZOA",)
+
+    def test_every_field_carries_its_centre(self):
+        """NASR records one for all of them, so a route can never come back
+        with airports but no centre to ask about."""
+        assert apt.find("KSQL").artcc == "ZOA"
+        assert apt.find("KJFK").artcc == "ZNY"
+
+    def test_the_two_lists_are_separate_but_askable_together(self):
+        found = apt.designators_along_route(self.BAY_TO_MONTEREY, 20.0)
+        assert set(found.all) == set(found.airports) | set(found.artccs)
+
+    def test_nothing_is_asked_about_twice(self):
+        """Overlapping circles along a route return the same field repeatedly,
+        and each duplicate would be a wasted query against a metered API."""
+        found = apt.designators_along_route(self.BAY_TO_MONTEREY, 20.0)
+        assert len(set(found.all)) == len(found.all)
+
+    def test_a_wider_corridor_asks_about_more(self):
+        narrow = apt.designators_along_route(self.BAY_TO_MONTEREY, 5.0)
+        wide = apt.designators_along_route(self.BAY_TO_MONTEREY, 40.0)
+        assert len(wide.airports) > len(narrow.airports)
+
+    def test_a_route_over_open_ocean_asks_about_nothing(self):
+        empty = apt.designators_along_route(
+            (LatLon(30.0, -140.0), LatLon(31.0, -141.0)), 20.0
+        )
+        assert empty.all == ()

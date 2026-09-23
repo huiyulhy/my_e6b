@@ -41,6 +41,11 @@ class Airport:
     municipality: str | None = None
     region: str | None = None
     longest_runway_ft: float | None = None
+    # The centre whose airspace this field sits in: "ZOA", "ZLA". Carried
+    # because airspace NOTAMs -- TFRs, MOAs, airway closures -- are filed
+    # against the centre rather than against any airport, so a NOTAM search
+    # that asks only about aerodromes never sees them.
+    artcc: str | None = None
     # The published traffic pattern altitude, in feet AGL -- NASR gives a
     # height above the field, not an MSL altitude. `None` for most fields:
     # NASR only carries one where it is non-standard or somebody filed it, so
@@ -110,6 +115,7 @@ def _to_airport(row: sqlite3.Row) -> Airport:
         region=row["region"],
         longest_runway_ft=row["longest_runway_ft"],
         pattern_altitude_agl_ft=row["pattern_altitude_ft"],
+        artcc=row["artcc"],
     )
 
 
@@ -140,6 +146,57 @@ def runways(ident: str, *, path: Path | None = None) -> list[preflight.Runway]:
         )
         for row in rows
     ]
+
+
+@dataclass(frozen=True)
+class RouteDesignators:
+    """The identifiers a NOTAM search has to ask about for one route.
+
+    A NOTAM is filed against a *designator*, not a coordinate, and which
+    designator depends on what it is about. A closed runway is filed against
+    the aerodrome; a TFR, a military operations area or an airspace closure is
+    filed against the **ARTCC** whose airspace it sits in. So a search that
+    asks only about the airports on the route gets the taxiway closures and
+    misses the restricted airspace -- which is the wrong half to miss.
+
+    Only needed by sources that query by identifier. The FAA API takes a
+    latitude, longitude and radius, and needs none of this.
+    """
+
+    airports: tuple[str, ...]
+    artccs: tuple[str, ...]
+
+    @property
+    def all(self) -> tuple[str, ...]:
+        return self.airports + self.artccs
+
+
+def designators_along_route(
+    positions: list[LatLon] | tuple[LatLon, ...],
+    radius_nm: float,
+    *,
+    limit_per_point: int = 40,
+    path: Path | None = None,
+) -> RouteDesignators:
+    """Every aerodrome near a route, and every centre whose airspace it crosses.
+
+    The centres come from the aerodromes rather than from an airspace
+    boundary: NASR records the responsible ARTCC for every field, and a route
+    passing through a centre's airspace passes near its airports. It is an
+    approximation -- a leg crossing a corner of a centre with no airport
+    inside the corridor would miss it -- and it needs no boundary polygons,
+    which this project does not yet carry.
+    """
+    seen_airports: dict[str, None] = {}
+    seen_artccs: dict[str, None] = {}
+    for position in positions:
+        for airport in near(position, radius_nm, limit=limit_per_point, path=path):
+            seen_airports[airport.ident] = None
+            if airport.artcc:
+                seen_artccs[airport.artcc] = None
+    return RouteDesignators(
+        airports=tuple(seen_airports), artccs=tuple(seen_artccs)
+    )
 
 
 def find(ident: str, *, path: Path | None = None) -> Airport | None:

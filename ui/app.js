@@ -52,14 +52,24 @@ const api = {
     return body;
   },
 
-  async aloft(lat, lon, isoTime) {
-    const p = new URLSearchParams({ lat, lon });
+  async aloftSeries(lat, lon, isoTime, hours) {
+    const p = new URLSearchParams({ lat, lon, hours });
     if (isoTime) p.set('time', isoTime);
-    const r = await fetch(`/api/wx/aloft?${p}`);
+    const r = await fetch(`/api/wx/aloft/series?${p}`);
     const body = await r.json().catch(() => null);
     if (!r.ok) return { error: (body && body.detail) || 'no forecast for this point' };
     if (body && body.ok === false) return { error: body.error };
     return body;
+  },
+
+  async notams(body) {
+    const r = await fetch('/api/notams', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const answer = await r.json().catch(() => null);
+    return answer || { ok: false, error: 'the NOTAM search did not answer' };
   },
 
   async plan(body) {
@@ -155,29 +165,37 @@ let fieldAir = [];
  */
 let fieldWx = new Map();
 
-/** The forecast column over each leg the pilot drew, from the last fetch.
+/** A window of forecast hours over each waypoint the pilot drew.
  *
- *  One per leg rather than one for the route: the wind over the coast is not
- *  the wind over the valley, and a single column stretched across the whole
- *  trip is the FD product's mistake in a different shape. The engine keys
- *  them by position, so which row a column ends up on survives the tops of
- *  climb moving -- which they do, under the very wind being applied.
+ *  Over the waypoints, not the leg midpoints, because a leg is costed at both
+ *  of its ends and flown in whichever end costs more -- see `engine/planwx`.
+ *  Two adjacent legs share the waypoint between them, so N waypoints cover
+ *  N-1 legs with N requests rather than 2(N-1).
  *
- *  Sent with the plan, not stored on the route: a column is a forecast for a
- *  piece of sky at a time, and the moment the route changes it is a forecast
- *  for somewhere else.
+ *  A window rather than an hour because the engine settles the weather and
+ *  the log against each other, and each pass reads the forecast at the hour
+ *  that pass says the leg is reached. Sending the window means the loop turns
+ *  without going back to the network.
+ *
+ *  Sent with the plan, not stored on the route: a forecast belongs to a place
+ *  and a time, and the moment the route changes it is a forecast for
+ *  somewhere else.
  */
-let windsAloft = [];
+let forecasts = [];
 
-/** Where the aloft columns came from, for the line under the navlog. */
-let windsAloftWx = null;
+/** Where the forecasts came from, for the line under the navlog. */
+let forecastWx = null;
 
-/** Drop the forecast columns. The route they were fetched for is gone. */
-function clearWindsAloft() {
-  if (!windsAloft.length && windsAloftWx === null) return;
-  windsAloft = [];
-  windsAloftWx = null;
+/** Drop the forecasts. The route they were fetched for is gone. */
+function clearForecasts() {
+  if (!forecasts.length && forecastWx === null) return;
+  forecasts = [];
+  forecastWx = null;
 }
+
+// Matches the server's cap on one forecast request. A light single's day is
+// a few hours; asking for more would be a mistyped number, not a longer trip.
+const MAX_FORECAST_HOURS = 12;
 
 const $ = (id) => document.getElementById(id);
 const setStatus = (text) => { $('status').textContent = text; };
@@ -684,9 +702,14 @@ function onRouteChanged() {
   // The derived pressure and density altitudes are
   // indexed by route position, and the next plan is what re-earns them.
   if (fieldAir.length !== route.length) fieldAir = [];
-  // The columns were forecast over the legs that just changed shape, and at
-  // the times the old route reached them. Both claims are now false.
-  clearWindsAloft();
+  // The forecasts were fetched over the points that just moved, and for the
+  // times the old route reached them. Both claims are now false.
+  clearForecasts();
+  // And the briefing was for a corridor that is now somewhere else. A stale
+  // NOTAM list beside a changed route is worse than none: it reads as having
+  // been checked.
+  notamReport = null;
+  renderNotams();
   clearConsistency();
   renderWaypointList();
   renderMarkers();
@@ -1373,7 +1396,10 @@ function planBody() {
     })),
     planning_mode: planningMode,
     overrides: overridesPayload(),
-    winds_aloft: windsAloft,
+    forecasts,
+    // What turns a cumulative ETE into a clock time, and so what decides
+    // which forecast hour each leg is read at.
+    off_blocks: offBlocksUtc()?.toISOString() ?? null,
     runway_margin: +$('runway-margin').value / 100,
     fuel_margin: +$('fuel-margin').value / 100,
     cruise_altitude_ft: +$('altitude').value,
@@ -1492,8 +1518,11 @@ function renderNavlog(plan) {
   $('warnings').innerHTML = '';
   // Cleared up front, not on the success path, so that every early return
   // below leaves it hidden. A stale "GO" beside a route that would not plan is
-  // the single most dangerous thing this screen could show.
+  // the single most dangerous thing this screen could show -- and a weather
+  // list left standing beside no navlog claims to describe rows that are not
+  // there.
   renderChecklist(null);
+  renderLegWeather({});
 
   if (!plan) {
     empty.hidden = false;
@@ -1635,8 +1664,58 @@ function renderNavlog(plan) {
   foot.appendChild(tr);
 
   renderSummary(plan);
+  renderLegWeather(plan);
   renderChecklist(plan.checklist);
   restoreFocus();
+}
+
+/** The weather list, one row per leg the pilot drew.
+ *
+ *  Shows the comparison that decided each leg rather than just its result: a
+ *  pilot who can see that the departure end costs 5.4 gal and the arrival end
+ *  3.6 can tell at a glance whether the choice was close or obvious, and
+ *  whether the day is worth waiting out.
+ */
+function renderLegWeather(plan) {
+  const block = $('weather-block');
+  const body = document.querySelector('#legwx tbody');
+  const rows = plan.weather || [];
+  body.innerHTML = '';
+  if (!rows.length) { block.hidden = true; return; }
+  block.hidden = false;
+
+  $('weather-note').textContent = plan.weather_settled
+    ? `settled in ${plan.weather_passes} pass${plan.weather_passes === 1 ? '' : 'es'}`
+    : `did not settle in ${plan.weather_passes} passes — see the warning above`;
+
+  const wind = (w) => (w == null ? '—'
+    : `${String(Math.round(w.from_deg)).padStart(3, '0')}/${Math.round(w.speed_kt)}`);
+  const gal = (v) => (v == null ? '—' : v.toFixed(2));
+  const end = (chosen) => (chosen === 'start' ? 'departure end'
+    : chosen === 'end' ? 'arrival end' : 'no forecast');
+
+  for (const row of rows) {
+    const tr = document.createElement('tr');
+    if (!row.chosen) tr.className = 'note';
+    // The winning end is marked in the table itself, so the row reads as a
+    // comparison rather than as four unrelated numbers.
+    const won = (which) => (row.chosen === which ? ' class="num chosen"' : ' class="num"');
+    tr.innerHTML =
+      `<td>${row.from}</td><td>${row.to}</td>` +
+      `<td>${end(row.chosen)}</td>` +
+      `<td class="num">${row.valid_time ? zulu(row.valid_time) : '—'}</td>` +
+      `<td${won('start')}>${wind(row.start_wind)}</td>` +
+      `<td${won('start')}>${gal(row.start_fuel_gal)}</td>` +
+      `<td${won('end')}>${wind(row.end_wind)}</td>` +
+      `<td${won('end')}>${gal(row.end_fuel_gal)}</td>`;
+    body.appendChild(tr);
+    if (row.note) {
+      const note = document.createElement('tr');
+      note.className = 'note';
+      note.innerHTML = `<td colspan="8">${row.note}</td>`;
+      body.appendChild(note);
+    }
+  }
 }
 
 // --- go / no-go ---------------------------------------------------------
@@ -1832,14 +1911,18 @@ function renderSummary(plan) {
   // Where the wind on every row came from. A forecast column and a number the
   // pilot read off a chart look identical in the table, and they are not the
   // same thing to be flying on -- so the table says which it is holding.
-  if (windsAloftWx) {
+  if (forecastWx) {
     const div = document.createElement('div');
     div.className = 'alert model';
-    const missed = windsAloftWx.of - windsAloftWx.legs;
+    const missed = forecastWx.of - forecastWx.points;
+    const passes = plan.weather_passes;
     div.textContent =
-      `Winds and temperatures aloft: model forecast for `
-      + `${zulu(windsAloftWx.valid_time)}, one column per leg`
-      + (missed ? `; ${missed} leg(s) unavailable and left on the typed wind` : '')
+      `Winds and temperatures aloft: model forecast over ${forecastWx.points} `
+      + `point${forecastWx.points === 1 ? '' : 's'}, `
+      + `${forecastWx.hours} hour${forecastWx.hours === 1 ? '' : 's'} each. `
+      + `Each leg is planned in whichever of its two ends costs more fuel`
+      + (passes ? `; settled in ${passes} pass${passes === 1 ? '' : 'es'}` : '')
+      + (missed ? `; ${missed} point(s) unavailable` : '')
       + '. A forecast, not an observation — and no substitute for a briefing.';
     warnings.appendChild(div);
   }
@@ -2102,8 +2185,9 @@ async function getWeather() {
 
   renderWaypointList();
 
-  // The sky between the fields, one column per leg the pilot drew.
-  const aloft = await getWindsAloft(arrivals);
+  // The sky between the fields: a window of forecast hours over every
+  // waypoint, which the engine costs each leg against at both of its ends.
+  const aloft = await getForecasts(arrivals);
 
   // Pass two: the fetched conditions change the density altitude, so every
   // distance and every chart reading has to be taken again -- and the winds
@@ -2113,74 +2197,231 @@ async function getWeather() {
   // reads the same whether it was observed now or forecast for tonight, and
   // those are very different things to be planning on.
   const when = arrivals.size ? ` for ${zulu(offBlocksUtc().toISOString())}+` : '';
-  const legs = aloft ? `, ${aloft} leg${aloft === 1 ? '' : 's'} aloft` : '';
+  const legs = aloft ? `, ${aloft} point${aloft === 1 ? '' : 's'} aloft` : '';
   flashButton(button, failed.length
     ? `${filled} filled, ${failed.length} unavailable${legs}`
     : `Filled ${filled} field${filled === 1 ? '' : 's'}${legs}${when}`);
 }
 
-/** Fetch the wind and temperature column over each leg the pilot drew.
+/** Fetch a window of forecast hours over every waypoint the pilot drew.
  *
- *  One request per leg, at that leg's own midpoint. The alternative -- one
- *  column for the route -- is the objection `engine/aloft.py` raises against
- *  the FD product, only with a finer grid: a column over the middle of a
- *  300 nm trip describes neither end of it.
+ *  Over the waypoints rather than the leg midpoints, because each leg is
+ *  costed at both of its ends and planned in whichever costs more. Two legs
+ *  meeting at a waypoint share its forecast, so this is one request per
+ *  point, not two per leg.
  *
- *  Each leg is asked about for the time it is *reached*, on the same
- *  reasoning as the fields: an afternoon leg planned on the morning's wind is
- *  the error this exists to remove. With no off-blocks time every column is
- *  the current forecast hour.
+ *  A window rather than a single hour. The engine settles the weather list
+ *  and the navlog against each other -- the wind moves the times, the times
+ *  move which forecast hour applies -- and it can only do that without a
+ *  network call per pass if it already holds the hours. The window is the
+ *  flight itself plus an hour at each end, so it is two or three hours for a
+ *  local trip and never more than the server's cap.
  *
- *  Returns how many legs came back, or 0. A leg that fails is left out rather
- *  than faked: the engine falls back to the wind typed on that row, and to
- *  calm where there is none, which is what the plan did before.
+ *  Returns how many points came back. A point that fails is left out rather
+ *  than faked: its legs fall back to the other end's forecast, and a leg with
+ *  neither end to the wind typed on its row, and to calm under that.
  */
-async function getWindsAloft(arrivals) {
-  // The legs the pilot drew, not the rows: a TOC the planner inserted splits
-  // one leg into two rows without splitting the sky it crosses in two.
+async function getForecasts(arrivals) {
   const drawn = route.filter((w) => !w.generated);
   if (drawn.length < 2) return 0;
 
-  const legs = [];
-  for (let i = 0; i < drawn.length - 1; i += 1) {
-    const from = drawn[i];
-    const to = drawn[i + 1];
-    legs.push({
-      // A plain average rather than a great-circle midpoint. It only has to
-      // land nearer this leg's column than the next leg's, and over the
-      // distances a light single flies the two are yards apart.
-      lat: (from.lat + to.lat) / 2,
-      lon: (from.lon + to.lon) / 2,
-      // Reached when its far end is reached, which is the arrival time the
-      // navlog already computes for that waypoint.
-      at: arrivals.get(to.name) || null,
-    });
-  }
+  const start = offBlocksUtc();
+  // How long the day is, from the plan we already have. An hour either side:
+  // the fetch is anchored to the off-blocks hour, and the last leg is reached
+  // after the total ETE, which the wind is about to change.
+  const enRoute = lastPlan?.ok ? (lastPlan.totals?.time_min ?? 0) : 0;
+  const hours = Math.min(MAX_FORECAST_HOURS, Math.ceil(enRoute / 60) + 2);
 
-  let columns;
+  let series;
   try {
-    columns = await Promise.all(legs.map(
-      (leg) => api.aloft(leg.lat, leg.lon, leg.at ? leg.at.toISOString() : null)));
+    series = await Promise.all(drawn.map(
+      (w) => api.aloftSeries(w.lat, w.lon, start ? start.toISOString() : null, hours)));
   } catch {
-    clearWindsAloft();
+    clearForecasts();
     return 0;
   }
 
-  const good = [];
+  // Every waypoint keeps its slot even when its fetch failed: the engine
+  // reads the list positionally against the route, and a gap would shift
+  // every forecast after it onto the wrong point.
   const notes = new Set();
-  let validTime = null;
-  columns.forEach((column, n) => {
-    if (!column || column.error || !Array.isArray(column.levels)) return;
-    good.push({ lat: legs[n].lat, lon: legs[n].lon, levels: column.levels });
-    (column.notes || []).forEach((note) => notes.add(note));
-    validTime = validTime || column.valid_time;
+  let got = 0;
+  forecasts = drawn.map((w, n) => {
+    const answer = series[n];
+    const ok = answer && !answer.error && Array.isArray(answer.hours);
+    if (!ok) return { name: w.name, lat: w.lat, lon: w.lon, hours: [] };
+    got += 1;
+    answer.hours.forEach((hour) => (hour.notes || []).forEach((x) => notes.add(x)));
+    return {
+      name: w.name,
+      lat: w.lat,
+      lon: w.lon,
+      hours: answer.hours.map((hour) => ({
+        valid_time: hour.valid_time, levels: hour.levels,
+      })),
+    };
   });
 
-  windsAloft = good;
-  windsAloftWx = good.length
-    ? { legs: good.length, of: legs.length, valid_time: validTime, notes: [...notes] }
+  forecastWx = got
+    ? { points: got, of: drawn.length, hours, notes: [...notes] }
     : null;
-  return good.length;
+  if (!got) forecasts = [];
+  return got;
+}
+
+/** What the last NOTAM search found, or why it could not look. */
+let notamReport = null;
+
+/** Search for NOTAMs along the route and show the ones about this flight.
+ *
+ *  Its own button rather than part of "Get weather": it is a separate service
+ *  with its own credentials and its own failure, and a briefing that half
+ *  worked should say which half.
+ *
+ *  The search is done against the plan, not the route, because three of the
+ *  four filters need what only a plan knows -- the altitude over each stretch
+ *  of ground and the time the aeroplane is there.
+ */
+async function getNotams() {
+  const button = $('get-notams');
+  if (route.filter((w) => !w.generated).length < 2) {
+    flashButton(button, 'Add a route first');
+    return;
+  }
+  button.disabled = true;
+  button.textContent = 'Searching…';
+  try {
+    notamReport = await api.notams(planBody());
+  } catch {
+    notamReport = { ok: false, error: 'the NOTAM search could not be reached' };
+  }
+  button.disabled = false;
+  renderNotams();
+  if (!notamReport.ok) {
+    flashButton(button, notamReport.needs_credentials ? 'Not configured' : 'Search failed');
+    return;
+  }
+  // Both numbers on the button too: "4 of 137" says the filter is working in
+  // a way "4 NOTAMs" does not.
+  flashButton(button, `${notamReport.relevant} of ${notamReport.returned}`);
+}
+
+/** The briefing, worst first.
+ *
+ *  Each entry says why it survived the filter -- how far off track, at what
+ *  altitude, over what times. A pilot who can see the reason can judge
+ *  whether the filter was right, which is the only way a filter that hides
+ *  things earns any trust.
+ */
+function renderNotams() {
+  const block = $('notam-block');
+  const list = $('notam-list');
+  list.innerHTML = '';
+  if (!notamReport) { block.hidden = true; return; }
+  block.hidden = false;
+
+  if (!notamReport.ok) {
+    $('notam-note').textContent = '';
+    const div = document.createElement('div');
+    div.className = notamReport.needs_credentials ? 'alert model' : 'alert';
+    div.textContent = notamReport.error;
+    list.appendChild(div);
+    return;
+  }
+
+  // What was searched: the aerodromes and centres SkyLink was asked about.
+  const idents = notamReport.designators?.length || 0;
+  $('notam-note').textContent =
+    `${notamReport.relevant} of ${notamReport.returned} within `
+    + `${Math.round(notamReport.corridor_nm)} nm of track, from `
+    + `${idents} identifier${idents === 1 ? '' : 's'} via SkyLink`;
+
+  if (!notamReport.complete) {
+    const div = document.createElement('div');
+    div.className = 'alert';
+    div.textContent = 'This briefing is incomplete — part of the search failed: '
+      + notamReport.failed.join('; ')
+      + '. Do not read the list below as "nothing else to report".';
+    list.appendChild(div);
+  }
+
+  if (!notamReport.notams.length) {
+    const div = document.createElement('div');
+    div.className = 'hint notam-none';
+    div.textContent = notamReport.returned
+      ? `Nothing along this route: all ${notamReport.returned} found nearby were `
+        + 'outside the corridor, at other altitudes, or not in force at the time.'
+      : 'Nothing was returned for this route. Check against an official '
+        + 'briefing before treating that as "no NOTAMs".';
+    list.appendChild(div);
+    return;
+  }
+
+  for (const one of notamReport.notams) {
+    const item = document.createElement('div');
+    item.className = `notam ${one.priority}`;
+    const when = notamWhen(one);
+    item.innerHTML =
+      `<div class="notam-head">` +
+        `<span class="pill ${one.priority}">${one.priority}</span>` +
+        `<span class="notam-id">${one.location || '—'} ${one.number || ''}</span>` +
+        `<span class="notam-where">${one.distance_nm == null ? 'unplaced'
+          : one.distance_nm < 0.1 ? 'on track' : `${one.distance_nm} nm off track`}` +
+          `</span>` +
+      `</div>` +
+      `<div class="notam-text">${escapeHtml(one.text)}</div>` +
+      `<div class="notam-why">${when}${when && one.reasons.length ? ' · ' : ''}` +
+        `${one.reasons.join(' · ')}</div>`;
+    list.appendChild(item);
+  }
+}
+
+/** A NOTAM's active window, in the terms it was published in.
+ *
+ *  The day is shown whenever the window crosses one. Bare Zulu times are what
+ *  a pilot reads everywhere else on this page, but "0802Z to 0802Z" for a
+ *  three-day closure reads as a window of no length at all -- which is the
+ *  opposite of what it says.
+ */
+function notamWhen(one) {
+  if (one.permanent) return 'permanent';
+  if (!one.effective_start && !one.effective_end) return '';
+  // Compared on the whole date, not the day of the month: 1 Sep and 1 Oct
+  // share a day-of-month, and treating them as the same day printed a
+  // month-long closure as "0000Z to 0000Z".
+  const utcDate = (iso) => new Date(iso).toISOString().slice(0, 10);
+  const utcMonth = (iso) => new Date(iso).toISOString().slice(0, 7);
+  const both = one.effective_start && one.effective_end;
+  const sameDay = both && utcDate(one.effective_start) === utcDate(one.effective_end);
+  const sameMonth = both && utcMonth(one.effective_start) === utcMonth(one.effective_end);
+  const stamp = (iso) => (sameDay ? zulu(iso) : sameMonth ? zuluDay(iso) : zuluDate(iso));
+  const from = one.effective_start ? stamp(one.effective_start) : '—';
+  const to = one.effective_end
+    ? stamp(one.effective_end) + (one.estimated_end ? ' est' : '') : 'UFN';
+  return `${from} to ${to}`;
+}
+
+/** A Zulu time with the day of the month on it: "04/0802Z". */
+function zuluDay(iso) {
+  const when = new Date(iso);
+  if (Number.isNaN(when.getTime())) return '';
+  return `${String(when.getUTCDate()).padStart(2, '0')}/${zulu(iso)}`;
+}
+
+/** With the month as well, for a window that crosses one: "01 Sep 0000Z".
+ *  A bare day would make 1 Sep to 1 Oct read as "01/0000Z to 01/0000Z". */
+function zuluDate(iso) {
+  const when = new Date(iso);
+  if (Number.isNaN(when.getTime())) return '';
+  const month = when.toLocaleString('en-US', { month: 'short', timeZone: 'UTC' });
+  return `${String(when.getUTCDate()).padStart(2, '0')} ${month} ${zulu(iso)}`;
+}
+
+/** NOTAM text is somebody else's, and it goes into innerHTML. */
+function escapeHtml(text) {
+  const node = document.createElement('div');
+  node.textContent = text || '';
+  return node.innerHTML;
 }
 
 const flashTimers = new Map();
@@ -2199,6 +2440,9 @@ function flashButton(button, message) {
 
 $('get-weather').dataset.label = 'Get weather';
 $('get-weather').addEventListener('click', getWeather);
+
+$('get-notams').dataset.label = 'Get NOTAMs';
+$('get-notams').addEventListener('click', getNotams);
 
 $('download-csv').addEventListener('click', async () => {
   if (!lastPlan?.ok) return;

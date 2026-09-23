@@ -233,6 +233,10 @@
                 title="Fetch surface weather for every airport on the route and fill in its altimeter setting, temperature and wind. With an off-blocks time set, each field is fetched for its own ETA.">
           Get weather
         </button>
+        <button id="get-notams" type="button"
+                title="Search for NOTAMs along the route and show the ones that are actually about this flight: within the corridor, at an altitude the aeroplane is at, and in force while it is there. Needs a SkyLink key from RapidAPI on the server.">
+          Get NOTAMs
+        </button>
         <button id="copy" type="button">Copy as text</button>
         <button id="download-csv" type="button"
                 title="Save the log as CSV in the column order of a paper nav log">
@@ -275,6 +279,44 @@
         <tbody></tbody>
         <tfoot></tfoot>
       </table>
+    </div>
+
+    <!-- The briefing. Beside the navlog rather than in the sidebar because
+         each entry is about a stretch of the route above it, and because a
+         NOTAM is read at the same moment as the log it applies to. -->
+    <div id="notam-block" hidden>
+      <div class="navlog-head">
+        <h2>NOTAMs</h2>
+        <span class="hint" id="notam-note"></span>
+      </div>
+      <div id="notam-list"></div>
+    </div>
+
+    <!-- The second of the two lists. The navlog above says what the flight
+         costs; this says what weather it was costed in, and which end of each
+         leg that weather came from. Beside the table rather than in the
+         sidebar because every row of it answers a row of the table. -->
+    <div id="weather-block" hidden>
+      <div class="navlog-head">
+        <h2>Weather by leg</h2>
+        <span class="hint" id="weather-note"></span>
+      </div>
+      <div class="table-scroll">
+        <table id="legwx">
+          <thead>
+            <tr>
+              <th>From</th><th>To</th>
+              <th title="Which end's forecast this leg was planned in — the one that costs more fuel">Planned in</th>
+              <th class="num" title="The forecast hour it was read at">Valid</th>
+              <th class="num" title="Wind at this leg's altitude from the departure end's forecast">Start wind</th>
+              <th class="num" title="What the leg would burn in the departure end's forecast">Start fuel</th>
+              <th class="num" title="Wind at this leg's altitude from the arrival end's forecast">End wind</th>
+              <th class="num" title="What the leg would burn in the arrival end's forecast">End fuel</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
     </div>
   </section>
 

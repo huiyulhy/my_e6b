@@ -26,6 +26,24 @@ departure hours away, from the TAF and a forecast model — so takeoff and landi
 computed on the air that will actually be there. Without a connection you type them in, as
 before, and everything else works unchanged.
 
+NOTAMs need one extra thing: a SkyLink subscription on RapidAPI (the free tier is 1,000 requests
+a month). Without it every other feature works and **Get NOTAMs** says what is missing rather
+than reporting none — "no NOTAMs" and "no NOTAM service" look identical on a briefing and mean
+opposite things.
+
+```bash
+export RAPIDAPI_KEY=...
+make serve
+```
+
+SkyLink is asked by airport identifier, so a briefing costs one request per aerodrome and ARTCC
+near the route, capped at 40 — about 25 briefings a month in busy airspace. The route's own
+airports and the ARTCCs are always asked first, so the cap only ever drops outlying fields.
+
+What comes back is filtered to the flight rather than dumped: within 20 nm of track, at an
+altitude the aeroplane is actually at over that stretch, and in force while it is there. The
+panel says how many of how many survived, so you can see the filter working.
+
 ```bash
 make altimeter-trend   # how far the altimeter setting really moves in a day, and what it costs
 ```

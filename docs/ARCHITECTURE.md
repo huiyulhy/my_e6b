@@ -54,6 +54,8 @@ my_e6b/
     airports.py      [built]  airport lookup against the local SQLite
     weather.py       [built]  METAR/TAF/model parsing + source resolution (pure)
     aloft.py         [built]  pressure-level winds and temperatures aloft (pure)
+    planwx.py        [built]  the weather list beside the navlog, settled against it
+    notam.py         [built]  NOTAM decoding + the 4D relevance filter (pure)
   data/
     poh/c172s/       [built]  five CSVs + SOURCE.md provenance
     magnetic/        [built]  WMM2025.COF + NOAA's 100-point test set
@@ -553,45 +555,178 @@ own METAR temperatures. No conversion is needed on the way in — that is the pa
 pressure altitude, where a field temperature has to be converted through its own station's
 altimeter setting first.
 
-### How it reaches the navlog: one column per leg
+### How it reaches the navlog: two lists, settled against each other
 
-**Get weather** fetches a column at each leg's own midpoint, for the time that leg is reached, and
-sends them back with the plan. Not one column for the route: a single column stretched across a
-300 nm trip is the objection above with a finer grid, describing neither end of it.
+`engine/planwx.py` produces **two lists**, one entry per leg the pilot drew: the navlog rows, and
+the weather each of them was planned in. They agree, which is the whole difficulty — each is an
+input to the other.
 
-The engine takes them on `Conditions`:
+**Both ends of every leg, and the worse of the two.** A leg is not a point. The forecast over the
+field it starts at and the forecast over the field it ends at are two different columns of air and
+the aeroplane flies through both. Planning on either alone guesses which half of the leg matters;
+planning on their average is a wind that was forecast nowhere. So each leg is costed under both
+and planned in whichever **costs more fuel** — a plan that comes in early is a good day, a plan
+that comes in late is a diversion.
 
-- **Wind** goes in as a `WindField` — a bag of `WindColumn`s, each a `WindsAloft` and the point it
-  was forecast over. `_RouteColumns` files each column under the leg the pilot drew it over, and
-  then hands each row the column of the leg it flies along.
-- **Temperature** goes in as `temperatures_aloft`, route-wide, merging with the fields' own METAR
-  temperatures into the single curve `build_navlog` builds. Route-wide because a pressure altitude
-  is a coordinate every station shares, which is exactly what one curve through all of them needs.
+Fuel rather than time, because fuel is what a reserve is measured in and the two can disagree: a
+leg flown higher is slower over the ground and cheaper per hour. Only the ground speed is
+recomputed to compare the two candidates — the power setting is the same either way, so the rows'
+own distance, altitude, TAS and fuel flow are read as they stand.
 
-**Both mappings are by position, and that is the whole design.** The obvious key is the row, and
-it does not work: a forecast wind moves the tops of climb — into a headwind the same climb covers
-less ground and tops out sooner — which renumbers the very rows the wind would have been keyed to.
-A point on the earth does not move. So `_RouteColumns.build` asks where each column *is*, and
-`over()` asks where each row *is*, and the answer survives the profile being re-solved underneath.
+The column is taken **whole**, its wind and its temperature together, rather than the worst wind
+from one end and the worst temperature from the other. Half of one forecast against half of
+another describes air neither of them reported — the same objection `resolve_surface` makes about
+mixing a METAR's ceiling with a TAF's cover.
 
-**Containment, not nearest.** `_drawn_leg_of` puts a point on the leg it lies *on*, using the
-along-track and cross-track distances `engine/geo.Segment` already computes. Nearest-column is the
-tempting shortcut and it is wrong at exactly one place: the first ten miles of a 130 nm leg are
-sixty miles nearer the *previous* leg's column, which sits at that leg's midpoint. The row is
-still unambiguously on the second leg.
+**Why it has to loop.** The weather a leg is flown in depends on when the leg is reached; when the
+leg is reached depends on the wind it is flown in. Planning once on the departure hour is the
+error the whole tier exists to remove — a three-hour leg planned on the 1300Z forecast is not the
+leg you fly at 1600Z. So `solve` settles the two lists:
 
-Where a column is missing the leg falls back to whatever was typed on its row, and to calm below
-that — which is what a plan with nothing entered has always meant. A wind the pilot typed still
-wins on its own row, and a half-typed wind now takes its other half from **that leg's** column
-rather than from a route-wide profile.
+1. Plan with no forecast, to learn roughly when each waypoint is reached.
+2. Choose each leg's weather from the forecasts at its two ends, at those times, taking the dearer.
+3. Plan again on that weather — which moves the times, and the tops of climb.
+4. Re-choose. If nothing changed, the two lists agree and it is done.
+
+**"No more changes" means the choice, not the numbers.** The numbers move by seconds forever. What
+has to stop moving is which end of each leg won and which forecast hour it was read at — both
+discrete, so settling is a real event rather than a tolerance. Two or three passes is the usual
+count; `MAX_PASSES` caps it, and a run that hits the cap still returns its last plan, labelled,
+because that is more use than an error.
+
+**One request per waypoint, a window of hours each.** Over the waypoints rather than the leg
+midpoints, since adjacent legs share the point between them — N points cover N-1 legs. A *window*
+because the loop re-reads the forecast at a different hour on every pass, and going back to the
+network each time would put a fetch inside a loop. It costs nothing extra: the Open-Meteo URL is
+keyed by day and already carries 48 hours, so `fetch_aloft_series` parses more of one cached
+payload. The UI asks for the flight's length plus an hour at each end.
+
+**The engine still takes wind by position.** `solve` hands each chosen column to `build_navlog` at
+its leg's midpoint, and `navlog._RouteColumns` files it back under that leg. The obvious key is
+the row and it does not work: a forecast wind moves the tops of climb — into a headwind the same
+climb covers less ground and tops out sooner — which renumbers the very rows the wind was keyed
+to. A point on the earth does not move.
+
+**Containment, not nearest.** `_drawn_leg_of` puts a point on the leg it lies *on*, from the
+along-track and cross-track distances `geo.Segment` already computes. Nearest-column is the
+tempting shortcut and is wrong at exactly one place: the first ten miles of a 130 nm leg are sixty
+miles nearer the *previous* leg's column. The row is still unambiguously on the second leg.
+
+Temperature goes in route-wide as `temperatures_aloft`, merging with the fields' own METARs into
+the single curve `build_navlog` builds — a pressure altitude is the coordinate every station
+shares, and `TemperatureProfile.from_observations` averages samples that land on the same level.
+
+Where an end has no forecast the other is used; where neither does, the leg falls back to the wind
+typed on its row and to calm under that, which is what a plan with nothing entered has always
+meant. A wind the pilot typed still wins on its own row, and a half-typed wind takes its other
+half from **that leg's** column rather than from a route-wide profile. An end whose wind no
+heading can hold the course in is the one thing never chosen despite being the dearest: planning
+on it makes the route unbuildable and leaves the pilot looking at an error instead of a plan, so
+the other end is used and the leg says so.
 
 This settles §4b's open question about whether a wind should move the top of climb. It does: the
 reason it did not was that an FD level is too coarse to trust that far, and a point-resolved model
-column is not. The planner gets the forecast on the first pass, since a column belongs to a leg by
+column is not. The planner gets the forecast on its first pass, since a column belongs to a leg by
 where it was forecast and needs no draft lay-out to find its home.
+
+The UI shows the second list under the navlog — both ends' costs, not just the winner's, so a
+pilot can see whether the choice was close or obvious.
 
 The navlog says so under the table — a model forecast and a number read off a chart look identical
 in a wind column, and they are not the same thing to be flying on.
+
+### 4e. NOTAMs — `engine/notam.py` + `server/notams.py`
+
+A NOTAM search returns everything for a region, and almost none of it is about the flight: a crane
+forty miles off track, a closed taxiway at an airport being overflown at 6,500 ft, an airway
+closure between FL240 and FL350, a runway shut next Tuesday. Printing all of it is how a briefing
+becomes something a pilot skims, and skimming is how the closed runway at the destination gets
+missed. So the filter is the feature — the fetch is the easy half.
+
+**Four tests, and all four against the same leg.** A NOTAM has to reach the route corridor
+(20 nm either side of track by default), overlap the band of altitude the aeroplane is in *over
+that stretch*, and be in force while it is *there*. Testing the three separately against the
+whole route keeps a NOTAM that is beside the first leg, at the altitude of the last, and during
+the time of neither — so `_against_route` walks leg by leg and a leg has to satisfy all three.
+The fourth test is what kind of news it is, which sorts rather than rejects.
+
+The window comes off the navlog, one entry per row: a climb out of a field covers the surface up
+to cruise, and the cruise after it covers only cruise. Merged into one entry per drawn leg they
+would together claim every altitude over the whole route, and the vertical test would stop
+rejecting anything.
+
+**Nothing is rejected on a guess.** A NOTAM with no position, no altitude band or no times cannot
+be ruled out on that ground and is kept, with the gap named in its `reasons`. Unstated limits read
+open — no lower limit is the surface, no upper limit is unlimited, no end is until further notice
+— because every one of those readings keeps a NOTAM rather than drops it. `FL999` is decoded as
+unlimited, not as 99,900 ft.
+
+**Distance is to the leg, not to the line through it,** and from the NOTAM's own circle rather
+than its centre. A five-mile radius eighteen miles off track reaches a 20 nm corridor; a point at
+the same place is clear of it. Measuring by cross-track alone would put a NOTAM two hundred miles
+beyond the destination "on the track", since the great circle through a leg does not stop where
+the leg does.
+
+**Priority is read from the text.** Anything unrecognised is called operational rather than
+information: burying a NOTAM nobody classified is the failure that matters.
+
+#### The source: SkyLink, through RapidAPI
+
+NOTAMs come from SkyLink, reached through RapidAPI with one key in `RAPIDAPI_KEY`. Unconfigured,
+`/api/notams` says exactly that instead of returning nothing: **"no NOTAMs" and "no NOTAM service"
+look identical on a briefing page and mean opposite things.** For the same reason a partly failed
+search is labelled rather than shown as a clean result, and the panel always says how many were
+found against how many were kept — "4 of 137" says the filter is working in a way "4 NOTAMs" does
+not.
+
+**It is asked by identifier, so both kinds of identifier are needed.** A closed runway is filed
+against the aerodrome; a TFR, an MOA or an airspace closure is filed against the ARTCC. A search
+that asks only about the airports on the route gets the taxiway closures and misses the restricted
+airspace, which is the wrong half to miss. `airports.designators_along_route` returns both: NASR
+records the responsible centre for every one of the 12,589 fields in the database, so the centres
+come from the aerodromes near the route rather than from airspace boundaries this project does not
+yet carry — an approximation that breaks only where a leg clips a corner of a centre with no
+airport inside the corridor.
+
+**The aerodromes are found by a chain of circles, and the spacing is what makes it a corridor.**
+Circles of radius R every R nm cover everything within `R·√3/2` of the track, the thin spot being
+where two adjacent circles cross, so the search radius is set from the corridor width
+(`corridor / (√3/2)` ≈ 23 nm for a 20 nm corridor) rather than equal to it. Searching at 20 nm
+left scalloped gaps, and an aerodrome 19 nm off track halfway between two samples was never asked
+about. `tests/test_notam_fetch.py` samples the whole corridor edge against the chain; it caught two
+holes in the thinning that drops circles sitting on top of one another, and a point is now dropped
+only when what follows it still lands within one spacing of the circle before it.
+
+**The budget decides the order.** The free tier is 1,000 requests a month and each identifier is
+one request, so `MAX_DESIGNATORS` caps a route at 40 — 25 briefings a month at the cap. A 150 nm
+route in busy airspace has 60 to 90 identifiers within reach, so the cap is the normal case, not the
+edge case, and what it cuts matters. Identifiers are asked in this order:
+
+1. the route's own aerodromes — departure, stops, destination;
+2. the ARTCCs;
+3. every other aerodrome, nearest the track first.
+
+The first version walked from departure to destination and cut at the cap, which on every busy
+route dropped the destination — the one aerodrome a pilot is certain to land at. The cut is always
+reported as an incomplete search, never applied silently.
+
+**The raw text supplies what the fields leave out.** SkyLink documents its fields as "NOTAM ID,
+type, location, effective time, expiration time, and body" — nothing about position or altitude.
+The raw ICAO text has both, in the Q-line, so `parse_q_line` decodes it underneath whatever came
+structurally: centre, radius, lower and upper limits, and the B/C start and end. That is what makes
+four-dimensional filtering possible from an identifier-only source.
+
+**An unreadable reply is an outage, never an empty airport.** `parse_skylink` raises
+`UnrecognisedPayload` on any reply it cannot read, including a list whose every record is
+unreadable; an empty list comes back only for a reply that was recognisably an empty NOTAM list,
+since a small field often has none. The fetcher records an unreadable reply as a failure for that
+identifier, and raises if every identifier failed — counting query failures on their own, so that
+the budget notice in the same failure list can never turn a total outage into an empty briefing.
+
+**The decoder is written to SkyLink's published description and has not yet met a live
+response** — the service returns 401 without a key. The first real reply should be checked against
+`tests/test_notam_skylink.py`; if the field names differ, the reply fails loudly as unreadable
+rather than showing an empty panel.
 
 ---
 

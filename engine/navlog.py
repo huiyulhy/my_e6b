@@ -91,8 +91,10 @@ __all__ = [
     "WindsAloft",
     "build_navlog",
     "build_segments",
+    "drawn_spans",
     "format_navlog",
     "resolve_route",
+    "rows_by_drawn_leg",
     "strip_generated",
 ]
 
@@ -1528,6 +1530,42 @@ def _row_winds(overrides: dict[int, LegOverride]) -> dict[int, tuple]:
     }
 
 
+def drawn_spans(waypoints: list[Waypoint]) -> tuple[Segment, ...]:
+    """The legs the pilot drew, as measured segments.
+
+    The pilot's own points, so a top of climb the planner inserted does not
+    count as a leg: it splits a row in two without splitting in two the
+    stretch of route the row covers.
+    """
+    return tuple(
+        inverse(start.position, end.position)
+        for start, end in pairwise(strip_generated(waypoints))
+    )
+
+
+def rows_by_drawn_leg(
+    legs: list[Leg] | tuple[Leg, ...], waypoints: list[Waypoint]
+) -> dict[int, list[Leg]]:
+    """Every navlog row, filed under the leg the pilot drew it on.
+
+    Rows that cover no ground -- the taxi, the pattern -- belong to no leg and
+    appear nowhere here: they have no course for a wind to act on.
+
+    Public because the weather list is built per drawn leg and has to be able
+    to ask what each leg actually costs. See `engine/planwx.py`.
+    """
+    spans = drawn_spans(waypoints)
+    by_leg: dict[int, list[Leg]] = {}
+    for leg in legs:
+        if not leg.covers_ground:
+            continue
+        midpoint = inverse(leg.from_position, leg.to_position).point_at_fraction(0.5)
+        index = _drawn_leg_of(spans, midpoint)
+        if index is not None:
+            by_leg.setdefault(index, []).append(leg)
+    return by_leg
+
+
 def _drawn_leg_of(spans: tuple[Segment, ...], point: LatLon) -> int | None:
     """Which leg the pilot drew a point sits on, or `None` if it sits on none.
 
@@ -1573,10 +1611,7 @@ class _RouteColumns:
         """
         if field is None or not field.columns:
             return None
-        spans = tuple(
-            inverse(start.position, end.position)
-            for start, end in pairwise(strip_generated(waypoints))
-        )
+        spans = drawn_spans(waypoints)
         by_leg: dict[int, WindsAloft] = {}
         for column in field.columns:
             index = _drawn_leg_of(spans, column.position)

@@ -13,7 +13,7 @@ run modes will drift apart. See docs/ARCHITECTURE.md section 2.
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -29,12 +29,20 @@ from engine import csv_download as csv_export
 from engine import currency as cur
 from engine import magnetic as mag
 from engine import navlog as nl
+from engine import notam as nt
+from engine import planwx as pw
 from engine import preflight as pf
 from engine import weather as wx
 from engine import weight_balance as wb
-from engine.geo import LatLon
+from engine.geo import LatLon, inverse
 from engine.magnetic import AtGeographicPole, OutsideModelValidity
+from server import notams as notam_source
 from server import wx_surface
+
+# How long a forecast window one request may ask for. A light single's day is
+# a few hours, the model publishes 48, and a bound keeps a mistyped `hours=`
+# from asking for all of them at every waypoint.
+MAX_FORECAST_HOURS = 12
 
 ROOT = Path(__file__).resolve().parent.parent
 UI_DIR = ROOT / "ui"
@@ -114,12 +122,26 @@ class AloftLevelIn(BaseModel):
     isa_deviation_c: float | None = None
 
 
-class WindColumnIn(BaseModel):
-    """A forecast column, and the point on the route it was forecast over."""
+class ForecastHourIn(BaseModel):
+    """One hour of a forecast column, as `/api/wx/aloft/series` gave it."""
 
+    valid_time: datetime
+    levels: list[AloftLevelIn] = []
+
+
+class PointForecastIn(BaseModel):
+    """Every hour fetched over one waypoint of the route.
+
+    One of these per waypoint the pilot drew, in route order. A window rather
+    than a single hour because `engine/planwx` re-reads it as the times move:
+    a leg's weather is chosen from the forecast at the hour that leg is
+    actually reached, and that hour is not known until the plan is built.
+    """
+
+    name: str = ""
     lat: float
     lon: float
-    levels: list[AloftLevelIn] = []
+    hours: list[ForecastHourIn] = []
 
 
 class LegOverrideIn(BaseModel):
@@ -164,10 +186,18 @@ class PlanRequest(BaseModel):
     night: bool = False
     flight_date: date | None = None
     overrides: list[LegOverrideIn] = Field(default_factory=list)
-    # One forecast column per leg the pilot drew, from "Get weather". Empty is
-    # the ordinary case and means every leg reads the winds typed on its row,
-    # or calm -- which is what a plan with nothing entered has always meant.
-    winds_aloft: list[WindColumnIn] = Field(default_factory=list)
+    # One forecast series per waypoint the pilot drew, in route order, from
+    # "Get weather". Each leg is then costed at both of its ends and planned
+    # in whichever costs more. Empty is the ordinary case and means every leg
+    # reads the wind typed on its row, or calm -- which is what a plan with
+    # nothing entered has always meant.
+    forecasts: list[PointForecastIn] = Field(default_factory=list)
+    # How far either side of track a NOTAM still counts as being on the route.
+    notam_corridor_nm: float = nt.DEFAULT_CORRIDOR_NM
+    # When the flight leaves, UTC. What turns a cumulative ETE into a clock
+    # time, and so what decides which forecast hour each leg is read at. Null
+    # plans every leg on the hour the forecast was fetched for.
+    off_blocks: datetime | None = None
     # Fractions: 0.20 means "require 20% more than the book distance".
     runway_margin: float = pf.DEFAULT_RUNWAY_MARGIN
     fuel_margin: float = pf.DEFAULT_FUEL_MARGIN
@@ -390,6 +420,45 @@ def winds_aloft(
     return _aloft_json(forecast)
 
 
+@app.get("/api/wx/aloft/series")
+def winds_aloft_series(
+    lat: float,
+    lon: float,
+    time: str | None = None,
+    hours: int = 1,
+    ceiling_ft: float = 14000.0,
+) -> dict:
+    """Consecutive forecast hours over one point, in one request.
+
+    A window rather than an hour, because the planner cannot know which hour
+    it needs until it knows when the leg is reached -- and it cannot know that
+    until it has planned it. `engine/planwx.solve` settles the two against
+    each other, re-reading the window on every pass, so the window has to be
+    in hand before the loop starts. It costs one upstream request either way:
+    the model publishes the whole day and the cache is keyed by it.
+    """
+    if not 1 <= hours <= MAX_FORECAST_HOURS:
+        raise HTTPException(
+            400, f"hours must be between 1 and {MAX_FORECAST_HOURS}"
+        )
+    start: datetime | None = None
+    if time:
+        try:
+            start = datetime.fromisoformat(time)
+        except ValueError:
+            raise HTTPException(400, f"could not read {time!r} as an ISO 8601 time")
+
+    try:
+        series = wx_surface.fetch_aloft_series(
+            LatLon(lat, lon), start, hours=hours, ceiling_ft=ceiling_ft
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except wx.WeatherUnavailable as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "hours": [_aloft_json(forecast) for forecast in series]}
+
+
 @app.get("/api/wx/surface")
 def surface_weather(ident: str, time: str | None = None) -> dict:
     """Surface weather at one field, for now or for a target time.
@@ -497,23 +566,11 @@ def _build_from_request(request: PlanRequest):
     # leg it was forecast for, and temperature comes from the fields plus any
     # row the pilot typed one on. Calm here is what a row with no wind on it
     # means, not a claim about the day.
-    columns = [_wind_column(c) for c in request.winds_aloft]
     conditions = nl.Conditions(
         altimeter_inhg=request.altimeter_inhg,
         isa_deviation_c=request.isa_deviation_c,
         flight_date=request.flight_date,
         night=request.night,
-        # Winds by position, temperatures by pressure altitude. The wind
-        # belongs to the piece of sky one leg crosses; the temperature does
-        # not -- it goes into the one curve the whole route is planned on,
-        # beside the fields' own observations, which is what a pressure
-        # altitude being a shared coordinate buys.
-        wind_field=nl.WindField(tuple(columns)) if columns else None,
-        temperatures_aloft=tuple(
-            sample
-            for column in request.winds_aloft
-            for sample in _aloft_temperature_samples(column)
-        ),
     )
     aircraft = nl.Aircraft(
         weight_lb=request.weight_lb,
@@ -533,16 +590,22 @@ def _build_from_request(request: PlanRequest):
         for o in request.overrides
     }
     margins = pf.Margins(runway=request.runway_margin, fuel=request.fuel_margin)
-    log = nl.build_navlog(
+    # Not `build_navlog` directly: with a forecast on the route the weather
+    # and the log are each an input to the other, and `planwx.solve` settles
+    # them against each other. With no forecast it builds the log once and
+    # returns, so a plan with nothing fetched costs exactly what it did.
+    solved = pw.solve(
         waypoints,
         request.cruise_altitude_ft,
         aircraft,
         conditions,
+        forecasts=tuple(_point_forecast(f) for f in request.forecasts),
+        off_blocks=request.off_blocks,
         overrides=overrides,
         margins=margins,
         planning_mode=request.planning_mode,
     )
-    return log, aircraft, conditions
+    return solved, aircraft, conditions
 
 
 @app.post("/api/consistency")
@@ -555,7 +618,8 @@ def consistency(request: PlanRequest) -> dict:
     if len(request.waypoints) < 2:
         return {"ok": False, "error": "Add a departure and a destination."}
     try:
-        log, aircraft, conditions = _build_from_request(request)
+        solved, aircraft, conditions = _build_from_request(request)
+        log = solved.navlog
     except (nl.RouteError, OutsideModelValidity) as exc:
         return {"ok": False, "error": str(exc)}
     except ValueError as exc:
@@ -602,7 +666,8 @@ def navlog_csv(request: PlanRequest, time_off: str | None = None) -> Response:
             status_code=400,
         )
     try:
-        log, _aircraft, _conditions = _build_from_request(request)
+        solved, _aircraft, _conditions = _build_from_request(request)
+        log = solved.navlog
         text = csv_export.navlog_csv(log, time_off=time_off)
     except (nl.RouteError, OutsideModelValidity, ValueError) as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
@@ -618,6 +683,160 @@ def navlog_csv(request: PlanRequest, time_off: str | None = None) -> Response:
     )
 
 
+@app.post("/api/notams")
+def notams(request: PlanRequest) -> dict:
+    """The NOTAMs that are actually about this flight.
+
+    Its own endpoint rather than part of `/api/plan`, on the same reasoning as
+    the consistency check: `/api/plan` runs on every keystroke, and a NOTAM
+    briefing is a deliberate act with a rate-limited external service behind
+    it.
+
+    The route is planned first, because the filter needs what only a plan
+    knows -- the altitude over each stretch of ground and the clock time the
+    aeroplane is there. Then SkyLink is asked about every aerodrome and centre
+    along the route, and the four tests in `engine/notam` sort what comes back.
+    """
+    if len(request.waypoints) < 2:
+        return {"ok": False, "error": "Add a departure and a destination."}
+    if not notam_source.credentials_configured():
+        return {
+            "ok": False,
+            "error": (
+                f"NOTAMs need a SkyLink subscription on RapidAPI. Set "
+                f"{notam_source.RAPIDAPI_KEY_ENV} before starting the server."
+            ),
+            "needs_credentials": True,
+        }
+
+    try:
+        solved, _aircraft, _conditions = _build_from_request(request)
+    except (nl.RouteError, OutsideModelValidity) as exc:
+        return {"ok": False, "error": str(exc)}
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+
+    window = _route_window(solved.navlog, request.off_blocks)
+    if not window:
+        return {"ok": False, "error": "This route has no legs to search along."}
+
+    try:
+        found = notam_source.fetch_route(
+            [leg.span.start for leg in window] + [window[-1].span.end],
+            corridor_nm=request.notam_corridor_nm,
+            # The route's own fields go to the front of the queue, so the
+            # request cap can never cut the departure or the destination.
+            priority=tuple(
+                w.ident or w.name for w in request.waypoints if _is_airport(w)
+            ),
+        )
+    except notam_source.NotamsUnavailable as exc:
+        return {"ok": False, "error": str(exc)}
+
+    kept = nt.relevant(
+        found.notams,
+        window,
+        corridor_nm=request.notam_corridor_nm,
+        start=window[0].start,
+        end=window[-1].end,
+    )
+    return {
+        "ok": True,
+        # Both numbers, always. "4 NOTAMs" reads very differently once you
+        # know it came from 137 -- and a filter that is throwing away almost
+        # everything is one worth being able to see working.
+        "returned": len(found.notams),
+        "relevant": len(kept),
+        "corridor_nm": request.notam_corridor_nm,
+        # What SkyLink was asked about: the aerodromes and centres along the
+        # route, so a pilot can see which fields the briefing covers.
+        "designators": list(found.designators),
+        # A partial search is worth showing, and worth labelling. An empty
+        # NOTAM list is the most dangerous thing this endpoint can return.
+        "complete": found.complete,
+        "failed": list(found.failed),
+        "window": {
+            "start": None if window[0].start is None else window[0].start.isoformat(),
+            "end": None if window[-1].end is None else window[-1].end.isoformat(),
+        },
+        "notams": [_notam_json(entry) for entry in kept],
+    }
+
+
+def _route_window(log: nl.Navlog, off_blocks: datetime | None) -> list[nt.RouteWindow]:
+    """Where the flight goes, how high and when, one entry per navlog row.
+
+    Per row rather than per drawn leg, because the altitude is the whole point
+    of the vertical test: a climb out of a field covers the surface to 6,500
+    ft and the cruise after it covers only 6,500. Merged into one leg they
+    would together claim every altitude over the whole route.
+
+    Rows that cover no ground -- the taxi, the pattern -- have no track for a
+    corridor and are left out; the fields they happen at are the ends of the
+    legs either side of them.
+    """
+    window: list[nt.RouteWindow] = []
+    start = None if off_blocks is None else _utc(off_blocks)
+    for leg in log.legs:
+        if not leg.covers_ground:
+            continue
+        entry = leg.entry_altitude_ft
+        exit_ = leg.exit_altitude_ft
+        low = leg.altitude_ft if entry is None or exit_ is None else min(entry, exit_)
+        high = leg.altitude_ft if entry is None or exit_ is None else max(entry, exit_)
+        window.append(
+            nt.RouteWindow(
+                span=inverse(leg.from_position, leg.to_position),
+                lower_ft=low,
+                upper_ft=high,
+                start=(
+                    None
+                    if start is None
+                    else start
+                    + timedelta(minutes=leg.cumulative_ete_min - leg.ete_min)
+                ),
+                end=(
+                    None
+                    if start is None
+                    else start + timedelta(minutes=leg.cumulative_ete_min)
+                ),
+            )
+        )
+    return window
+
+
+def _notam_json(entry: nt.Relevance) -> dict:
+    one = entry.notam
+    return {
+        "key": one.key,
+        "number": one.number,
+        "location": one.location,
+        "text": one.text,
+        "priority": str(one.priority),
+        "distance_nm": None if entry.distance_nm is None else round(entry.distance_nm, 1),
+        "nearest_leg": entry.nearest_leg,
+        "lat": None if one.position is None else round(one.position.lat, 4),
+        "lon": None if one.position is None else round(one.position.lon, 4),
+        "radius_nm": one.radius_nm,
+        "lower_ft": one.lower_ft,
+        "upper_ft": one.upper_ft,
+        "effective_start": (
+            None if one.effective_start is None else one.effective_start.isoformat()
+        ),
+        "effective_end": (
+            None if one.effective_end is None else one.effective_end.isoformat()
+        ),
+        "permanent": one.permanent,
+        "estimated_end": one.estimated_end,
+        # Why it survived the filter, in the filter's own terms.
+        "reasons": list(entry.reasons),
+    }
+
+
+def _utc(moment: datetime) -> datetime:
+    return moment.replace(tzinfo=UTC) if moment.tzinfo is None else moment.astimezone(UTC)
+
+
 @app.post("/api/plan")
 def plan(request: PlanRequest) -> dict:
     """Build a navigation log for a route.
@@ -631,7 +850,8 @@ def plan(request: PlanRequest) -> dict:
         return {"ok": False, "error": "Add a departure and a destination."}
 
     try:
-        log, _aircraft, conditions = _build_from_request(request)
+        solved, _aircraft, conditions = _build_from_request(request)
+        log = solved.navlog
     except (nl.RouteError, OutsideModelValidity) as exc:
         return {"ok": False, "error": str(exc)}
     except ValueError as exc:
@@ -709,9 +929,48 @@ def plan(request: PlanRequest) -> dict:
             "reserve_required_gal": log.reserve_required_gal,
             "legal_on_fuel": log.is_legal_on_fuel,
         },
-        "warnings": list(log.warnings),
+        # The second of the two lists: the weather each leg the pilot drew was
+        # planned in, and which end of the leg it came from. Empty when
+        # nothing was fetched.
+        "weather": [_leg_weather_json(entry) for entry in solved.weather],
+        "weather_passes": solved.passes,
+        "weather_settled": solved.settled,
+        "warnings": list(log.warnings) + list(solved.notes),
         "text": nl.format_navlog(log),
     }
+
+
+def _leg_weather_json(entry: pw.LegWeather) -> dict:
+    def wind(value):
+        if value is None:
+            return None
+        return {
+            "from_deg": round(value.from_deg, 1),
+            "speed_kt": round(value.speed_kt, 1),
+        }
+
+    return {
+        "leg": entry.leg,
+        "from": entry.from_name,
+        "to": entry.to_name,
+        # "start" | "end" | "" -- which end of the leg the forecast came from.
+        "chosen": entry.chosen,
+        "valid_time": None if entry.valid_time is None else entry.valid_time.isoformat(),
+        # What each end was worth over this leg. The comparison that decided
+        # it, shown rather than asserted.
+        "start_fuel_gal": _finite(entry.start_fuel_gal),
+        "end_fuel_gal": _finite(entry.end_fuel_gal),
+        "start_wind": wind(entry.start_wind),
+        "end_wind": wind(entry.end_wind),
+        "note": entry.note,
+    }
+
+
+def _finite(value: float | None) -> float | None:
+    """JSON has no infinity, and an unflyable leg is reported as one anyway."""
+    if value is None or value != value or value in (float("inf"), float("-inf")):
+        return None
+    return round(value, 2)
 
 
 # What the UI can send as a waypoint's kind when it means "a field". The map
@@ -736,27 +995,43 @@ def _runways_for(waypoint: WaypointIn) -> tuple[pf.Runway, ...]:
         return ()
 
 
-def _wind_column(column: WindColumnIn) -> nl.WindColumn:
-    """One fetched column as the engine's own type.
+def _point_forecast(point: PointForecastIn) -> pw.PointForecast:
+    """One waypoint's fetched window as the engine's own type."""
+    return pw.PointForecast(
+        name=point.name,
+        position=LatLon(point.lat, point.lon),
+        hours=tuple(
+            pw.ForecastHour(
+                valid_time=hour.valid_time,
+                winds=_winds_aloft(hour),
+                temperatures=tuple(_aloft_temperature_samples(hour)),
+            )
+            for hour in point.hours
+        ),
+    )
 
-    Levels with half a wind are dropped rather than half-read: a direction
-    with no speed would interpolate as a calm from that bearing, which is a
-    claim about the air rather than the absence of one.
+
+def _winds_aloft(hour: ForecastHourIn) -> nl.WindsAloft:
+    """One hour's levels as a wind profile, keyed by geopotential height.
+
+    Height rather than pressure altitude: it is where the aeroplane actually
+    is. Levels with half a wind are dropped rather than half-read -- a
+    direction with no speed would interpolate as a calm from that bearing,
+    which is a claim about the air rather than the absence of one.
     """
-    layers = tuple(
-        (level.height_ft, nl.Wind(level.wind_from_deg, level.wind_speed_kt))
-        for level in column.levels
-        if level.height_ft is not None
-        and level.wind_from_deg is not None
-        and level.wind_speed_kt is not None
-    )
-    return nl.WindColumn(
-        position=LatLon(column.lat, column.lon), winds=nl.WindsAloft(layers)
+    return nl.WindsAloft(
+        tuple(
+            (level.height_ft, nl.Wind(level.wind_from_deg, level.wind_speed_kt))
+            for level in hour.levels
+            if level.height_ft is not None
+            and level.wind_from_deg is not None
+            and level.wind_speed_kt is not None
+        )
     )
 
 
-def _aloft_temperature_samples(column: WindColumnIn) -> list[nl.TemperatureSample]:
-    """The column's temperatures, keyed by the pressure altitude they are at.
+def _aloft_temperature_samples(hour: ForecastHourIn) -> list[nl.TemperatureSample]:
+    """The hour's temperatures, keyed by the pressure altitude they are at.
 
     No conversion, which is the point of the pressure-level frame: a field
     temperature has to be read through its station's altimeter setting before
@@ -765,7 +1040,7 @@ def _aloft_temperature_samples(column: WindColumnIn) -> list[nl.TemperatureSampl
     """
     return [
         nl.TemperatureSample(level.pressure_altitude_ft, level.isa_deviation_c)
-        for level in column.levels
+        for level in hour.levels
         if level.pressure_altitude_ft is not None and level.isa_deviation_c is not None
     ]
 
