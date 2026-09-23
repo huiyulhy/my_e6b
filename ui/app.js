@@ -1547,6 +1547,13 @@ function renderNavlog(plan) {
   plan.legs.forEach((leg, row) => {
     const tr = document.createElement('tr');
     if (leg.overridden.length) tr.classList.add('row-edited');
+    // A row whose performance was extrapolated. Marked on the row so the log
+    // itself shows where the totals stop being the book's, not only the
+    // checklist underneath it.
+    if (leg.extrapolated) {
+      tr.classList.add('row-extrapolated');
+      tr.title = (leg.off_chart || []).map((e) => e.detail).join('; ');
+    }
 
     // Taxi and the traffic pattern cost time and fuel without covering
     // ground, so they get a row -- the fuel column adds up to the total --
@@ -1728,8 +1735,14 @@ function renderChecklist(checklist) {
   block.hidden = false;
 
   const verdict = $('verdict');
-  verdict.textContent = checklist.is_go ? 'GO' : 'NO GO';
-  verdict.className = `verdict ${checklist.is_go ? 'go' : 'nogo'}`;
+  // Three states. "GO — EXTRAPOLATED" is still a go: every check passed, but
+  // some of the numbers behind it came from air the POH does not publish for
+  // that operating point, and a word that hid that would be the wrong word.
+  const extrapolated = checklist.is_go && checklist.all_from_the_book === false;
+  verdict.textContent = checklist.verdict
+    || (checklist.is_go ? 'GO' : 'NO GO');
+  verdict.className =
+    `verdict ${!checklist.is_go ? 'nogo' : extrapolated ? 'extrapolated' : 'go'}`;
 
   const ft = (v) => (v == null ? '—' : `${Math.round(v)}`);
   const mark = (p) => (p === true ? 'ok' : p === false ? 'short' : 'unknown');
@@ -1890,6 +1903,17 @@ function renderChecklist(checklist) {
     const div = document.createElement('div');
     div.className = 'alert unknown';
     div.textContent = `Unknown — ${reason}`;
+    body.appendChild(div);
+  }
+  // Last, under the verdict they qualify: these are not failures, they are the
+  // reason the word above may read GO with a qualifier on it. The ones that
+  // can read optimistic carry the caution colour; a conservative substitution
+  // errs long and is a note, not a warning.
+  for (const entry of checklist.extrapolations || []) {
+    const div = document.createElement('div');
+    div.className =
+      `alert ${entry.conservative ? 'extrapolated' : 'extrapolated-optimistic'}`;
+    div.textContent = `Extrapolated — ${entry.where}: ${entry.detail}`;
     body.appendChild(div);
   }
 }

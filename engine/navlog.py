@@ -505,6 +505,17 @@ class Leg:
     start_role: str | None = None
     end_role: str | None = None
 
+    # Chart cells this row was costed from that are not where the query asked
+    # -- a cruise reading taken at an equal density on a hot day, a level
+    # stretch below the bottom of the chart. Empty on a row read straight off
+    # the published page, which is the normal case. See `perf.OffChart`.
+    off_chart: tuple[perf.OffChart, ...] = ()
+
+    @property
+    def extrapolated(self) -> bool:
+        """Whether any number on this row came from off the chart."""
+        return bool(self.off_chart)
+
     @property
     def covers_ground(self) -> bool:
         """Whether this row is a leg flown along the route.
@@ -550,6 +561,22 @@ class Navlog:
     def is_legal_on_fuel(self) -> bool:
         """Whether the flight lands with its required VFR reserve intact."""
         return self.fuel_remaining_gal >= self.reserve_required_gal
+
+    @property
+    def extrapolated_legs(self) -> tuple[int, ...]:
+        """Row numbers, counting from 1, costed from off the chart."""
+        return tuple(i for i, leg in enumerate(self.legs, 1) if leg.extrapolated)
+
+    @property
+    def first_extrapolated_leg(self) -> int | None:
+        """The first such row, which is where a pilot starts reading.
+
+        Everything downstream of it inherits its error -- fuel and time are
+        cumulative -- so the row an off-chart reading first appears on is the
+        row from which the totals stop being the book's.
+        """
+        rows = self.extrapolated_legs
+        return rows[0] if rows else None
 
 
 # --- route geometry ------------------------------------------------------
@@ -792,6 +819,7 @@ def build_navlog(
             cumulative_fuel,
             margins,
             decimal_year,
+            legs,
         ),
     )
 
@@ -892,6 +920,35 @@ def _field_wind(waypoint: Waypoint, decimal_year: float) -> preflight.SurfaceWin
     )
 
 
+def _leg_off_chart(legs: list[Leg]) -> list[tuple[str, perf.OffChart]]:
+    """Every off-chart reading on the rows, one entry per distinct reading.
+
+    Grouped rather than listed row by row. A hot afternoon puts the same
+    substitution on every level row of the flight, and eleven copies of one
+    sentence buries the verdict it is qualifying. Each group names the row it
+    **first** appears on, because fuel and time are cumulative: that row is
+    where the totals stop being the book's, and everything after it inherits
+    the error whether or not it was read off-chart itself.
+    """
+    grouped: dict[perf.OffChart, tuple[int, Leg, int]] = {}
+    for number, leg in enumerate(legs, 1):
+        for entry in leg.off_chart:
+            if entry in grouped:
+                first, first_leg, count = grouped[entry]
+                grouped[entry] = (first, first_leg, count + 1)
+            else:
+                grouped[entry] = (number, leg, 1)
+
+    out: list[tuple[str, perf.OffChart]] = []
+    for entry, (number, leg, count) in grouped.items():
+        where = f"leg {number} ({leg.from_name} to {leg.to_name})"
+        if count > 1:
+            later = count - 1
+            where += f", and {later} later {'row' if later == 1 else 'rows'}"
+        out.append((where, entry))
+    return out
+
+
 def _build_checklist(
     flights: list[list[Waypoint]],
     aircraft: Aircraft,
@@ -900,6 +957,7 @@ def _build_checklist(
     burn_gal: float,
     margins: preflight.Margins,
     decimal_year: float,
+    legs: list[Leg] | None = None,
 ) -> preflight.GoNoGo:
     """Every takeoff and landing on the route, plus the fuel check.
 
@@ -961,7 +1019,9 @@ def _build_checklist(
         margin=margins.fuel,
         night=conditions.night,
     )
-    return preflight.summarise(checks, fuel)
+    return preflight.summarise(
+        checks, fuel, off_chart=_leg_off_chart(legs or [])
+    )
 
 
 def _split_at_landings(waypoints: list[Waypoint]) -> list[list[Waypoint]]:
@@ -1211,6 +1271,9 @@ def _build_flight(
         # A level row reads the cruise chart at its own altitude; a climb or a
         # descent has no cruise setting and keeps the flight's, which is only
         # used for its fuel flow.
+        # One collector per row, so the go/no-go can name the leg an off-chart
+        # reading happened on rather than only that one happened somewhere.
+        leg_off_chart: list[perf.OffChart] = []
         leg_cruise = _leg_cruise_point(
             override,
             phase=phase,
@@ -1223,6 +1286,7 @@ def _build_flight(
             default=cruise_point,
             leg_name=leg_name,
             warnings=warnings,
+            off_chart=leg_off_chart,
         )
         if phase == "cruise":
             tas = leg_cruise.ktas
@@ -1261,6 +1325,7 @@ def _build_flight(
                 conditions=conditions,
                 pressure_offset_ft=pressure_offset,
                 default=leg_cruise.gph,
+                off_chart=leg_off_chart,
             )
             if segment.level_minutes > 0
             else None
@@ -1317,6 +1382,12 @@ def _build_flight(
                 density_altitude_ft=density_altitude(leg_pressure_alt, leg_oat),
                 start_role=segment.start_role,
                 end_role=segment.end_role,
+                # Deduped: a row that reads the chart twice -- once for its own
+                # cruise, once for a level remainder -- hits the same
+                # substitution twice and it is one fact about the row.
+                off_chart=tuple(
+                    dict.fromkeys(leg_off_chart)
+                ),
             )
         )
 
@@ -1431,6 +1502,7 @@ def _cruise_point_at(
     conditions: Conditions,
     default: perf.CruisePoint,
     pressure_offset_ft: float = 0.0,
+    off_chart: list[perf.OffChart] | None = None,
 ) -> perf.CruisePoint:
     """The cruise chart at one altitude, or the flight's entry if unreadable.
 
@@ -1447,28 +1519,55 @@ def _cruise_point_at(
     route-wide altimeter setting, not the number itself.
     """
     floor, ceiling = perf.cruise_altitude_range()
-    pressure_alt = min(
-        max(
-            conditions.pressure_altitude_ft(indicated_altitude_ft)
-            + pressure_offset_ft,
-            floor,
-        ),
-        ceiling,
-    )
+    asked = conditions.pressure_altitude_ft(indicated_altitude_ft) + pressure_offset_ft
+    pressure_alt = min(max(asked, floor), ceiling)
+    if off_chart is not None and pressure_alt != asked:
+        off_chart.append(
+            perf.OffChart(
+                what="cruise altitude",
+                detail=(
+                    f"a pressure altitude of {asked:.0f} ft is outside the cruise "
+                    f"chart's {floor:.0f} to {ceiling:.0f} ft range; read at "
+                    f"{pressure_alt:.0f} ft"
+                ),
+                # Below the floor the engine makes more power than the page
+                # shows, so the fuel flow reads low; above the ceiling it makes
+                # less. Only the first can happen to a 172 in practice, and it
+                # is the direction that flatters the reserve.
+                conservative=asked > ceiling,
+            )
+        )
     isa_dev = _isa_deviation_at(conditions, indicated_altitude_ft)
     try:
         # Read at an equal density where the day is off the chart's temperature
         # band, which down in the pattern on a hot afternoon it often is. A
         # reading from the published grid beats the fallback below, and the
         # fallback is still there for when even that has nothing to offer.
-        return perf.cruise_at_density(
+        lookup = perf.cruise_at_density(
             pressure_alt,
             aircraft.cruise_rpm,
             isa_temperature_c(pressure_alt) + isa_dev,
-        ).point
+        )
+        if off_chart is not None:
+            off_chart.extend(lookup.off_chart)
+        return lookup.point
     except perf.OutsidePOHEnvelope:
         # The RPM is not published this low, or the day is off the chart. The
-        # flight's own setting is a better answer than no plan at all.
+        # flight's own setting is a better answer than no plan at all -- but it
+        # is the flight's setting standing in for this row's, which is exactly
+        # the kind of substitution the verdict has to hear about.
+        if off_chart is not None:
+            off_chart.append(
+                perf.OffChart(
+                    what="cruise setting",
+                    detail=(
+                        f"the POH publishes no cruise reading at "
+                        f"{pressure_alt:.0f} ft and ISA{isa_dev:+.0f}; costed at "
+                        f"the flight's own cruise fuel flow instead"
+                    ),
+                    conservative=False,
+                )
+            )
         return default
 
 
@@ -1859,8 +1958,14 @@ def _leg_cruise_point(
     default: perf.CruisePoint,
     leg_name: str,
     warnings: list[str],
+    off_chart: list[perf.OffChart] | None = None,
 ) -> perf.CruisePoint:
     """The cruise chart entry one row is flown at.
+
+    `off_chart` collects any reading taken from beside the query rather than
+    at it, the same way `warnings` collects prose. The prose is for the pilot
+    reading the log; these are for the go/no-go, which has to say whether the
+    verdict rests on published numbers without parsing sentences to find out.
 
     A cross-country is flown at **one power setting**: the RPM is the aircraft's
     throughout, and a row only departs from it by carrying an explicit
@@ -1911,6 +2016,7 @@ def _leg_cruise_point(
                 conditions=conditions,
                 default=default,
                 pressure_offset_ft=pressure_offset_ft,
+                off_chart=off_chart,
             )
         return default
 
@@ -1938,6 +2044,21 @@ def _leg_cruise_point(
             f"cruise chart. Read at {floor:.0f} ft, which under-reads the fuel "
             f"flow slightly."
         )
+        if off_chart is not None:
+            off_chart.append(
+                perf.OffChart(
+                    what="cruise altitude",
+                    detail=(
+                        f"level at a pressure altitude of {pressure_alt:.0f} ft, "
+                        f"below the {floor:.0f} ft bottom of the cruise chart; "
+                        f"read at {floor:.0f} ft, where the engine makes less "
+                        f"power than it really will, so the fuel flow reads low"
+                    ),
+                    # Under-reading fuel flow is the wrong direction to be
+                    # wrong in: it makes the reserve look better than it is.
+                    conservative=False,
+                )
+            )
         pressure_alt = floor
 
     def read(setting: float) -> perf.CruisePoint:
@@ -1951,6 +2072,8 @@ def _leg_cruise_point(
         """
         lookup = perf.cruise_at_density(pressure_alt, setting, oat_c)
         if lookup.substituted:
+            if off_chart is not None:
+                off_chart.extend(lookup.off_chart)
             warnings.append(
                 f"leg {leg_name} is level at a pressure altitude of "
                 f"{pressure_alt:.0f} ft and ISA"
@@ -2121,6 +2244,7 @@ def _worst_level_gph(
     conditions: Conditions,
     default: float,
     pressure_offset_ft: float = 0.0,
+    off_chart: list[perf.OffChart] | None = None,
 ) -> float:
     """The thirstiest level fuel flow the POH admits to at this altitude.
 
@@ -2134,16 +2258,38 @@ def _worst_level_gph(
     setting, not the number itself.
     """
     floor, ceiling = perf.cruise_altitude_range()
-    pressure_alt = min(
-        max(conditions.pressure_altitude_ft(altitude_ft) + pressure_offset_ft, floor),
-        ceiling,
-    )
+    asked = conditions.pressure_altitude_ft(altitude_ft) + pressure_offset_ft
+    pressure_alt = min(max(asked, floor), ceiling)
+    if off_chart is not None and pressure_alt != asked:
+        off_chart.append(
+            perf.OffChart(
+                what="level stretch altitude",
+                detail=(
+                    f"a level stretch at a pressure altitude of {asked:.0f} ft is "
+                    f"outside the cruise chart's {floor:.0f} to {ceiling:.0f} ft "
+                    f"range; costed at {pressure_alt:.0f} ft"
+                ),
+                conservative=asked > ceiling,
+            )
+        )
     isa_dev = _isa_deviation_at(conditions, altitude_ft)
     try:
         return perf.max_published_cruise(
             pressure_alt, isa_temperature_c(pressure_alt) + isa_dev
         ).gph
     except perf.OutsidePOHEnvelope:
+        if off_chart is not None:
+            off_chart.append(
+                perf.OffChart(
+                    what="level stretch setting",
+                    detail=(
+                        f"the POH publishes no cruise setting at "
+                        f"{pressure_alt:.0f} ft and ISA{isa_dev:+.0f}; the level "
+                        f"stretch is costed at the flight's own fuel flow"
+                    ),
+                    conservative=False,
+                )
+            )
         return default
 
 
@@ -2186,8 +2332,12 @@ def format_navlog(navlog: Navlog) -> str:
             wind = f"*{wind}"
         from_label = leg_label(leg.from_name, leg.start_role)
         to_label = leg_label(leg.to_name, leg.end_role)
+        # A plus marks a row whose performance was extrapolated, for the same
+        # reason the star marks an edited one: a printed log must not pass
+        # either off as the book.
+        phase = f"{leg.phase}+" if leg.extrapolated else leg.phase
         lines.append(
-            f"{from_label:<10}{to_label:<10}{leg.phase:<8}"
+            f"{from_label:<10}{to_label:<10}{phase:<8}"
             f"{leg.altitude_ft:>6.0f}{leg.true_course_deg:>6.0f}"
             f"{leg.wind_correction_angle_deg:>+6.1f}{leg.true_heading_deg:>6.0f}"
             f"{leg.variation_deg:>+6.1f}{leg.magnetic_heading_deg:>6.0f}"
@@ -2201,6 +2351,17 @@ def format_navlog(navlog: Navlog) -> str:
         f"{navlog.total_time_min:>6.1f}{navlog.total_fuel_gal:>6.1f}"
         f"{navlog.fuel_remaining_gal:>6.1f}"
     )
+    first_extrapolated = navlog.first_extrapolated_leg
+    if first_extrapolated is not None:
+        lines.append("")
+        lines.append(
+            f"+ marks a row whose performance was extrapolated -- the POH "
+            f"publishes nothing at that row's pressure altitude and "
+            f"temperature. The first is row {first_extrapolated}; time and fuel "
+            f"are cumulative, so every total from that row on carries the "
+            f"extrapolation with it. The go/no-go below lists each one and "
+            f"which way it errs."
+        )
     if navlog.warnings:
         lines.append("")
         lines.extend(f"WARNING: {w}" for w in navlog.warnings)

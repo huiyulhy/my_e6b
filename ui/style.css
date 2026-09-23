@@ -371,6 +371,19 @@ tr.row-ground td.num:nth-last-child(3) { color: var(--ink); }
   padding: 2px 10px; border-radius: 999px; letter-spacing: 0.06em; }
 .verdict.go { background: rgba(126, 224, 129, 0.16); color: var(--ok); }
 .verdict.nogo { background: rgba(255, 123, 114, 0.16); color: var(--warn); }
+/* A go, but not one read entirely off the chart. Amber rather than green:
+   the answer is yes and the reader still owes the list underneath it a look. */
+.verdict.extrapolated { background: rgba(230, 180, 80, 0.18); color: #e6b450; }
+
+/* A navlog row whose performance was extrapolated. The left edge only: the
+   row is still a real row with real numbers, they just did not all come off
+   the page. */
+#navlog tr.row-extrapolated td:first-child { border-left: 2px solid #e6b450; }
+
+/* Extrapolations, under the blockers they are not. The conservative ones are
+   quiet; the ones that can read optimistic carry the caution colour. */
+.alert.extrapolated { border-left-color: #e6b450; color: var(--ink-dim); }
+.alert.extrapolated-optimistic { border-left-color: #e6b450; color: #e6b450; }
 
 .check { margin: 12px 0; }
 .check-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }

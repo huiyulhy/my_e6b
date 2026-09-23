@@ -1,13 +1,13 @@
-AIS subscriber files effective date August 06, 2026.
+AIS subscriber files effective date September 03, 2026.
 
 Dear Subscribers,
 
-For the August 06, 2026 subscriber files, the files incorporate data 
+For the September 03, 2026 subscriber files, the files incorporate data 
 published in the daily National Flight Data Digest (NFDD) through
  
-    NFDD 128 dated 07/07/2026.  
+    NFDD 147 dated 08/03/2026.  
 
-The August 06, 2026 cycle is a 28 Day Change Notice Cycle subscriber set. 
+The September 03, 2026 cycle is a 28 Day Change Notice Cycle subscriber set. 
 
 By FAA policy and order, some NASR resources, generally categorized as 
 "Enroute", are only updated on a 56 day charting basis. The following legacy 
@@ -40,12 +40,12 @@ DATUM
     reference NAD 83.
 
 -------------------------------------------------------------------------------
-COMING FORMAT CHANGES:
+FORMAT CHANGES:
 
-    NOTE: An enhancement to the NASR database to incorporate the following  
-    format changes is scheduled for release effective for the 
-    03 September 2026 AIRAC cycle. Test TXT NASR subscriber files are now 
-    available to Users and can be accessed at the following link: 
+    NOTE: An enhancement was made to the NASR database to incorporate the 
+    following format changes effective for the 03 September 2026 AIRAC cycle. 
+    Test TXT NASR subscriber files are available to Users and can be accessed 
+    at the following link: 
     https://www.faa.gov/air_traffic/flight_info/aeronav/aero_data/
     NASR_Subscription/ .
     A Data Product Notice (DPN) has been issued that further describes the 
@@ -56,19 +56,18 @@ COMING FORMAT CHANGES:
 
 AIRPORT (APT.txt) PAVEMENT CLASSIFICATION FIELD CHANGE
 
-    Software changes to incorporate Pavement Classification Rating (PCR) in 
-    the APT.txt NASR Subscriber File are currently scheduled for release 
-    effective for the 03 September 2026 AIRAC cycle. A new 
-    “PAVEMENT CLASSIFICATION” column will be added to the APT.txt subscriber 
-    file which will denote either “PCN” or “PCR”. With the transition towards 
-    utilizing the PCR method for rating the strength of an airport runway, 
-    the current PCN fields will reflect either PCN values or PCR values 
-    (but not both), or null. For PCN or PCR, the PCN/PCR number is concatenated 
-    with the Pavement type, Subgrade Strength, Tire Pressure, and Evaluation 
-    Method. Since PCR Number allows for up to 4 characters, the PCN/PCR Number 
-    field will increase from 3 characters to 4 characters. Initial 
-    population of the new "PAVEMENT CLASSIFICATION" data field has yet to 
-    be determined. Therefore, the current practice of displaying PCN values 
+    Software changes were made to incorporate Pavement Classification Rating 
+    (PCR) in the APT.txt NASR Subscriber File effective for the 03 September 
+    2026 AIRAC cycle. A new “PAVEMENT CLASSIFICATION” column was added to the 
+    APT.txt subscriber file which denotes either “PCN” or “PCR”. With the 
+    transition towards utilizing the PCR method for rating the strength of an 
+    airport runway, the current PCN fields will reflect either PCN values or 
+    PCR values (but not both), or null. For PCN or PCR, the PCN/PCR number is 
+    concatenated with the Pavement type, Subgrade Strength, Tire Pressure, 
+    and Evaluation Method. Since PCR Number allows for up to 4 characters, 
+    the PCN/PCR Number field will increase from 3 characters to 4 characters. 
+    Initial population of the new "PAVEMENT CLASSIFICATION" data field has yet 
+    to be determined. Therefore, the current practice of displaying PCN values 
     in the data fields and PCR values in a reference remark may continue 
     after the deployment of the NASR enhancement until the fields can be 
     properly populated and the reference remarks removed.
@@ -76,44 +75,37 @@ AIRPORT (APT.txt) PAVEMENT CLASSIFICATION FIELD CHANGE
 
 AIRWAY (ATS.txt, AWY.txt) MEA GAP COLUMN ADDED
 
-    Software changes to include an MEA GAP column in the AWY.txt and ATS.txt 
-    files are scheduled for release effective for the 03 September 2026 AIRAC 
-    cycle. Currently, when the MEA GAP field for a segment is "UNUSABLE", a 
-    reference remark of "UNUSABLE" is added. A new MEA GAP column will be added 
-    to AWY.txt and ATS.txt that contains "N" for 'No MEA', "U" for "UNUSABLE", 
-    or null. Similar to the MEA Value, the value for this field will be entered 
-    on each segment until the Next MEA Point is reached.
+    Software changes were made to include an MEA GAP column in the AWY.txt 
+    and ATS.txt files effective for the 03 September 2026 AIRAC cycle. 
+    Currently, when the MEA GAP field for a segment is "UNUSABLE", a 
+    reference remark of "UNUSABLE" is added. A new MEA GAP column was added 
+    to AWY.txt and ATS.txt that contains "N" for 'No MEA', "U" for 
+    "UNUSABLE", or null. Similar to the MEA Value, the value for this field 
+    will be entered on each segment until the Next MEA Point is reached.
 
 ATS NON-REGULATORY AIRWAYS (ATS.txt) ATS AIRWAY DESIGNATION ADDITION
 
-    A new ATS Airway Designation in the ATS.txt NASR Subscriber File is 
-    planned for release effective for the 03 September 2026 AIRAC cycle. 
-    SP = SPECIAL ROUTE Designation and description will be added to the 
-    ATS.txt Subscriber File. "Special, non-regulatory (non-Part 95) ZK Routes 
-    are low-level, IFR, performance-based (RNAV) navigation routes primarily 
-    used by Helicopter Air Ambulance operators. They are not included on 
-    public charts. You may not file or use these routes without approval from 
-    FAA Flight Standards. These Special airways will be updated on a 56-day 
-    cycle.".
+    A new ATS Airway Designation was added to the ATS.txt NASR Subscriber 
+    File effective for the 03 September 2026 AIRAC cycle. SP = SPECIAL ROUTE 
+    Designation and description was added to the ATS.txt Subscriber File. 
+    "Special, non-regulatory (non-Part 95) ZK Routes are low-level, IFR, 
+    performance-based (RNAV) navigation routes primarily used by Helicopter 
+    Air Ambulance operators. They are not included on public charts. You may 
+    not file or use these routes without approval from FAA Flight Standards. 
+    These Special airways will be updated on a 56-day cycle.".
 
 FIX (FIX.txt) NEW CHARTING TYPE
 
-    A new ATS Airway Designation in the ATS.txt NASR Subscriber File is 
-    planned for release effective for the 03 September 2026 AIRAC cycle. 
-    SP = SPECIAL ROUTE Designation and description will be added to the 
-    ATS.txt Subscriber File. "Special, non-regulatory (non-Part 95) ZK Routes 
-    are low-level, IFR, performance-based (RNAV) navigation routes primarily 
-    used by Helicopter Air Ambulance operators. They are not included on 
-    public charts. You may not file or use these routes without approval from 
-    FAA Flight Standards. These Special airways will be updated on a 56-day 
-    cycle.". Fixes that are part of these routes will be denoted with a 
-    "SPECIAL ENROUTE" charting type.
+    Fixes that are part of an airway with a "SPECIAL ROUTE" Designation in 
+    ATS.txt (see ATS AIRWAY DESIGNATION ADDITION above) will be denoted with 
+    a "SPECIAL ENROUTE" charting type in the FIX.txt subscriber file effective
+    for the 03 September 2026 AIRAC cycle.
 
 PREFERRED ROUTES (PFR.txt) INCR. DESIGNATOR, DESCRIPTION, & AIRCRAFT FLD SIZE
 
    Software changes to increase the field size of the "Designator" field, 
    the “Special Area Description” field, and the "Aircraft" field for all PFR 
-   route types in the PFR.txt NASR Subscriber File are planned for release 
+   route types in the PFR.txt NASR Subscriber File were applied to NASR  
    effective for the 03 September 2026 AIRAC cycle. In the Designator field, 
    the number of characters allowed will increase from 5 characters to 16 
    characters. The “Special Area Description” field will increase from 75 
@@ -123,7 +115,7 @@ PREFERRED ROUTES (PFR.txt) INCR. DESIGNATOR, DESCRIPTION, & AIRCRAFT FLD SIZE
 PREFERRED ROUTES (PFR.txt) RENAME HSD/LSD PREFERRED ROUTE TYPES
 
     A software change to rename the "HSD" and "LSD" Preferred Route types 
-    in the PFR.txt NASR Subscriber File is planned for release effective for 
+    in the PFR.txt NASR Subscriber File was made in NASR effective for 
     the 03 September 2026 AIRAC cycle. The code and description for the "HSD" 
     and "LSD" Preferred Route types will change. The High Altitude Single 
     Direction Preferred Routes (HSD) and Low Altitude Single Direction 
@@ -150,10 +142,10 @@ SUNSETTING OF LEGACY .TXT SUBSCRIBER FILES
     available. A Legacy TXT to CSV Mapping Document is available for download 
     via the main 28-Day Subscription page to ease transition.
 
-    NOTE: An enhancement to the NASR database is scheduled for release effective 
-    for the 03 September 2026 AIRAC cycle. After this next NASR release, .txt 
-    subscriber files will no longer contain new data entrants in NASR. New data 
-    entrants will be available only in .csv subscriber files. 
+    NOTE: An enhancement to the NASR database was released effective for the 
+    03 September 2026 AIRAC cycle. After this NASR release, .txt subscriber 
+    files will no longer contain new data entrants in NASR. New data entrants 
+    will be available only in .csv subscriber files. 
 
 AIRWAY DYNAMIC MAGNETIC VARIATION (ATS.txt, AWY.txt)
 
@@ -203,8 +195,8 @@ ATS NON-REGULATORY AIRWAYS (ATS.txt) PREFERRED DIRECTION INFORMATION
     Single Direction) preferred route.
 
     NOTE: In order to maintain consistency in NASR all references, titles, and 
-    headings to SINGLE DIRECTION will be removed and or retitled to 
-    indicate PREFERRED DIRECTION in a future release. 
+    headings to SINGLE DIRECTION was removed effective for 03 September 2026 
+    and retitled to indicate PREFERRED DIRECTION in the latest NASR release. 
 
 AIRPORT (APT.txt) NEW FUEL TYPES
 

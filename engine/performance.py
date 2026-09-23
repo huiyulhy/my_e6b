@@ -66,6 +66,25 @@ MAX_DEMONSTRATED_CROSSWIND_KT = 15.0
 MAX_CHART_TAILWIND_KT = 10.0
 MAX_CHART_HEADWIND_KT = 30.0
 
+# How far outside the cruise chart's published temperature columns a reading
+# may be taken before it counts as an extrapolation.
+#
+# The chart prints three columns per altitude page -- ISA-20, ISA, ISA+20 --
+# so a query inside ISA +/-20 is read straight off it and is not in question.
+# Outside that band there is no column, and `cruise_at_density` finds the same
+# air somewhere else on the chart instead. That reading is still taken from
+# published cells, but it is not the cell the query asked for, and past some
+# distance from the printed band it stops being a reading of this operating
+# point at all.
+#
+# Zero, deliberately: the line sits exactly at the chart's edge, so anything
+# needing the density substitution at all is an extrapolation. A positive
+# value would allow that much slop either side before the label applies --
+# treating ISA+22 as close enough to the printed ISA+20 column -- which is a
+# judgement about how far a reading may travel before it stops describing
+# this operating point, and not one to make silently.
+CRUISE_ISA_TOLERANCE_C = 0.0
+
 # Taxi takeoff fuel consumption (based on POH)
 START_TAXI_TAKEOFF_FUEL_GAL = 1.4
 
@@ -74,12 +93,53 @@ class OutsidePOHEnvelope(ValueError):
 
 # --- result types --------------------------------------------------------
 
+
+@dataclass(frozen=True)
+class OffChart:
+    """One reading the POH does not publish, and what was read instead.
+
+    Nothing in this module extrapolates -- a query past the edge of a chart is
+    refused, not projected. But refusing everything would fail ordinary days
+    for ordinary reasons: a high-pressure morning at a sea-level field is below
+    the bottom row of every takeoff chart, and a hot afternoon is off the right
+    of the cruise chart's temperature band. Where a *published* cell can stand
+    in for the query, one is read and this records that it happened.
+
+    `conservative` is the field that decides what a caller should do about it.
+    True means the substitute errs on the safe side -- it reads a longer
+    ground roll, or a lower rate of climb, than the aeroplane will actually
+    deliver -- and a plan built on it is still a plan you can fly. False means
+    the substitute errs the other way, or is an approximation with error in
+    both directions, and the number is optimistic or merely close: that is the
+    kind that has to reach the pilot before the go/no-go is read as a "GO".
+    """
+
+    what: str  # short label, e.g. "pressure altitude"
+    detail: str  # a sentence a pilot can act on
+    conservative: bool
+
+
 @dataclass(frozen=True)
 class GroundDistance:
     """A takeoff or landing distance pair, in feet."""
 
     ground_roll_ft: float
     total_over_50ft_ft: float
+
+    # Every cell that was read from somewhere other than where the query
+    # asked. Empty is the normal case and means the whole reading is straight
+    # off the published chart.
+    off_chart: tuple[OffChart, ...] = ()
+
+    @property
+    def extrapolated(self) -> bool:
+        """Whether any part of this distance came from off the chart."""
+        return bool(self.off_chart)
+
+    @property
+    def optimistic(self) -> bool:
+        """Whether any substitution errs on the unsafe side."""
+        return any(not entry.conservative for entry in self.off_chart)
 
 
 @dataclass(frozen=True)
@@ -402,8 +462,21 @@ def _chart_pressure_altitude(pressure_altitude_ft: float) -> float:
     Reading sea level understates all of it, which is the conservative side, so
     unlike the cruise chart's 2000 ft floor this needs no warning: that one
     clamps in the direction that flatters the fuel flow, and says so.
+
+    Conservative, but still not what was asked for, so it comes back with an
+    `OffChart` saying so rather than passing for a published reading.
     """
-    return max(0.0, pressure_altitude_ft)
+    if pressure_altitude_ft >= 0.0:
+        return pressure_altitude_ft, None
+    return 0.0, OffChart(
+        what="pressure altitude",
+        detail=(
+            f"a pressure altitude of {pressure_altitude_ft:.0f} ft is below the "
+            f"bottom row of the chart; read at sea level, where the air is "
+            f"thinner than it really is, so the distance errs long"
+        ),
+        conservative=True,
+    )
 
 
 def _select_weight(axis: np.ndarray, weight_lb: float | None) -> float:
@@ -445,17 +518,20 @@ def takeoff_distance(
         raise TypeError("pressure_altitude_ft and oat_c are required")
     t = _tables(data_dir)
     chart_weight = _select_weight(t.takeoff_roll.axes[0], weight_lb)
-    point = (chart_weight, _chart_pressure_altitude(pressure_altitude_ft), oat_c)
+    chart_alt, floored = _chart_pressure_altitude(pressure_altitude_ft)
+    point = (chart_weight, chart_alt, oat_c)
     roll = _call(t.takeoff_roll, point, "takeoff ground roll")
     over = _call(t.takeoff_50, point, "takeoff distance over 50 ft")
-    roll, over = _apply_wind(roll, over, headwind_kt)
+    roll, over, capped = _apply_wind(roll, over, headwind_kt)
     if dry_grass:
         # The correction is a percentage of the ground roll, and it applies to
         # the over-50 ft figure as the same number of feet.
         penalty = 0.15 * roll
         roll += penalty
         over += penalty
-    return GroundDistance(roll, over)
+    return GroundDistance(
+        roll, over, off_chart=tuple(e for e in (floored, capped) if e is not None)
+    )
 
 
 def landing_distance(
@@ -469,18 +545,23 @@ def landing_distance(
     """Short-field landing distance, flaps 30, at 2550 lb.
     """
     t = _tables(data_dir)
-    point = (_chart_pressure_altitude(pressure_altitude_ft), oat_c)
+    chart_alt, floored = _chart_pressure_altitude(pressure_altitude_ft)
+    point = (chart_alt, oat_c)
     roll = _call(t.landing_roll, point, "landing ground roll")
     over = _call(t.landing_50, point, "landing distance over 50 ft")
-    roll, over = _apply_wind(roll, over, headwind_kt)
+    roll, over, capped = _apply_wind(roll, over, headwind_kt)
     if dry_grass:
         penalty = 0.45 * roll
         roll += penalty
         over += penalty
-    return GroundDistance(roll, over)
+    return GroundDistance(
+        roll, over, off_chart=tuple(e for e in (floored, capped) if e is not None)
+    )
 
 
-def _apply_wind(roll: float, over: float, headwind_kt: float) -> tuple[float, float]:
+def _apply_wind(
+    roll: float, over: float, headwind_kt: float
+) -> tuple[float, float, OffChart | None]:
     """POH wind corrections, shared by the takeoff and landing charts. (based on 172s)
     1. Add 15% of takeoff for dry grass
     2. Subtract 10% per 9 kts of headwind, add 10% per 2 kts of tailwind
@@ -495,13 +576,24 @@ def _apply_wind(roll: float, over: float, headwind_kt: float) -> tuple[float, fl
             f"tailwind of {-headwind_kt:.0f} kt is beyond the "
             f"{MAX_CHART_TAILWIND_KT:.0f} kt the chart corrects for"
         )
-    headwind_kt = min(headwind_kt, MAX_CHART_HEADWIND_KT)
+    capped: OffChart | None = None
+    if headwind_kt > MAX_CHART_HEADWIND_KT:
+        capped = OffChart(
+            what="headwind",
+            detail=(
+                f"a headwind of {headwind_kt:.0f} kt is past the "
+                f"{MAX_CHART_HEADWIND_KT:.0f} kt the chart corrects for; credited "
+                f"at {MAX_CHART_HEADWIND_KT:.0f} kt, so the distance errs long"
+            ),
+            conservative=True,
+        )
+        headwind_kt = MAX_CHART_HEADWIND_KT
     if headwind_kt >= 0:
         factor = 1.0 - 0.10 * (headwind_kt / 9.0)
     else:
         factor = 1.0 + 0.10 * (-headwind_kt / 2.0)
     factor = max(factor, 0.0)
-    return roll * factor, over * factor
+    return roll * factor, over * factor, capped
 
 
 def climb_rate(
@@ -509,7 +601,11 @@ def climb_rate(
 ) -> ClimbRate:
     """Maximum rate of climb at gross weight, from POH Section 5."""
     t = _tables(data_dir)
-    chart_alt = _chart_pressure_altitude(pressure_altitude_ft)
+    # The floor's own `OffChart` is dropped here: below sea level the aeroplane
+    # out-climbs the bottom row, so the reading is conservative in the only
+    # direction a climb matters, and `ClimbRate` has no caller that carries a
+    # record. Takeoff, landing and cruise, which do, keep theirs.
+    chart_alt, _ = _chart_pressure_altitude(pressure_altitude_ft)
     fpm = _call(t.climb_rate, (chart_alt, oat_c), "climb rate")
     kias = _call(t.climb_kias, (chart_alt,), "climb speed")
     return ClimbRate(fpm, kias)
@@ -543,8 +639,8 @@ def climb_from_to(
     # still a caller error rather than two clamped altitudes quietly agreeing.
     if to_pressure_altitude_ft < from_pressure_altitude_ft:
         raise ValueError("climb segment must end above where it starts")
-    bottom = _chart_pressure_altitude(from_pressure_altitude_ft)
-    top = _chart_pressure_altitude(to_pressure_altitude_ft)
+    bottom, _ = _chart_pressure_altitude(from_pressure_altitude_ft)
+    top, _ = _chart_pressure_altitude(to_pressure_altitude_ft)
     t = _tables(data_dir)
     kias = 0.5 * (
         _call(t.climb_table_kias, (bottom,), "climb speed")
@@ -704,11 +800,79 @@ class CruiseLookup:
     pressure_altitude_ft: float
     oat_c: float
     substituted: bool
+    # What was actually asked for. Carried so the reading can describe itself
+    # without the caller having to hold on to the query to make sense of it --
+    # and because "ISA+27 was read at ISA+0" is the whole story, and only half
+    # of it lives in the fields above.
+    asked_pressure_altitude_ft: float = 0.0
+    asked_oat_c: float = 0.0
+
+    @property
+    def asked_isa_deviation_c(self) -> float:
+        """How far off standard the query itself was."""
+        return self.asked_oat_c - isa_temperature_c(self.asked_pressure_altitude_ft)
 
     @property
     def isa_deviation_c(self) -> float:
         """How far off standard the page it was read at is."""
         return self.oat_c - isa_temperature_c(self.pressure_altitude_ft)
+
+    @property
+    def extrapolated(self) -> bool:
+        """Whether this reading is an extrapolation of the cruise chart.
+
+        The chart prints ISA-20, ISA and ISA+20 at each altitude. A query
+        inside that band is read off the page it belongs to. Outside it there
+        is no column for this operating point, and what came back is the same
+        *density* found elsewhere on the chart -- a different pressure
+        altitude and a different temperature, chosen because the air matches.
+
+        That is an extrapolation of the chart in the sense that matters: the
+        POH does not publish this aeroplane's cruise performance at this
+        pressure altitude and this temperature, and the number standing in for
+        it was measured somewhere else. `CRUISE_ISA_TOLERANCE_C` sets how far
+        past the printed columns that judgement waits.
+        """
+        if not self.substituted:
+            return False
+        low, high = cruise_extrapolation_band()
+        return not low - 1e-9 <= self.asked_isa_deviation_c <= high + 1e-9
+
+    @property
+    def off_chart(self) -> tuple[OffChart, ...]:
+        """The extrapolation, in the vocabulary the rest of the plan uses.
+
+        Marked `conservative=False`. Not because the equal-density reading is
+        careless -- every number still comes from inside the published grid --
+        but because its error runs both ways: about 1% on fuel flow and true
+        airspeed, in either direction, with a step of up to that much at the
+        seam. An approximation that can read a plan *better* than it will fly
+        is one the pilot is entitled to see before treating the answer as the
+        book's.
+
+        Empty for a substitution inside the tolerance: the reading was taken
+        beside the query, but close enough to the printed column that calling
+        it an extrapolation would cry wolf.
+        """
+        if not self.extrapolated:
+            return ()
+        return (
+            OffChart(
+                what="cruise temperature",
+                detail=(
+                    f"the POH publishes no cruise performance at "
+                    f"{self.asked_pressure_altitude_ft:.0f} ft and "
+                    f"ISA{self.asked_isa_deviation_c:+.0f} -- the chart's "
+                    f"columns run ISA{cruise_isa_band()[0]:+.0f} to "
+                    f"ISA{cruise_isa_band()[1]:+.0f}. Extrapolated from "
+                    f"{self.pressure_altitude_ft:.0f} ft and "
+                    f"ISA{self.isa_deviation_c:+.0f}, the nearest published air "
+                    f"of the same density ({self.density_altitude_ft:.0f} ft), "
+                    f"which agrees to about 1% on fuel flow and true airspeed"
+                ),
+                conservative=False,
+            ),
+        )
 
 
 def cruise_density_range(
@@ -793,6 +957,8 @@ def cruise_at_density(
             pressure_altitude_ft=pressure_altitude_ft,
             oat_c=oat_c,
             substituted=False,
+            asked_pressure_altitude_ft=pressure_altitude_ft,
+            asked_oat_c=oat_c,
         )
 
     alts = table.altitudes
@@ -807,6 +973,8 @@ def cruise_at_density(
             pressure_altitude_ft=density_alt,
             oat_c=equivalent_oat,
             substituted=True,
+            asked_pressure_altitude_ft=pressure_altitude_ft,
+            asked_oat_c=oat_c,
         )
 
     # 3. Off the top or the bottom: the highest page whose band still covers
@@ -832,6 +1000,8 @@ def cruise_at_density(
                 pressure_altitude_ft=page_alt,
                 oat_c=equivalent_oat,
                 substituted=True,
+                asked_pressure_altitude_ft=pressure_altitude_ft,
+                asked_oat_c=oat_c,
             )
 
     pages = cruise_density_pages(data_dir=data_dir)
@@ -861,6 +1031,26 @@ def max_published_cruise(
             f"the POH publishes no cruise setting at {pressure_altitude_ft:g} ft"
         )
     return cruise(pressure_altitude_ft, max(usable), oat_c, data_dir=data_dir)
+
+
+def cruise_isa_band(data_dir: Path | None = None) -> tuple[float, float]:
+    """The ISA deviations the cruise chart prints columns for.
+
+    Read off the digitized data rather than written down, so a re-digitized
+    chart with more columns widens the band instead of silently disagreeing
+    with a constant nobody updated.
+    """
+    devs = _tables(data_dir).cruise.isa_devs
+    return float(devs[0]), float(devs[-1])
+
+
+def cruise_extrapolation_band(data_dir: Path | None = None) -> tuple[float, float]:
+    """The band outside which a cruise reading counts as an extrapolation.
+
+    The published columns, plus `CRUISE_ISA_TOLERANCE_C` of slop either side.
+    """
+    low, high = cruise_isa_band(data_dir)
+    return low - CRUISE_ISA_TOLERANCE_C, high + CRUISE_ISA_TOLERANCE_C
 
 
 def cruise_altitude_range(data_dir: Path | None = None) -> tuple[float, float]:

@@ -892,6 +892,18 @@ def plan(request: PlanRequest) -> dict:
                 "fuel_gal": leg.fuel_gal,
                 "fuel_remaining_gal": leg.fuel_remaining_gal,
                 "overridden": list(leg.overridden),
+                # Whether this row's performance came off the published chart
+                # or from beside it. The row marks itself so a pilot reading
+                # the log can see where the totals stop being the book's.
+                "extrapolated": leg.extrapolated,
+                "off_chart": [
+                    {
+                        "what": entry.what,
+                        "detail": entry.detail,
+                        "conservative": entry.conservative,
+                    }
+                    for entry in leg.off_chart
+                ],
                 "cruise_rpm": leg.cruise_rpm,
                 "flight_index": leg.flight_index,
                 "segment_type": leg.segment_type,
@@ -928,6 +940,12 @@ def plan(request: PlanRequest) -> dict:
             "fuel_remaining_gal": log.fuel_remaining_gal,
             "reserve_required_gal": log.reserve_required_gal,
             "legal_on_fuel": log.is_legal_on_fuel,
+            # The row from which the totals stop being the book's: fuel and
+            # time are cumulative, so an off-chart reading taints everything
+            # downstream of where it first appears. Null when every row came
+            # straight off the chart.
+            "first_extrapolated_leg": log.first_extrapolated_leg,
+            "extrapolated_legs": list(log.extrapolated_legs),
         },
         # The second of the two lists: the weather each leg the pilot drew was
         # planned in, and which end of the leg it came from. Empty when
@@ -1068,8 +1086,22 @@ def _checklist_json(checklist: pf.GoNoGo | None) -> dict | None:
         return None
     return {
         "is_go": checklist.is_go,
+        # Three states, not two: see `preflight.GoNoGo.verdict`. `is_go` stays
+        # what it was so nothing reading it changes meaning.
+        "verdict": checklist.verdict,
+        "all_from_the_book": checklist.all_from_the_book,
         "blockers": list(checklist.blockers),
         "unknowns": list(checklist.unknowns),
+        "extrapolations": [
+            {
+                "where": entry.where,
+                "what": entry.what,
+                "detail": entry.detail,
+                "conservative": entry.conservative,
+                "summary": entry.summary,
+            }
+            for entry in checklist.extrapolations
+        ],
         "airports": [
             {
                 "airport": check.airport,
@@ -1109,6 +1141,15 @@ def _checklist_json(checklist: pf.GoNoGo | None) -> dict | None:
                         "spare_ft": runway.spare_ft,
                         "passes": runway.passes,
                         "outside_envelope": runway.outside_envelope,
+                        "extrapolated": runway.extrapolated,
+                        "off_chart": [
+                            {
+                                "what": entry.what,
+                                "detail": entry.detail,
+                                "conservative": entry.conservative,
+                            }
+                            for entry in runway.off_chart
+                        ],
                         "note": runway.note,
                     }
                     for runway in check.runways
