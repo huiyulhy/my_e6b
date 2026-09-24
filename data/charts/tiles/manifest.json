@@ -16,7 +16,7 @@
         40.63945206180063
       ],
       "min_zoom": 5,
-      "max_zoom": 11,
+      "max_zoom": 10,
       "effective": "2026-09-03",
       "expires": "2026-10-28",
       "note": null
@@ -35,7 +35,7 @@
         38.32459909971787
       ],
       "min_zoom": 5,
-      "max_zoom": 13,
+      "max_zoom": 12,
       "effective": "2026-09-03",
       "expires": "2026-10-28",
       "note": null
@@ -54,7 +54,7 @@
         38.26107912643405
       ],
       "min_zoom": 5,
-      "max_zoom": 13,
+      "max_zoom": 12,
       "effective": "2026-09-03",
       "expires": "2026-10-28",
       "note": null

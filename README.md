@@ -32,7 +32,7 @@ than reporting none — "no NOTAMs" and "no NOTAM service" look identical on a b
 opposite things.
 
 ```bash
-export RAPIDAPI_KEY=...
+export RAPID_API_KEY=...
 make serve
 ```
 

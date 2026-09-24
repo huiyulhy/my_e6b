@@ -101,7 +101,8 @@ class TestAnUnreadableReplyIsAnOutage:
 
 class TestCredentials:
     def test_no_key_is_not_configured(self, monkeypatch):
-        monkeypatch.delenv(ns.RAPIDAPI_KEY_ENV, raising=False)
+        for name in ns.KEY_ENV_NAMES:
+            monkeypatch.delenv(name, raising=False)
         assert not ns.credentials_configured()
 
     def test_a_key_is_configured(self, monkeypatch):
@@ -110,7 +111,8 @@ class TestCredentials:
 
     def test_without_a_key_the_fetch_says_what_is_missing(self, monkeypatch):
         """Never an empty list: "no key" must not read as "no NOTAMs"."""
-        monkeypatch.delenv(ns.RAPIDAPI_KEY_ENV, raising=False)
+        for name in ns.KEY_ENV_NAMES:
+            monkeypatch.delenv(name, raising=False)
         with pytest.raises(ns.NotamsUnavailable, match=ns.RAPIDAPI_KEY_ENV):
             ns.fetch_route((LatLon(37.5, -122.2), LatLon(36.6, -121.8)))
 

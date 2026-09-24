@@ -7,7 +7,7 @@ whether a NOTAM matters.
 **Credentials.** One RapidAPI key with a SkyLink subscription, read from the
 environment rather than committed:
 
-    export RAPIDAPI_KEY=...
+    export RAPID_API_KEY=...
 
 With none set, `fetch_route` raises `NotamsUnavailable` saying so. An empty
 NOTAM list is the most dangerous thing this module could return, since it
@@ -51,6 +51,7 @@ from engine import notam as nt
 from engine.geo import LatLon, inverse
 
 __all__ = [
+    "KEY_ENV_NAMES",
     "MAX_DESIGNATORS",
     "NotamsUnavailable",
     "RouteNotams",
@@ -62,7 +63,15 @@ __all__ = [
 # how RapidAPI routes the request to the right product.
 SKYLINK_HOST = "skylink-api.p.rapidapi.com"
 SKYLINK_API = f"https://{SKYLINK_HOST}/v3/notams"
-RAPIDAPI_KEY_ENV = "RAPIDAPI_KEY"
+RAPIDAPI_KEY_ENV = "RAPID_API_KEY"
+
+# Every name the key is accepted under, in the order they are consulted. The
+# second is the spelling this asked for before, still honoured so that a shell
+# profile or a deployment configured against the old name keeps working. Only
+# the first is ever named in an error message, because that is the one a
+# reader should be setting -- but anything deciding whether a key is present
+# has to consider all of them, which is why the whole tuple is public.
+KEY_ENV_NAMES = (RAPIDAPI_KEY_ENV, "RAPIDAPI_KEY")
 
 USER_AGENT = "my_e6b VFR planner (+https://github.com/huiyulhy/my_e6b)"
 TIMEOUT_S = 20.0
@@ -119,9 +128,23 @@ class RouteNotams:
         return not self.failed
 
 
+def _api_key() -> str:
+    """The configured RapidAPI key, or an empty string.
+
+    Whitespace is stripped before the emptiness test: a variable set to a
+    stray space is not a key, and letting one through would send an empty
+    header and turn a configuration mistake into a 401 from SkyLink.
+    """
+    for name in KEY_ENV_NAMES:
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    return ""
+
+
 def credentials_configured() -> bool:
     """Whether SkyLink can be called at all, without calling it."""
-    return bool(os.environ.get(RAPIDAPI_KEY_ENV))
+    return bool(_api_key())
 
 
 def fetch_route(
@@ -319,7 +342,7 @@ def _get_json(url: str, *, refresh: bool = False) -> Any:
         headers={
             "User-Agent": USER_AGENT,
             "Accept": "application/json",
-            "X-RapidAPI-Key": os.environ.get(RAPIDAPI_KEY_ENV, ""),
+            "X-RapidAPI-Key": _api_key(),
             "X-RapidAPI-Host": SKYLINK_HOST,
         },
     )

@@ -27,6 +27,7 @@ issued hourly, a TAF every six hours, model output every hour.
 from __future__ import annotations
 
 import json
+import logging
 import time
 import urllib.error
 import urllib.parse
@@ -49,6 +50,14 @@ __all__ = [
     "fetch_aloft_series",
     "fetch_surface",
 ]
+
+# Every upstream refusal is reported to the caller as data -- `{"ok": false}`
+# with a reason in it -- so that the UI can render it rather than catch it.
+# That is right for the UI and useless for an operator: a deployment where
+# every source is being refused looks, in an access log, exactly like one that
+# is working, because the HTTP layer succeeded either way. So the reason is
+# also written to the log, which is the only place an operator can see it.
+logger = logging.getLogger(__name__)
 
 AWC = "https://aviationweather.gov/api/data"
 OPEN_METEO = "https://api.open-meteo.com/v1/forecast"
@@ -111,6 +120,18 @@ def _get_json(url: str, ttl_s: float, *, refresh: bool = False) -> Any:
         with urllib.request.urlopen(request, timeout=TIMEOUT_S) as response:
             body = response.read().decode("utf-8")
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        # `HTTPError` subclasses `URLError`, so a 403 or a 429 arrives here
+        # alongside a genuine transport failure. They are very different
+        # things to an operator -- one is the service refusing this client,
+        # the other is the network -- so the status is named where there is
+        # one, rather than being flattened into "could not reach".
+        status = getattr(exc, "code", None)
+        logger.warning(
+            "weather: %s refused this request -- %s. Asked for %s",
+            _host(url),
+            f"HTTP {status}" if status is not None else f"no reply ({exc})",
+            url,
+        )
         raise WeatherUnavailable(f"could not reach {_host(url)}: {exc}") from exc
 
     # AWC answers a station that publishes no TAF with an empty body rather
@@ -123,6 +144,10 @@ def _get_json(url: str, ttl_s: float, *, refresh: bool = False) -> Any:
         try:
             payload = json.loads(body)
         except ValueError as exc:
+            logger.warning(
+                "weather: %s returned %d bytes that are not JSON: %.200r",
+                _host(url), len(body), body,
+            )
             raise WeatherUnavailable(f"{_host(url)} returned malformed JSON") from exc
 
     try:
