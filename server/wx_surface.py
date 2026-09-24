@@ -32,6 +32,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -45,9 +46,11 @@ from engine.geo import LatLon
 from engine.weather import SurfaceWeather, WeatherUnavailable
 
 __all__ = [
+    "MAX_BATCH_POINTS",
     "WeatherUnavailable",
     "fetch_aloft",
     "fetch_aloft_series",
+    "fetch_aloft_series_many",
     "fetch_surface",
 ]
 
@@ -65,6 +68,12 @@ OPEN_METEO = "https://api.open-meteo.com/v1/forecast"
 # A courteous identifier. Public services are entitled to know who is calling,
 # and an unidentified client is the first thing a rate limiter drops.
 USER_AGENT = "my_e6b VFR planner (+https://github.com/huiyulhy/my_e6b)"
+
+# How many points one batched forecast may ask about. A route longer than
+# this is asking for a URL that servers start truncating rather than a better
+# forecast, and the cap is well clear of any plan a light single would fly in
+# a day.
+MAX_BATCH_POINTS = 25
 
 TIMEOUT_S = 15.0
 CACHE = Path(__file__).resolve().parent.parent / ".cache" / "wx"
@@ -206,7 +215,9 @@ def _model_url(position: LatLon, target: datetime) -> str:
     return f"{OPEN_METEO}?{urllib.parse.urlencode(query)}"
 
 
-def _aloft_url(position: LatLon, target: datetime, levels: tuple[int, ...]) -> str:
+def _aloft_url(
+    positions: tuple[LatLon, ...], target: datetime, levels: tuple[int, ...]
+) -> str:
     """The same forecast as `_model_url`, asked on pressure levels.
 
     A separate request rather than more `hourly=` names on the surface one:
@@ -214,11 +225,20 @@ def _aloft_url(position: LatLon, target: datetime, levels: tuple[int, ...]) -> s
     consequences. A field with no wind aloft still has a usable altimeter
     setting, and losing the go/no-go because the cruise wind was unavailable
     would be the wrong trade.
+
+    **Many points, one request.** Open-Meteo takes comma-separated
+    coordinates and answers with a list in the order asked. A route is nine
+    or ten waypoints, and asking about them one at a time is nine or ten
+    requests against a per-address rate limit that a shared deployment shares
+    with strangers -- which is not a theoretical concern: it is what
+    `api.open-meteo.com` was answering `429` to. The column over each
+    waypoint is the same column either way; only the number of requests
+    changes.
     """
     day = target.astimezone(UTC).date()
     query = {
-        "latitude": f"{position.lat:.4f}",
-        "longitude": f"{position.lon:.4f}",
+        "latitude": ",".join(f"{point.lat:.4f}" for point in positions),
+        "longitude": ",".join(f"{point.lon:.4f}" for point in positions),
         "hourly": ",".join(al.hourly_fields(levels)),
         "wind_speed_unit": "kn",
         "temperature_unit": "celsius",
@@ -250,7 +270,9 @@ def fetch_aloft(
     """
     target = datetime.now(tz=UTC) if target is None else _as_utc(target)
     levels = al.levels_up_to(ceiling_ft)
-    payload = _get_json(_aloft_url(position, target, levels), TTL_MODEL, refresh=refresh)
+    payload = _get_json(
+        _aloft_url((position,), target, levels), TTL_MODEL, refresh=refresh
+    )
     forecast = al.parse_aloft(payload, target, levels=levels)
     if forecast is None:
         raise WeatherUnavailable(
@@ -280,26 +302,72 @@ def fetch_aloft_series(
     series is a real answer; a padded one would claim a forecast exists.
     """
     start = datetime.now(tz=UTC) if start is None else _as_utc(start)
-    levels = al.levels_up_to(ceiling_ft)
-    payload = _get_json(_aloft_url(position, start, levels), TTL_MODEL, refresh=refresh)
-
-    series: list[al.AloftForecast] = []
-    seen: set[datetime] = set()
-    for step in range(max(1, hours)):
-        forecast = al.parse_aloft(payload, start + timedelta(hours=step), levels=levels)
-        # `parse_aloft` snaps to the nearest hour it has, so a window running
-        # off the end of the payload returns the last hour over and over.
-        if forecast is None or forecast.valid_time in seen:
-            continue
-        seen.add(forecast.valid_time)
-        series.append(forecast)
-
+    series = fetch_aloft_series_many(
+        (position,), start, hours=hours, ceiling_ft=ceiling_ft, refresh=refresh
+    )[0]
     if not series:
         raise WeatherUnavailable(
             f"the model returned no hour near {start:%Y-%m-%d %H:%MZ} "
             f"for {position.lat:.3f}, {position.lon:.3f}"
         )
     return series
+
+
+def fetch_aloft_series_many(
+    positions: Sequence[LatLon],
+    start: datetime | None = None,
+    *,
+    hours: int = 1,
+    ceiling_ft: float = 14000.0,
+    refresh: bool = False,
+) -> list[list[al.AloftForecast]]:
+    """A window of forecast hours over several points, in **one** request.
+
+    The whole route in a single call rather than one call per waypoint. See
+    `_aloft_url` for why that matters; the short version is that the free
+    Open-Meteo tier limits by address, a deployed instance shares its address
+    with strangers, and ten requests per press of a button is how a plan ends
+    up silently back on the standard atmosphere.
+
+    Returns one list per position, **in the order asked**, because that is how
+    the caller matches a column to the waypoint it belongs to. A point the
+    model had nothing for gets an empty list rather than being dropped: losing
+    the position would shift every forecast after it onto the wrong waypoint,
+    which is worse than admitting a gap.
+
+    Raises `WeatherUnavailable` only when the request itself fails -- that is
+    every point at once, and the caller has nothing to plan on.
+    """
+    points = tuple(positions)
+    if not points:
+        return []
+    if len(points) > MAX_BATCH_POINTS:
+        raise WeatherUnavailable(
+            f"{len(points)} points asked about at once; the limit is "
+            f"{MAX_BATCH_POINTS}"
+        )
+
+    start = datetime.now(tz=UTC) if start is None else _as_utc(start)
+    levels = al.levels_up_to(ceiling_ft)
+    payload = _get_json(_aloft_url(points, start, levels), TTL_MODEL, refresh=refresh)
+
+    columns: list[list[al.AloftForecast]] = []
+    for index in range(len(points)):
+        series: list[al.AloftForecast] = []
+        seen: set[datetime] = set()
+        for step in range(max(1, hours)):
+            forecast = al.parse_aloft(
+                payload, start + timedelta(hours=step), levels=levels, index=index
+            )
+            # `parse_aloft` snaps to the nearest hour it has, so a window
+            # running off the end of the payload returns the last hour over
+            # and over.
+            if forecast is None or forecast.valid_time in seen:
+                continue
+            seen.add(forecast.valid_time)
+            series.append(forecast)
+        columns.append(series)
+    return columns
 
 
 def _nearest_taf_candidates(position: LatLon) -> list[apt.Airport]:

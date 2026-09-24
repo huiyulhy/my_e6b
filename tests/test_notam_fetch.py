@@ -138,7 +138,7 @@ class TestTheEndpoint:
         answer = main.notams(self.request())
         assert answer["ok"] is False
         assert answer["needs_credentials"]
-        assert ns.RAPIDAPI_KEY_ENV in answer["error"]
+        assert ns.SKYLINK_KEY_ENV in answer["error"]
 
     def test_a_notam_at_the_destination_comes_through(self, monkeypatch):
         self.stub(monkeypatch, [self.notam()])

@@ -476,6 +476,83 @@ def winds_aloft_series(
     return {"ok": True, "hours": [_aloft_json(forecast) for forecast in series]}
 
 
+@app.get("/api/wx/aloft/series/batch")
+def winds_aloft_series_batch(
+    lat: str,
+    lon: str,
+    time: str | None = None,
+    hours: int = 1,
+    ceiling_ft: float = 14000.0,
+) -> dict:
+    """The same window as `/api/wx/aloft/series`, over many points at once.
+
+    `lat` and `lon` are comma-separated and positional: the nth latitude goes
+    with the nth longitude, and the nth entry of `points` in the reply is the
+    forecast over them. The order is the contract -- the planner reads the
+    list against the route it drew, so a reply that dropped an unanswerable
+    point would shift every forecast after it onto the wrong waypoint. A point
+    the model had nothing for comes back with `ok: false` in its slot instead.
+
+    One endpoint rather than the caller looping over the single-point one,
+    because the whole reason this exists is to spend one upstream request
+    where a route's worth of waypoints used to spend ten. See
+    `wx_surface._aloft_url`.
+    """
+    try:
+        lats = [float(value) for value in lat.split(",") if value.strip()]
+        lons = [float(value) for value in lon.split(",") if value.strip()]
+    except ValueError:
+        raise HTTPException(400, "lat and lon must be comma-separated numbers")
+    if not lats or len(lats) != len(lons):
+        raise HTTPException(
+            400,
+            f"lat and lon must pair up: {len(lats)} latitudes and "
+            f"{len(lons)} longitudes",
+        )
+    if len(lats) > wx_surface.MAX_BATCH_POINTS:
+        raise HTTPException(
+            400,
+            f"at most {wx_surface.MAX_BATCH_POINTS} points at a time, "
+            f"asked about {len(lats)}",
+        )
+    if not 1 <= hours <= MAX_FORECAST_HOURS:
+        raise HTTPException(400, f"hours must be between 1 and {MAX_FORECAST_HOURS}")
+
+    start: datetime | None = None
+    if time:
+        try:
+            start = datetime.fromisoformat(time)
+        except ValueError:
+            raise HTTPException(400, f"could not read {time!r} as an ISO 8601 time")
+
+    try:
+        positions = [LatLon(y, x) for y, x in zip(lats, lons, strict=True)]
+    except ValueError as exc:
+        # LatLon refuses an impossible position; that is a bad request.
+        raise HTTPException(400, str(exc))
+
+    try:
+        columns = wx_surface.fetch_aloft_series_many(
+            positions, start, hours=hours, ceiling_ft=ceiling_ft
+        )
+    except wx.WeatherUnavailable as exc:
+        # The request itself failed, so every point failed together. One
+        # refusal for the whole batch, on the same reasoning as the
+        # single-point endpoint: data the UI renders, not an HTTP error.
+        return {"ok": False, "error": str(exc)}
+
+    return {
+        "ok": True,
+        "hours": hours,
+        "points": [
+            {"ok": True, "hours": [_aloft_json(forecast) for forecast in series]}
+            if series
+            else {"ok": False, "error": "the model returned no hour for this point"}
+            for series in columns
+        ],
+    }
+
+
 @app.get("/api/wx/surface")
 def surface_weather(ident: str, time: str | None = None) -> dict:
     """Surface weather at one field, for now or for a target time.
@@ -720,8 +797,8 @@ def notams(request: PlanRequest) -> dict:
         return {
             "ok": False,
             "error": (
-                f"NOTAMs need a SkyLink subscription on RapidAPI. Set "
-                f"{notam_source.RAPIDAPI_KEY_ENV} before starting the server."
+                f"NOTAMs need a SkyLink licence. Set "
+                f"{notam_source.SKYLINK_KEY_ENV} before starting the server."
             ),
             "needs_credentials": True,
         }

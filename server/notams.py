@@ -1,11 +1,15 @@
-"""Fetching NOTAMs for a route from SkyLink, through RapidAPI.
+"""Fetching NOTAMs for a route from SkyLink.
 
 The network half of `engine/notam.py`, on the same split as
 `server/wx_surface.py`: this reaches the outside world and knows nothing about
 whether a NOTAM matters.
 
-**Credentials.** One RapidAPI key with a SkyLink subscription, read from the
-environment rather than committed:
+**Credentials.** SkyLink sells the same service through two channels, and they
+authenticate differently: a direct licence billed through Polar, which sends
+the licence key as `x-api-key` to `data.skylinkapi.com`, and the RapidAPI
+marketplace, which sends a RapidAPI key as `X-RapidAPI-Key` to a
+`p.rapidapi.com` host. This asks the direct endpoint, which is the licence
+this project holds. One key, read from the environment rather than committed:
 
     export RAPID_API_KEY=...
 
@@ -59,19 +63,25 @@ __all__ = [
     "fetch_route",
 ]
 
-# SkyLink, through RapidAPI. One key, sent as a header; the host header is
-# how RapidAPI routes the request to the right product.
-SKYLINK_HOST = "skylink-api.p.rapidapi.com"
+# SkyLink direct, billed through Polar. The key goes in `x-api-key`; there is
+# no host header, because there is no marketplace in front of the service to
+# route past -- that is the RapidAPI channel, and this is not it.
+SKYLINK_HOST = "data.skylinkapi.com"
 SKYLINK_API = f"https://{SKYLINK_HOST}/v3/notams"
-RAPIDAPI_KEY_ENV = "RAPID_API_KEY"
+SKYLINK_KEY_HEADER = "x-api-key"
+# The variable the key is read from. Named for RapidAPI rather than for
+# SkyLink because that is what is already set in the deployment and in the
+# shell; the key it holds is now a direct licence key, and only the channel
+# changed underneath it.
+SKYLINK_KEY_ENV = "RAPID_API_KEY"
 
 # Every name the key is accepted under, in the order they are consulted. The
-# second is the spelling this asked for before, still honoured so that a shell
-# profile or a deployment configured against the old name keeps working. Only
-# the first is ever named in an error message, because that is the one a
-# reader should be setting -- but anything deciding whether a key is present
-# has to consider all of them, which is why the whole tuple is public.
-KEY_ENV_NAMES = (RAPIDAPI_KEY_ENV, "RAPIDAPI_KEY")
+# second is an older spelling, still honoured so that a shell profile or a
+# deployment configured against it keeps working. Only the first is ever named
+# in an error message, because that is the one a reader should be setting --
+# but anything deciding whether a key is present has to consider all of them,
+# which is why the whole tuple is public.
+KEY_ENV_NAMES = (SKYLINK_KEY_ENV, "RAPIDAPI_KEY")
 
 USER_AGENT = "my_e6b VFR planner (+https://github.com/huiyulhy/my_e6b)"
 TIMEOUT_S = 20.0
@@ -129,7 +139,7 @@ class RouteNotams:
 
 
 def _api_key() -> str:
-    """The configured RapidAPI key, or an empty string.
+    """The configured SkyLink key, or an empty string.
 
     Whitespace is stripped before the emptiness test: a variable set to a
     stray space is not a key, and letting one through would send an empty
@@ -168,8 +178,8 @@ def fetch_route(
         raise NotamsUnavailable("a route needs at least two points")
     if not credentials_configured():
         raise NotamsUnavailable(
-            f"NOTAMs need a SkyLink subscription on RapidAPI: set "
-            f"{RAPIDAPI_KEY_ENV} before starting the server"
+            f"NOTAMs need a SkyLink licence: set {SKYLINK_KEY_ENV} "
+            f"before starting the server"
         )
 
     wanted = _designators(tuple(positions), corridor_nm, priority)
@@ -207,7 +217,7 @@ def fetch_route(
     if skipped:
         failed.append(
             f"{len(skipped)} of {len(wanted)} identifiers along the route were "
-            f"not asked about, to stay inside the RapidAPI allowance: "
+            f"not asked about, to stay inside the licence allowance: "
             f"{', '.join(skipped[:8])}{'...' if len(skipped) > 8 else ''}"
         )
 
@@ -342,8 +352,7 @@ def _get_json(url: str, *, refresh: bool = False) -> Any:
         headers={
             "User-Agent": USER_AGENT,
             "Accept": "application/json",
-            "X-RapidAPI-Key": _api_key(),
-            "X-RapidAPI-Host": SKYLINK_HOST,
+            SKYLINK_KEY_HEADER: _api_key(),
         },
     )
     try:
@@ -354,8 +363,9 @@ def _get_json(url: str, *, refresh: bool = False) -> Any:
         # fix is a subscription, not a network.
         if exc.code in (401, 403):
             raise NotamsUnavailable(
-                f"SkyLink rejected the key ({exc.code}); check {RAPIDAPI_KEY_ENV} "
-                f"and that it is subscribed to SkyLink on RapidAPI"
+                f"SkyLink rejected the key ({exc.code}); check {SKYLINK_KEY_ENV} "
+                f"holds the licence key from your SkyLink account, and that "
+                f"the licence is current"
             ) from exc
         # 429 is the allowance, not the service, and the fix is different:
         # wait for the month to roll over, or pay for more.

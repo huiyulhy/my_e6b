@@ -743,9 +743,12 @@ the leg does.
 **Priority is read from the text.** Anything unrecognised is called operational rather than
 information: burying a NOTAM nobody classified is the failure that matters.
 
-#### The source: SkyLink, through RapidAPI
+#### The source: SkyLink
 
-NOTAMs come from SkyLink, reached through RapidAPI with one key in `RAPID_API_KEY`. Unconfigured,
+NOTAMs come from SkyLink's direct API at `data.skylinkapi.com`, authenticated with one licence
+key sent as `x-api-key` and read from `RAPID_API_KEY`. (SkyLink also sells the same service
+through the RapidAPI marketplace, which uses a different host and an `X-RapidAPI-Key` header;
+this is not that channel.) Unconfigured,
 `/api/notams` says exactly that instead of returning nothing: **"no NOTAMs" and "no NOTAM service"
 look identical on a briefing page and mean opposite things.** For the same reason a partly failed
 search is labelled rather than shown as a clean result, and the panel always says how many were

@@ -67,6 +67,42 @@ const api = {
     return body;
   },
 
+  /** The forecast window over every point of the route, in one request.
+   *
+   *  One call rather than one per waypoint. The model's free tier counts
+   *  requests per IP address, and a deployed instance shares its address with
+   *  strangers -- a route's worth of separate calls is what got this refused
+   *  with a 429 in the first place, which showed up as a plan quietly falling
+   *  back to the standard atmosphere.
+   *
+   *  Answers positionally: `points[n]` is the forecast over `points[n]` of
+   *  the argument, and a point the model could not answer for keeps its slot
+   *  with an error on it. A whole-batch failure is normalised to that same
+   *  shape, so the caller has one case to handle rather than two. */
+  async aloftSeriesMany(points, isoTime, hours) {
+    const p = new URLSearchParams({
+      lat: points.map((w) => w.lat).join(','),
+      lon: points.map((w) => w.lon).join(','),
+      hours,
+    });
+    if (isoTime) p.set('time', isoTime);
+    const r = await fetch(`/api/wx/aloft/series/batch?${p}`);
+    const body = await r.json().catch(() => null);
+    const failed = (error) => points.map(() => ({ error }));
+    if (!r.ok) return failed((body && body.detail) || 'no forecast for this route');
+    if (!body || body.ok === false) {
+      return failed((body && body.error) || 'no forecast for this route');
+    }
+    // A short list would silently shift every forecast onto the wrong
+    // waypoint, so the length is the contract and a mismatch is a failure.
+    if (!Array.isArray(body.points) || body.points.length !== points.length) {
+      return failed('the forecast did not line up with the route');
+    }
+    return body.points.map((point) => (point && point.ok
+      ? point
+      : { error: (point && point.error) || 'no forecast for this point' }));
+  },
+
   async notams(body) {
     const r = await fetch('/api/notams', {
       method: 'POST',
@@ -2386,8 +2422,8 @@ async function getForecasts(arrivals) {
 
   let series;
   try {
-    series = await Promise.all(drawn.map(
-      (w) => api.aloftSeries(w.lat, w.lon, start ? start.toISOString() : null, hours)));
+    series = await api.aloftSeriesMany(
+      drawn, start ? start.toISOString() : null, hours);
   } catch {
     clearForecasts();
     return 0;

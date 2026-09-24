@@ -26,8 +26,8 @@ departure hours away, from the TAF and a forecast model — so takeoff and landi
 computed on the air that will actually be there. Without a connection you type them in, as
 before, and everything else works unchanged.
 
-NOTAMs need one extra thing: a SkyLink subscription on RapidAPI (the free tier is 1,000 requests
-a month). Without it every other feature works and **Get NOTAMs** says what is missing rather
+NOTAMs need one extra thing: a SkyLink licence (1,000 queries). Without it every other
+feature works and **Get NOTAMs** says what is missing rather
 than reporting none — "no NOTAMs" and "no NOTAM service" look identical on a briefing and mean
 opposite things.
 

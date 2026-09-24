@@ -106,14 +106,14 @@ class TestCredentials:
         assert not ns.credentials_configured()
 
     def test_a_key_is_configured(self, monkeypatch):
-        monkeypatch.setenv(ns.RAPIDAPI_KEY_ENV, "k")
+        monkeypatch.setenv(ns.SKYLINK_KEY_ENV, "k")
         assert ns.credentials_configured()
 
     def test_without_a_key_the_fetch_says_what_is_missing(self, monkeypatch):
         """Never an empty list: "no key" must not read as "no NOTAMs"."""
         for name in ns.KEY_ENV_NAMES:
             monkeypatch.delenv(name, raising=False)
-        with pytest.raises(ns.NotamsUnavailable, match=ns.RAPIDAPI_KEY_ENV):
+        with pytest.raises(ns.NotamsUnavailable, match=ns.SKYLINK_KEY_ENV):
             ns.fetch_route((LatLon(37.5, -122.2), LatLon(36.6, -121.8)))
 
 
@@ -124,7 +124,7 @@ class TestAskingAboutARoute:
 
     @pytest.fixture(autouse=True)
     def skylink(self, monkeypatch):
-        monkeypatch.setenv(ns.RAPIDAPI_KEY_ENV, "k")
+        monkeypatch.setenv(ns.SKYLINK_KEY_ENV, "k")
 
     def answer(self, monkeypatch, reply):
         """Stub the network: `reply(designator)` returns the payload or raises."""
@@ -249,12 +249,17 @@ class TestAskingAboutARoute:
 class TestTheRequest:
     """What actually goes over the wire.
 
-    A misspelt RapidAPI header is a 401 on every request, forever, and would
-    read as a bad key rather than a bug.
+    A misspelt auth header is a 401 on every request, forever, and would read
+    as a bad key rather than as a bug. SkyLink sells the same service through
+    two channels with different headers -- `x-api-key` on a direct licence,
+    `X-RapidAPI-Key` through the marketplace -- so which one is sent, and to
+    which host, is worth pinning rather than assuming.
     """
 
-    def test_the_rapidapi_headers_are_sent(self, monkeypatch, tmp_path):
-        monkeypatch.setenv(ns.RAPIDAPI_KEY_ENV, "secret")
+    def test_the_licence_key_is_sent_to_the_direct_endpoint(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv(ns.SKYLINK_KEY_ENV, "secret")
         monkeypatch.setattr(ns, "CACHE", tmp_path)
         seen = {}
 
@@ -269,7 +274,9 @@ class TestTheRequest:
                 return b"[]"
 
         def urlopen(request, timeout):
-            seen["key"] = request.get_header("X-rapidapi-key")
+            # `Request` normalises header names to capitalised form.
+            seen["key"] = request.get_header("X-api-key")
+            seen["rapidapi"] = request.get_header("X-rapidapi-key")
             seen["host"] = request.get_header("X-rapidapi-host")
             seen["url"] = request.full_url
             return Reply()
@@ -277,5 +284,9 @@ class TestTheRequest:
         monkeypatch.setattr(ns.urllib.request, "urlopen", urlopen)
         assert ns._get_json(f"{ns.SKYLINK_API}/KSQL", refresh=True) == []
         assert seen["key"] == "secret"
-        assert seen["host"] == ns.SKYLINK_HOST
-        assert seen["url"] == "https://skylink-api.p.rapidapi.com/v3/notams/KSQL"
+        # The marketplace headers belong to the other channel. Sending them
+        # as well would not fail loudly, it would just be noise on every
+        # request -- and noise that suggests the wrong endpoint to a reader.
+        assert seen["rapidapi"] is None
+        assert seen["host"] is None
+        assert seen["url"] == "https://data.skylinkapi.com/v3/notams/KSQL"
