@@ -11,8 +11,7 @@ So each NOTAM is put through four tests, and the ones that survive all four
 are the briefing:
 
 1. **Corridor.** Its own circle -- the Q-line centre and radius -- has to
-   reach the route corridor. Twenty miles either side of track by default,
-   which is a VFR pilot's realistic diversion width.
+   reach the route corridor. Ten miles either side of track by default.
 2. **Altitude.** Its band has to overlap the band the aeroplane is actually in
    over that stretch of route. A closure from FL240 to FL350 is not about a
    Skyhawk at 6,500 ft.
@@ -53,12 +52,17 @@ __all__ = [
     "relevant",
 ]
 
-# How far either side of track counts as "on the route". Twenty miles is the
-# figure an EFB uses for an en-route corridor and it is a defensible one for
-# VFR: it is about ten minutes of flying, which is the distance a diversion
-# actually costs, and it is wide enough that a NOTAM plotted to the nearest
-# minute of arc cannot fall out of it by rounding.
-DEFAULT_CORRIDOR_NM = 20.0
+# How far either side of track counts as "on the route". Ten miles is about
+# five minutes of flying at a Skyhawk's cruise, and it is the width a VFR
+# pilot actually wanders for terrain, airspace and a build-up -- wide enough
+# that a NOTAM plotted to the nearest minute of arc cannot fall out of it by
+# rounding, and narrow enough that the briefing stays short enough to read.
+#
+# It is a filter on *relevance*, not on safety: a NOTAM outside the corridor
+# is not hidden, it is left out of the briefing for this route. Widen it with
+# the `corridor_nm` argument for a flight where the diversion options matter
+# more than the length of the list.
+DEFAULT_CORRIDOR_NM = 10.0
 
 # How far above and below the planned altitude still counts. A thousand feet
 # covers the altitude a pilot actually holds against the one they filed, and
@@ -353,8 +357,8 @@ def _gap_to_leg_nm(notam: Notam, span: Segment) -> float:
     """How far a NOTAM's circle is from a leg, in nautical miles. Zero if it
     reaches it.
 
-    From the circle, not from its centre: a five-mile radius eighteen miles
-    off track reaches a twenty-mile corridor, and a point at the same place
+    From the circle, not from its centre: a five-mile radius eight miles
+    off track reaches a ten-mile corridor, and a point at the same place
     does not.
     """
     if notam.position is None:

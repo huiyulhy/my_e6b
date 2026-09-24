@@ -717,7 +717,7 @@ becomes something a pilot skims, and skimming is how the closed runway at the de
 missed. So the filter is the feature — the fetch is the easy half.
 
 **Four tests, and all four against the same leg.** A NOTAM has to reach the route corridor
-(20 nm either side of track by default), overlap the band of altitude the aeroplane is in *over
+(10 nm either side of track by default), overlap the band of altitude the aeroplane is in *over
 that stretch*, and be in force while it is *there*. Testing the three separately against the
 whole route keeps a NOTAM that is beside the first leg, at the altitude of the last, and during
 the time of neither — so `_against_route` walks leg by leg and a leg has to satisfy all three.
@@ -735,8 +735,8 @@ open — no lower limit is the surface, no upper limit is unlimited, no end is u
 unlimited, not as 99,900 ft.
 
 **Distance is to the leg, not to the line through it,** and from the NOTAM's own circle rather
-than its centre. A five-mile radius eighteen miles off track reaches a 20 nm corridor; a point at
-the same place is clear of it. Measuring by cross-track alone would put a NOTAM two hundred miles
+than its centre. A fifteen-mile radius twenty-four miles off track reaches a 10 nm corridor; a
+point at the same place is clear of it. Measuring by cross-track alone would put a NOTAM two hundred miles
 beyond the destination "on the track", since the great circle through a leg does not stop where
 the leg does.
 
@@ -767,8 +767,8 @@ airport inside the corridor.
 **The aerodromes are found by a chain of circles, and the spacing is what makes it a corridor.**
 Circles of radius R every R nm cover everything within `R·√3/2` of the track, the thin spot being
 where two adjacent circles cross, so the search radius is set from the corridor width
-(`corridor / (√3/2)` ≈ 23 nm for a 20 nm corridor) rather than equal to it. Searching at 20 nm
-left scalloped gaps, and an aerodrome 19 nm off track halfway between two samples was never asked
+(`corridor / (√3/2)` ≈ 11.5 nm for a 10 nm corridor) rather than equal to it. Searching at 10 nm
+left scalloped gaps, and an aerodrome 9 nm off track halfway between two samples was never asked
 about. `tests/test_notam_fetch.py` samples the whole corridor edge against the chain; it caught two
 holes in the thinning that drops circles sitting on top of one another, and a point is now dropped
 only when what follows it still lands within one spacing of the circle before it.

@@ -27,8 +27,8 @@ an airspace closure is filed against the ARTCC whose airspace it sits in.
 database, searched in a chain of circles laid along the route. Circles of
 radius R every R nautical miles cover everything within R x sqrt(3)/2 of the
 track -- the thin spot is halfway between two centres -- so the search radius
-is set from the corridor width rather than equal to it. Searching 20 nm
-circles every 20 nm would leave scalloped gaps, and an aerodrome 19 nm off
+is set from the corridor width rather than equal to it. Searching 10 nm
+circles every 10 nm would leave scalloped gaps, and an aerodrome 9 nm off
 track halfway between two samples would never be asked about.
 
 **The budget.** The free tier is 1,000 requests a month and each identifier
@@ -98,9 +98,14 @@ TTL_S = 10 * 60
 # than burning a month's allowance on one long cross-country.
 MAX_DESIGNATORS = 40
 
-# The most sample points one route may be broken into. A 1,000 nm route at the
-# spacing below is well inside this; the cap is a backstop against a route
-# with a mistyped waypoint on the other side of the world.
+# The most sample points one route may be broken into. At the default 10 nm
+# corridor the chain spaces circles about 11.5 nm apart, so this covers a
+# route of roughly 440 nm before the spacing has to be stretched -- about the
+# most a 172 can fly on one tank, so a realistic route reaches the far end
+# with the corridor intact. Past that the stretch narrows the corridor
+# between circles rather than dropping the far end, which `_query_points`
+# does deliberately. The cap is otherwise a backstop against a route with a
+# mistyped waypoint on the other side of the world.
 MAX_QUERY_POINTS = 40
 
 # Circles of radius R spaced R apart cover everything within R*sqrt(3)/2 of

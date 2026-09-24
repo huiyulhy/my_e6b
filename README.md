@@ -40,7 +40,7 @@ SkyLink is asked by airport identifier, so a briefing costs one request per aero
 near the route, capped at 40 — about 25 briefings a month in busy airspace. The route's own
 airports and the ARTCCs are always asked first, so the cap only ever drops outlying fields.
 
-What comes back is filtered to the flight rather than dumped: within 20 nm of track, at an
+What comes back is filtered to the flight rather than dumped: within 10 nm of track, at an
 altitude the aeroplane is actually at over that stretch, and in force while it is there. The
 panel says how many of how many survived, so you can see the filter working.
 

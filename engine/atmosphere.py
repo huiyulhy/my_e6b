@@ -241,40 +241,8 @@ def altitude_for_relative_density(sigma: float) -> float:
     h_m = (t_ratio - 1.0) * T0_K / LAPSE_K_PER_M
     return m_to_ft(h_m)
 
-
-# --- observed temperature ------------------------------------------------
-#
-# A real day is not the standard atmosphere, and the pilot learns about it from
-# two products that look nothing alike: a METAR gives a temperature at a field
-# elevation with that station's altimeter setting, an FD winds-aloft forecast
-# gives a temperature at a flight altitude. Both are the same thing underneath
-# -- one point on a temperature-against-pressure curve -- and this is where
-# they are made to agree.
-#
-# The common currency is ISA deviation against *pressure* altitude. Pressure
-# altitude carries no temperature term (see `pressure_altitude`), so the chain
-# altitude -> PA -> deviation -> OAT -> density altitude runs one way with
-# nothing to solve for. Referencing deviation to PA rather than to indicated
-# altitude also means two stations reporting different altimeter settings still
-# land in the same coordinate, which is the whole point of reconciling them.
-
-# The dry adiabatic lapse rate: 9.8 K/km, the steepest gradient still air can
-# hold without overturning.
 DRY_ADIABATIC_C_PER_1000FT = 2.98
-
-# What actually earns a warning. Not the adiabatic rate itself: a shallow
-# superadiabatic layer over ground baking in the afternoon sun is ordinary
-# weather, and a METAR paired with a forecast nine thousand feet above it will
-# cross 3 degC per 1000 ft on any hot day. Only a gradient well past that says
-# a digit went in wrong. An inversion is the other way round and is perfectly
-# ordinary too, so only this side is worth a word at all.
 _IMPLAUSIBLE_LAPSE_C_PER_1000FT = 4.5
-
-# Two observations closer together than this in pressure altitude describe the
-# same slice of air, not a gradient. Two airports a couple of hundred feet
-# apart with genuinely different weather -- one coastal, one inland -- would
-# otherwise imply a lapse rate of tens of degrees per thousand feet and poison
-# every altitude above them.
 _MERGE_TOLERANCE_FT = 250.0
 
 
@@ -305,16 +273,6 @@ class TemperatureSample:
 @dataclass(frozen=True)
 class TemperatureProfile:
     """Observed ISA deviation against pressure altitude, linearly interpolated.
-
-    Outside the observed range the nearest deviation is held flat. That is the
-    reason the whole model is expressed in deviation and not in temperature:
-    holding a *deviation* constant keeps the standard lapse rate running above
-    the top sample and below the bottom one, where holding a *temperature*
-    constant would claim the air stops cooling with height.
-
-    With no samples at all the profile is a single constant deviation, which is
-    exactly the route-wide ISA-deviation figure this replaced -- so a plan with
-    no weather entered behaves as it always did.
     """
 
     samples: tuple[TemperatureSample, ...] = ()
@@ -329,11 +287,6 @@ class TemperatureProfile:
         merge_tolerance_ft: float = _MERGE_TOLERANCE_FT,
     ) -> TemperatureProfile:
         """Sort, merge near-coincident observations, and keep the result.
-
-        Samples win outright where there are any: the default deviation is a
-        fallback for an empty profile, never something blended in. A pilot who
-        has typed a temperature should see that temperature used, not an
-        average of it and a form default they forgot about.
         """
         ordered = sorted(observations, key=lambda s: s.pressure_altitude_ft)
         merged: list[TemperatureSample] = []

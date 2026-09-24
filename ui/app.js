@@ -1686,7 +1686,6 @@ function renderNavlog(plan) {
   // list left standing beside no navlog claims to describe rows that are not
   // there.
   renderChecklist(null);
-  renderLegWeather({});
 
   if (!plan) {
     empty.hidden = false;
@@ -1835,7 +1834,6 @@ function renderNavlog(plan) {
   foot.appendChild(tr);
 
   renderSummary(plan);
-  renderLegWeather(plan);
   renderChecklist(plan.checklist);
   restoreFocus();
 }
@@ -1847,48 +1845,6 @@ function renderNavlog(plan) {
  *  3.6 can tell at a glance whether the choice was close or obvious, and
  *  whether the day is worth waiting out.
  */
-function renderLegWeather(plan) {
-  const block = $('weather-block');
-  const body = document.querySelector('#legwx tbody');
-  const rows = plan.weather || [];
-  body.innerHTML = '';
-  if (!rows.length) { block.hidden = true; return; }
-  block.hidden = false;
-
-  $('weather-note').textContent = plan.weather_settled
-    ? `settled in ${plan.weather_passes} pass${plan.weather_passes === 1 ? '' : 'es'}`
-    : `did not settle in ${plan.weather_passes} passes — see the warning above`;
-
-  const wind = (w) => (w == null ? '—'
-    : `${String(Math.round(w.from_deg)).padStart(3, '0')}/${Math.round(w.speed_kt)}`);
-  const gal = (v) => (v == null ? '—' : v.toFixed(2));
-  const end = (chosen) => (chosen === 'start' ? 'departure end'
-    : chosen === 'end' ? 'arrival end' : 'no forecast');
-
-  for (const row of rows) {
-    const tr = document.createElement('tr');
-    if (!row.chosen) tr.className = 'note';
-    // The winning end is marked in the table itself, so the row reads as a
-    // comparison rather than as four unrelated numbers.
-    const won = (which) => (row.chosen === which ? ' class="num chosen"' : ' class="num"');
-    tr.innerHTML =
-      `<td>${row.from}</td><td>${row.to}</td>` +
-      `<td>${end(row.chosen)}</td>` +
-      `<td class="num">${row.valid_time ? zulu(row.valid_time) : '—'}</td>` +
-      `<td${won('start')}>${wind(row.start_wind)}</td>` +
-      `<td${won('start')}>${gal(row.start_fuel_gal)}</td>` +
-      `<td${won('end')}>${wind(row.end_wind)}</td>` +
-      `<td${won('end')}>${gal(row.end_fuel_gal)}</td>`;
-    body.appendChild(tr);
-    if (row.note) {
-      const note = document.createElement('tr');
-      note.className = 'note';
-      note.innerHTML = `<td colspan="8">${row.note}</td>`;
-      body.appendChild(note);
-    }
-  }
-}
-
 // --- go / no-go ---------------------------------------------------------
 
 function renderChecklist(checklist) {

@@ -68,12 +68,12 @@ class TestTheCorridor:
         assert "on the track" in kept[0].reasons[0]
 
     def test_one_just_inside_the_corridor_is_kept(self):
-        kept = keep([notam(position=off_track(19.0))])
+        kept = keep([notam(position=off_track(9.0))])
         assert len(kept) == 1
-        assert kept[0].distance_nm == pytest.approx(19.0, abs=0.3)
+        assert kept[0].distance_nm == pytest.approx(9.0, abs=0.3)
 
     def test_one_just_outside_it_is_dropped(self):
-        assert keep([notam(position=off_track(21.0))]) == ()
+        assert keep([notam(position=off_track(11.0))]) == ()
 
     def test_the_corridor_width_is_the_callers(self):
         far = [notam(position=off_track(30.0))]
@@ -81,12 +81,12 @@ class TestTheCorridor:
         assert len(keep(far, corridor_nm=40.0)) == 1
 
     def test_a_notams_own_radius_reaches_into_the_corridor(self):
-        """A five-mile circle eighteen miles off track touches a 20 nm
-        corridor; a point at the same place is fifteen miles clear of it."""
-        assert keep([notam(position=off_track(34.0))]) == ()
-        kept = keep([notam(position=off_track(34.0), radius_nm=15.0)])
+        """A fifteen-mile circle twenty-four miles off track touches a 10 nm
+        corridor; a point at the same place is fourteen miles clear of it."""
+        assert keep([notam(position=off_track(24.0))]) == ()
+        kept = keep([notam(position=off_track(24.0), radius_nm=15.0)])
         assert len(kept) == 1
-        assert kept[0].distance_nm == pytest.approx(19.0, abs=0.5)
+        assert kept[0].distance_nm == pytest.approx(9.0, abs=0.5)
 
     def test_distance_is_measured_to_the_leg_not_the_line_through_it(self):
         """A NOTAM two hundred miles beyond the destination is on the great
@@ -255,7 +255,7 @@ class TestPriority:
     def test_the_briefing_is_ordered_worst_first_then_nearest(self):
         entries = keep([
             notam(key="a", text="MOWING ADJ TWY B"),
-            notam(key="b", text="RWY 12/30 CLSD", position=off_track(15.0)),
+            notam(key="b", text="RWY 12/30 CLSD", position=off_track(8.0)),
             notam(key="c", text="TWY A CLSD"),
             notam(key="d", text="RWY 06/24 CLSD"),
         ])

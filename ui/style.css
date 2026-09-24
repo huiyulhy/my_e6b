@@ -224,6 +224,14 @@ input:disabled { opacity: .45; cursor: not-allowed; }
 #copy:hover { border-color: var(--accent); color: var(--accent); }
 
 .table-scroll { overflow: auto; flex: 1; min-height: 0; }
+/* The navigation log is this panel's subject, and it may never be squeezed
+   out of existence by the blocks that describe it. `flex: 1; min-height: 0`
+   alone lets it absorb the whole deficit when its siblings refuse to shrink:
+   fetching weather for a nine-leg route left the table at exactly zero height
+   with "Weather by leg" sitting directly under the heading, which reads as
+   the log having been replaced rather than scrolled. Enough rows here to be
+   recognisably a navigation log, and it scrolls within that. */
+#navlog-wrap > .table-scroll { min-height: 180px; }
 table { width: 100%; border-collapse: collapse; font-size: 12px; }
 th, td { padding: 5px 9px; text-align: left; white-space: nowrap; }
 th {
@@ -253,10 +261,12 @@ tr.row-ground td.num:nth-last-child(3) { color: var(--ink); }
 /* --- NOTAMs ------------------------------------------------------------ */
 /* A list rather than a table: the text is the notice, and it is the one thing
    here that cannot be truncated into a column. */
-#notam-block { border-top: 1px solid var(--line); flex: none; }
+/* Yields before the navlog for the same reason "Weather by leg" does: a long
+   briefing must not leave the log it annotates at zero height. */
+#notam-block { border-top: 1px solid var(--line); flex: 0 1 auto; min-height: 0; }
 #notam-block .navlog-head { padding-top: 8px; }
 #notam-note { font-size: 11px; }
-#notam-list { padding: 0 14px 10px; max-height: 40vh; overflow: auto; }
+#notam-list { padding: 0 14px 10px; max-height: 33vh; overflow: auto; }
 .notam-none { padding: 4px 0 8px; }
 
 .notam {
@@ -280,23 +290,6 @@ tr.row-ground td.num:nth-last-child(3) { color: var(--ink); }
 /* A closed runway should be findable by eye in a list of twenty. */
 .notam.critical .notam-text { color: var(--warn); }
 .notam.information .notam-text { color: var(--ink-dim); }
-
-/* --- weather by leg ---------------------------------------------------- */
-/* The second list, under the first. It does not scroll with the navlog: it is
-   one row per leg the pilot drew, so it is always the shorter of the two and
-   there is nothing to gain by hiding it. */
-#weather-block { border-top: 1px solid var(--line); flex: none; }
-#weather-block .navlog-head { padding-top: 8px; }
-#weather-block .table-scroll { flex: none; max-height: 40vh; }
-#weather-note { font-size: 11px; }
-/* The end that won the comparison. Marking it in the table is what makes the
-   four numbers read as a comparison rather than as four separate readings. */
-#legwx td.chosen { color: var(--ink); font-weight: 600; }
-#legwx td.num { color: var(--ink-dim); }
-#legwx tr.note td {
-  color: var(--ink-dim); font-size: 11px; font-family: inherit;
-  border-bottom: none; padding-top: 0;
-}
 
 .airport-label {
   font-family: var(--mono); font-size: 10px; color: #8ea3ba;
