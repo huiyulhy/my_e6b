@@ -20,10 +20,12 @@ Table structure, which is not uniform and drives the code below:
   climb speed column is read as a plain 1-D lookup
 * cruise   -- RAGGED: which RPM settings exist depends on altitude (2100 RPM
   only appears at 2000-4000 ft, 2700 RPM only at 8000-10000 ft), so this one
-  cannot use a regular grid. It is stored one altitude page at a time and
-  read in sequence -- temperature, then RPM within that page, then between
-  pages -- so a setting the POH omits at an altitude is refused rather than
-  interpolated around. See `cruise`.
+  cannot use a regular grid. It is stored one altitude page at a time, and
+  unlike every other chart here its altitude is a *selector rather than an
+  interpolation axis*: the query is rounded down to the page at or below it,
+  which is then read at temperature and then RPM. Rounding down is the
+  conservative direction on fuel and it is what makes the ragged chart
+  readable at all. See `cruise`.
 """
 
 from __future__ import annotations
@@ -673,10 +675,33 @@ def cruise(
     data_dir: Path | None = None,
 ) -> CruisePoint:
     """Cruise power, true airspeed and fuel flow at a given power setting.
-    Interpolate in the following order:
-    1. Temperature
-    2. RPM
-    3. pressure altitude
+
+    The altitude is a **chart selector, not an interpolation axis**: it is
+    rounded *down* to the published page at or below the query, and that one
+    page is then read at temperature and then RPM. Two reasons, in order of
+    weight:
+
+    1. Conservative on fuel. A lower page is denser air and more power, so it
+       reads a higher fuel burn per nautical mile than the true altitude
+       would -- 0.0789 against 0.0769 gal/nm at 7,900 ft read on the 6,000 ft
+       page at 2500 RPM, about 2.6%, which is the worst case on this chart.
+    2. It is what makes the ragged chart readable. RPM settings drop off the
+       top of the chart as it climbs -- 2100 and 2550 above 4,000 ft, 2200
+       above 8,000 ft -- so blending two pages let the *upper* page's omission
+       refuse a setting the pilot's own altitude publishes perfectly well.
+       Reading one page asks only whether that page has the setting.
+
+    The only refusal left is a setting missing from the page at or below the
+    query, which happens where the setting is not available that low yet:
+    2650 below 6,000 ft, 2700 below 8,000 ft. That is a real limit on the
+    power available up there, not a gap to interpolate across.
+
+    The cost is that TAS is read optimistically for the same reason fuel flow
+    is read conservatively. That 6,000 ft page reads 114 KTAS where 7,900 ft
+    would give 112.1, so a leg plans about a minute per 100 nm quicker than it
+    will fly. Fuel per nautical mile still errs the safe way, but ETAs and
+    leg times taken off this chart run slightly early, and anything downstream
+    reading ground speed inherits that.
 
     Assumes the POH cruise condition: 2550 lb, recommended lean mixture.
     """
@@ -697,31 +722,25 @@ def cruise(
             f"cruise pressure altitude {pressure_altitude_ft:g} ft is outside "
             f"the published range [{alts[0]:g}, {alts[-1]:g}]"
         )
-    k = min(
-        max(int(np.searchsorted(alts, pressure_altitude_ft, side="right")) - 1, 0),
-        len(alts) - 2,
-    )
-    span = alts[k + 1] - alts[k]
-    frac = float((pressure_altitude_ft - alts[k]) / span)
+    # Round down to the published page at or below the query. The epsilon
+    # keeps a query sitting exactly on a page on that page rather than on the
+    # one below it.
+    index = int(np.searchsorted(alts, pressure_altitude_ft + 1e-9, side="right")) - 1
+    page = min(max(index, 0), len(alts) - 1)
 
-    # A query sitting exactly on a published altitude is read off only that page
-    if frac <= 1e-9:
-        pages, weights = [k], [1.0]
-    elif frac >= 1.0 - 1e-9:
-        pages, weights = [k + 1], [1.0]
-    else:
-        pages, weights = [k, k + 1], [1.0 - frac, frac]
-
-    total = np.zeros(3)
-    for page, weight in zip(pages, weights):
-        total += weight * _cruise_page(table, page, rpm, isa_dev)
-    return CruisePoint(float(total[0]), float(total[1]), float(total[2]))
+    values = _cruise_page(table, page, rpm, isa_dev)
+    return CruisePoint(float(values[0]), float(values[1]), float(values[2]))
 
 
 def _cruise_page(
     table: _CruiseTable, page: int, rpm: float, isa_dev_c: float
 ) -> np.ndarray:
-    """Read one altitude page at a deviation column and an RPM, in that order."""
+    """Read one altitude page at a deviation column and an RPM, in that order.
+
+    `page` has already been chosen by `cruise` as the published altitude at or
+    below the query, so this never blends pages and the RPM axis it consults
+    is the one axis that matters.
+    """
     devs, axis, values = table.isa_devs, table.rpms[page], table.values[page]
     altitude = table.altitudes[page]
 
@@ -732,14 +751,16 @@ def _cruise_page(
     t_frac = (isa_dev_c - devs[j]) / (devs[j + 1] - devs[j])
     by_rpm = values[:, j, :] + t_frac * (values[:, j + 1, :] - values[:, j, :])
 
-    # 2. RPM, within this altitude's own published settings. Outside them the
-    #    POH is not silent by accident: the setting does not belong here.
+    # 2. RPM, within this page's own published settings. Outside them the POH
+    #    is not silent by accident: since the page is the one at or below the
+    #    query, a setting missing from it is one that is not available this
+    #    low -- a limit on the power there is, not a hole in the chart.
     lo, hi = table.rpm_range(page)
     if not (lo - 1e-9 <= rpm <= hi + 1e-9):
         raise OutsidePOHEnvelope(
-            f"the POH publishes no {rpm:g} RPM cruise setting at {altitude:g} ft; "
-            f"that page runs {lo:g} to {hi:g} RPM. A setting missing from a page "
-            f"is one that should not be used at that altitude."
+            f"the POH publishes no {rpm:g} RPM cruise setting on the {altitude:g} ft "
+            f"page, which runs {lo:g} to {hi:g} RPM. That is the page at or below "
+            f"the query, so the setting is not available that low."
         )
     i = min(max(int(np.searchsorted(axis, rpm, side="right")) - 1, 0), len(axis) - 2)
     r_frac = (rpm - axis[i]) / (axis[i + 1] - axis[i])
@@ -770,13 +791,17 @@ def _cruise_page(
 #
 # How big that part is, measured across the chart: reading the ISA+20 column
 # of a page against the standard-temperature page at the same density altitude
-# agrees to within about 1% on both fuel flow and true airspeed, in either
+# agrees to within about 1.6% on both fuel flow and true airspeed, in either
 # direction. That is the size of the approximation, and it is also the size of
 # the step at the seam -- a plan does not move smoothly from the last
 # published column to the first substituted reading, it jumps by up to that
 # much. Small against a POH chart digitized to the nearest knot and tenth of a
 # gallon, but real, and the reason the substitution is a fallback rather than
 # the normal path.
+#
+# It was about 1% while `cruise` interpolated its altitude axis. Rounding down
+# to a page moves the substituted reading by up to a page of its own, and the
+# two disagreements compound.
 #
 # The chart's total reach in density altitude is about -480 ft to 14,270 ft.
 # Beyond that there is no equal-density page to move to, and the refusal
@@ -844,7 +869,7 @@ class CruiseLookup:
 
         Marked `conservative=False`. Not because the equal-density reading is
         careless -- every number still comes from inside the published grid --
-        but because its error runs both ways: about 1% on fuel flow and true
+        but because its error runs both ways: about 1.6% on fuel flow and true
         airspeed, in either direction, with a step of up to that much at the
         seam. An approximation that can read a plan *better* than it will fly
         is one the pilot is entitled to see before treating the answer as the
@@ -868,7 +893,7 @@ class CruiseLookup:
                     f"{self.pressure_altitude_ft:.0f} ft and "
                     f"ISA{self.isa_deviation_c:+.0f}, the nearest published air "
                     f"of the same density ({self.density_altitude_ft:.0f} ft), "
-                    f"which agrees to about 1% on fuel flow and true airspeed"
+                    f"which agrees to about 1.6% on fuel flow and true airspeed"
                 ),
                 conservative=False,
             ),
@@ -963,8 +988,9 @@ def cruise_at_density(
 
     alts = table.altitudes
     # 2. The same air, at standard temperature, where the chart has a page for
-    #    it. Not snapped to a published altitude: `cruise` interpolates between
-    #    pages for every other query and there is no reason to be coarser here.
+    #    it. Handed over as a raw density altitude rather than snapped to a
+    #    page here: `cruise` rounds it down to one like any other query, so the
+    #    substitution stays conservative the same way the normal path is.
     if alts[0] <= density_alt <= alts[-1]:
         equivalent_oat = isa_temperature_c(density_alt)
         return CruiseLookup(
@@ -1081,8 +1107,8 @@ def available_cruise_rpm(
 
     Used by the altitude optimiser, which needs to enumerate real power
     settings rather than guess at one and be refused. Between two altitude
-    pages this is the *intersection* of what they publish, since a query
-    there is read from both.
+    pages this is what the *lower* page publishes, since that is the only page
+    a query there is read from.
 
     `density_substitution` asks the same question of `cruise_at_density`
     instead: which settings exist where the chart would actually be read for

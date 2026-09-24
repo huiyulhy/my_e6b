@@ -129,7 +129,7 @@ class TestRefusesToExtrapolate:
 
 
 class TestCruiseSequence:
-    """Cruise reads temperature, then RPM within a page, then between pages."""
+    """Cruise rounds the altitude down to a page, then reads temperature, then RPM."""
 
     @staticmethod
     def _page(alt, rpm, isa_dev):
@@ -159,26 +159,71 @@ class TestCruiseSequence:
         )
 
     def test_matches_the_sequence_done_by_hand(self):
-        """7000 ft between pages, 2450 RPM between settings, ISA+5 between columns."""
-        lo, hi = self._page(6000, 2450, 5), self._page(8000, 2450, 5)
-        want = [a + 0.5 * (b - a) for a, b in zip(lo, hi)]
+        """7000 ft reads the 6000 ft page, at 2450 RPM and ISA+5 within it."""
+        want = self._page(6000, 2450, 5)
         got = perf.cruise(7000, 2450, _oat(7000, 5))
         assert [got.percent_power, got.ktas, got.gph] == pytest.approx(want)
+
+    @pytest.mark.parametrize("altitude", [6000, 6001, 7000, 7999])
+    def test_the_whole_band_reads_the_page_below_it(self, altitude):
+        """Altitude is a selector, not an axis: nothing blends toward 8000 ft."""
+        got = perf.cruise(altitude, 2400, _oat(altitude, 5))
+        assert [got.percent_power, got.ktas, got.gph] == pytest.approx(
+            self._page(6000, 2400, 5)
+        )
+
+    def test_reading_down_a_page_is_conservative_on_fuel(self):
+        """The whole reason for rounding down: it never under-reads the burn.
+
+        Per nautical mile, which is what a leg is actually charged. The lower
+        page is denser air and more power, so it reads both a higher fuel flow
+        and a higher true airspeed -- the ratio is what has to err safe.
+        """
+        read = perf.cruise(7900, 2500, _oat(7900))
+        true_page = self._page(8000, 2500, 0)
+        assert read.gph / read.ktas > true_page[2] / true_page[1]
 
     @pytest.mark.parametrize(
         ("alt", "rpm", "culprit"),
         [
             (2000, 2700, 2000),  # above what the 2000 ft page publishes
             (6000, 2100, 6000),  # below what the 6000 ft page publishes
-            (7000, 2700, 6000),  # between pages: the lower one refuses
-            (5000, 2100, 6000),  # between pages: the upper one refuses
+            (7000, 2700, 6000),  # not available this low: 2700 starts at 8000
+            (5000, 2650, 4000),  # not available this low: 2650 starts at 6000
             (12000, 2700, 12000),  # the top page stops at 2650
         ],
     )
     def test_a_setting_missing_from_a_page_is_refused(self, alt, rpm, culprit):
-        """Not a hole to interpolate around: the POH omits it on purpose."""
-        with pytest.raises(perf.OutsidePOHEnvelope, match=f"at {culprit} ft"):
+        """The page at or below the query does not publish it, so neither do we.
+
+        Every case here is a setting that only becomes available higher up, so
+        the refusal is a real limit on the power there is at this altitude
+        rather than a gap in the chart to interpolate across.
+        """
+        with pytest.raises(
+            perf.OutsidePOHEnvelope, match=f"on the {culprit} ft page"
+        ):
             perf.cruise(alt, rpm, _oat(alt))
+
+    @pytest.mark.parametrize(
+        ("alt", "rpm", "page"),
+        [
+            (5000, 2100, 4000),  # 2100 drops off above 4000, but 5000 reads 4000
+            (5000, 2550, 4000),  # likewise 2550
+            (9000, 2200, 8000),  # 2200 drops off above 8000
+        ],
+    )
+    def test_a_setting_the_page_above_drops_is_still_read(self, alt, rpm, page):
+        """The upper page's omission no longer vetoes a setting below it.
+
+        These are exactly the settings that used to be refused between pages:
+        the page the query rounds down to publishes them, the next one up does
+        not, and only the first page is consulted now.
+        """
+        got = perf.cruise(alt, rpm, _oat(alt, 5))
+        assert [got.percent_power, got.ktas, got.gph] == pytest.approx(
+            self._page(page, rpm, 5)
+        )
 
     @pytest.mark.parametrize(
         ("alt", "rpm"), [(2000, 2100), (4000, 2100), (8000, 2700), (10000, 2700)]
@@ -187,11 +232,12 @@ class TestCruiseSequence:
         """Sitting exactly on a page, its neighbour's narrower list cannot veto."""
         assert perf.cruise(alt, rpm, _oat(alt)).ktas > 0
 
-    def test_available_rpm_is_the_intersection_between_pages(self):
-        """Between pages only settings both publish can be read."""
+    def test_available_rpm_is_what_the_page_below_publishes(self):
+        """Between pages the settings are the lower page's, since that is what is read."""
         at_5000 = perf.available_cruise_rpm(5000, _oat(5000))
-        assert 2100.0 not in at_5000  # 4000 has it, 6000 does not
-        assert 2600.0 in at_5000  # both pages have it
+        assert at_5000 == perf.available_cruise_rpm(4000, _oat(4000))
+        assert 2100.0 in at_5000  # 4000 ft has it; 6000 ft does not, and cannot veto
+        assert 2650.0 not in at_5000  # 2650 does not start until 6000 ft
         for rpm in at_5000:
             perf.cruise(5000, rpm, _oat(5000))  # must not raise
 
@@ -270,8 +316,10 @@ class TestCruiseAtDensity:
         A setting the POH leaves off a page is left off deliberately, and the
         substitution has no standing to put it back.
         """
+        # ISA+25 at 4000 ft is about 6,400 ft of density altitude, which reads
+        # on the 6000 ft page -- and 2100 RPM is not published from 6000 up.
         with pytest.raises(perf.OutsidePOHEnvelope, match="RPM"):
-            perf.cruise_at_density(2000, 2100, _oat(2000, 35))
+            perf.cruise_at_density(4000, 2100, _oat(4000, 25))
 
     def test_hotter_air_keeps_costing_speed_across_the_seam(self):
         """True airspeed must not jump upward where the substitution starts.
@@ -299,9 +347,14 @@ class TestCruiseAtDensity:
         The chart's own ISA+20 column and the standard-temperature page at the
         same density altitude do not agree exactly -- cruise performance is
         not a pure function of density -- so a plan jumps a little where the
-        substitution takes over. It jumps by about 1%, in either direction,
-        which is what makes this a defensible fallback and not a free lunch.
-        A regression that widened it would show here.
+        substitution takes over. A regression that widened it would show here.
+
+        The step is about 1.6% at worst, in either direction, measured across
+        the chart. It was about 1% while the altitude axis was interpolated:
+        rounding down to a page moved the substituted reading by up to a page
+        of its own, and the two disagreements compound. Still small against a
+        chart digitized to the knot and the tenth of a gallon, and still the
+        reason this is a fallback rather than the normal path.
         """
         for altitude in (2000, 4000, 6000, 8000):
             for rpm in (2300, 2400, 2500):
@@ -312,7 +365,7 @@ class TestCruiseAtDensity:
                 )
                 assert substituted.substituted is True
                 assert substituted.point.gph == pytest.approx(
-                    published.gph, rel=0.01
+                    published.gph, rel=0.02
                 )
                 assert substituted.point.ktas == pytest.approx(
                     published.ktas, rel=0.01

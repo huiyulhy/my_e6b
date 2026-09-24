@@ -140,7 +140,7 @@ POH Section 5 tables and interpolation. **Two rules govern this module:**
 | landing | press alt × temp | 2550 lb only — the POH publishes max weight only. Using it at lower weights is conservative, which errs the right way. |
 | climb rate | press alt × temp | **One blank cell** at 12000 ft / 40 °C. |
 | climb dist | press alt | Time and fuel are cumulative from sea level — a segment is the difference of two rows. The speed column is read directly and averaged over the segment; the distance column is not read at all (see below). |
-| cruise | (alt, RPM) × temp | **Ragged**: 2100 RPM exists only at 2000–4000 ft, 2700 RPM only at 8000–10000 ft. Temp is always full. |
+| cruise | alt → (RPM × temp) | **Ragged**: 2100 RPM exists only at 2000–4000 ft, 2700 RPM only at 8000–10000 ft. Temp is always full. Altitude is a page *selector*, not an axis — see below. |
 
 ### Two mechanisms handle the irregularity
 
@@ -151,23 +151,42 @@ POH does publish. So `_Grid` carries a **parallel validity interpolator**: value
 with the hole zeroed, and the mask reports how much of each query's weight came from published
 cells. Answerable only if all of it did.
 
-**Ragged cruise — Delaunay, not a regular grid.** A `RegularGridInterpolator` needs a full
-grid; cruise has none. Instead the `(altitude, RPM)` points that actually exist are triangulated
-once — **axis-normalised first**, since altitude spans thousands and RPM hundreds, and raw
-Delaunay would be badly conditioned. One `LinearNDInterpolator` per published temperature shares
-that triangulation; results blend linearly in temperature. Queries landing in a hole return NaN
-and become a refusal. Falling outside the convex hull is refused for free — the desired
-behaviour, obtained structurally rather than by a bounds check.
+**Ragged cruise — one page, selected by rounding the altitude down.** A
+`RegularGridInterpolator` needs a full grid; cruise has none, because the RPM list slides upward
+and narrows with height. So cruise is stored one altitude page at a time, and **altitude is a
+chart selector rather than an interpolation axis**: a query is rounded *down* to the published
+page at or below it, and that single page is read at temperature and then RPM. Nothing blends
+between pages.
+
+Rounding down rather than interpolating buys two things:
+
+- **It errs safe on fuel.** The lower page is denser air and more power, so it reads a higher
+  burn per nautical mile — 0.0789 against 0.0769 gal/nm at 7,900 ft read on the 6,000 ft page at
+  2500 RPM, the worst case on this chart, about 2.6%.
+- **It makes the raggedness answerable.** Blending two pages meant the *upper* page's omission
+  could refuse a setting the pilot's own altitude publishes perfectly well — 2100 and 2550 RPM
+  above 4,000 ft, 2200 above 8,000 ft were all refused between pages for no reason the POH
+  gives. Reading one page asks only whether *that* page has the setting.
+
+The refusals that remain are settings missing from the page at or below the query — 2650 below
+6,000 ft, 2700 below 8,000 ft. Those are real limits on the power available that low, not holes
+to interpolate across.
+
+The price is paid on the other side of the same coin: **TAS is read optimistically**, 114 KTAS
+where 7,900 ft would give 112.1, so legs plan about a minute per 100 nm quicker than they fly.
+Fuel per nautical mile still errs safe, but ETAs off this chart run slightly early and anything
+reading ground speed inherits that.
 
 `available_cruise_rpm(alt, temp)` enumerates settings that actually exist at an altitude, so
-the altitude optimiser can iterate real options instead of guessing and being refused.
+the altitude optimiser can iterate real options instead of guessing and being refused. Between
+pages it reports the lower page's list, since that is the only page a query there reads.
 
 ### What counts as an extrapolation, and what happens to it — `perf.OffChart`
 
 The rule is one sentence: a query past the edge of a chart is **refused**, or answered from a
 **published cell beside it** — never from a curve fitted past the last row. `_bracket` raises
-outside an axis, `_Grid`'s mask refuses a query drawing on a blank cell, the ragged cruise
-pages refuse an RPM they do not publish, and a tailwind past the 10 kt the correction covers is
+outside an axis, `_Grid`'s mask refuses a query drawing on a blank cell, the selected cruise
+page refuses an RPM it does not publish, and a tailwind past the 10 kt the correction covers is
 refused rather than projected down a slope that compounds at 10% per 2 kt.
 
 But refusing *everything* off the edge fails ordinary days for ordinary reasons. A high-pressure
@@ -180,7 +199,9 @@ happened, with the field that decides what to do about it:
   than the chart admits, so the distance reads long and the climb reads flat. A plan built on it
   is still a plan you can fly.
 - **`conservative=False`** — the substitute errs the other way, or both ways. The equal-density
-  cruise reading is accurate to about 1% on fuel flow and TAS *in either direction*; a level
+  cruise reading is accurate to about 1.6% on fuel flow and TAS *in either direction* — it was
+  about 1% while altitude was interpolated, and rounding the substituted reading down to a page
+  compounds the two disagreements; a level
   stretch below the chart's 2000 ft floor is read where the engine makes less power than it
   really will, so the fuel flow reads low and the reserve looks better than it is.
 
@@ -724,7 +745,7 @@ information: burying a NOTAM nobody classified is the failure that matters.
 
 #### The source: SkyLink, through RapidAPI
 
-NOTAMs come from SkyLink, reached through RapidAPI with one key in `RAPIDAPI_KEY`. Unconfigured,
+NOTAMs come from SkyLink, reached through RapidAPI with one key in `RAPID_API_KEY`. Unconfigured,
 `/api/notams` says exactly that instead of returning nothing: **"no NOTAMs" and "no NOTAM service"
 look identical on a briefing page and mean opposite things.** For the same reason a partly failed
 search is labelled rather than shown as a clean result, and the panel always says how many were
@@ -846,10 +867,20 @@ colours and is quantised to 255, which is the one lossy step in the pipeline and
 image that is already a reduction. The palette is written no longer than the tile needs, since
 most tiles hold a handful of colours and a padded 256-entry table would be 768 bytes on each.
 
-Zoom is where the size is. The top level is roughly three quarters of a chart's tiles, so the
-sectional is capped at z11 and the terminal area charts run to their native z13, where the
-detail is actually wanted. MapLibre overzooms past whatever the manifest advertises, so a
-capped chart goes soft rather than blank.
+Zoom is where the size is, and it is the dial to turn when the committed tree gets too big.
+Each level has four times the tiles of the one below, so the top one or two are most of the
+bytes — for the Bay Area set, the full pyramid is 93 MB and two levels off the top is 33 MB.
+MapLibre overzooms past whatever the manifest advertises, so a capped chart goes soft rather
+than blank, and `make charts MAXZOOM=` is what sets the cap.
+
+What is committed now is the sectional to z10 and the terminal area charts to z12. The
+sectional is crisp at the zoom a route is actually planned at and blocky if you push past it;
+the terminal charts are within a level of native over the ground where you would.
+
+| Committed | Tiles | Size |
+|---|---|---|
+| Sectional z5–10, TAC and Flyway z5–12 | 2,381 | 33 MB |
+| Sectional z5–11, TAC and Flyway z5–13 | 8,968 | 93 MB |
 
 ## 5. Verification strategy
 

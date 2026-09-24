@@ -13,6 +13,7 @@ run modes will drift apart. See docs/ARCHITECTURE.md section 2.
 
 from __future__ import annotations
 
+import logging
 import threading
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -50,6 +51,19 @@ MAX_FORECAST_HOURS = 12
 ROOT = Path(__file__).resolve().parent.parent
 UI_DIR = ROOT / "ui"
 DATA_DIR = ROOT / "data"
+
+# Uvicorn configures its own loggers and leaves the root one alone, so a
+# warning raised anywhere in `engine/` or `server/` falls through to Python's
+# handler of last resort -- which prints the bare message, with no level on
+# it. That is the difference between a deployment whose log can be searched
+# for "WARNING" and one an operator has to read line by line. Only added when
+# nothing else has configured logging, so a host that brought its own setup
+# keeps it.
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(levelname)s:  %(name)s - %(message)s",
+    )
 
 app = FastAPI(title="my_e6b", description="Offline VFR cross-country planner")
 

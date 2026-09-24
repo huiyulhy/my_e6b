@@ -313,10 +313,11 @@ class TestFuelReserve:
             planning_mode="auto",
         )
         assert night.reserve_required_gal > day.reserve_required_gal
-        # Both figures are rounded up to the tenth a pilot writes down, so the
-        # ratio holds to within that rather than exactly.
+        # Both figures are rounded up to the tenth a pilot writes down, and
+        # the 45/30 ratio is applied before that rounding, so the check has to
+        # allow a tenth at each end rather than one overall.
         assert night.reserve_required_gal == pytest.approx(
-            day.reserve_required_gal * 45.0 / 30.0, abs=0.1
+            day.reserve_required_gal * 45.0 / 30.0, abs=0.2
         )
 
 
@@ -325,17 +326,23 @@ class TestConditions:
         """A hot day is slower and climbs worse -- but burns less total fuel.
 
         Not a typo. At a fixed 2400 RPM, hotter air means less power, so cruise
-        drops from 55% to 52% and fuel flow from 7.90 to 7.58 gph. Climb fuel
-        does rise, by the POH's 10%-per-10-degC note, from 2.80 to 3.22 gal.
+        fuel flow drops -- 8.53 to 8.19 gph on the page this reads -- while
+        climb fuel rises by the POH's 10%-per-10-degC note, 3.2 to 3.7 gal.
         The cruise saving outweighs the climb penalty, so the total falls.
 
         The lesson, which has caught this project three times now: a fixed RPM
         is not a fixed power setting. See docs/ARCHITECTURE.md section 5.
+
+        Flown at 8500 ft rather than 7500. Since `cruise` rounds the altitude
+        down to a published page, 7500 ft reads the 6000 ft page, where the
+        saving and the penalty happen to cancel to within the tenth of a
+        gallon a navlog prints -- a genuine tie, not a regression, but it
+        cannot carry the lesson. Every other cruising altitude still shows it.
         """
-        standard = nl.build_navlog([KSQL, KSBP], 7500, conditions=CALM, planning_mode="auto")
+        standard = nl.build_navlog([KSQL, KSBP], 8500, conditions=CALM, planning_mode="auto")
         hot = nl.build_navlog(
             [KSQL, KSBP],
-            7500,
+            8500,
             conditions=nl.Conditions(isa_deviation_c=15.0, flight_date=date(2026, 8, 15)),
             planning_mode="auto",
         )
@@ -761,8 +768,14 @@ class TestPatternAndReserveFuelRates:
         return next(leg for leg in log.legs if leg.phase == phase)
 
     def test_pattern_is_charged_at_pattern_altitude(self):
-        """A sea-level circuit reads the chart's floor, not the cruise page."""
-        log = nl.build_navlog([KSQL, KMRY], 9500, conditions=CALM, planning_mode="auto")
+        """A sea-level circuit reads the chart's floor, not the cruise page.
+
+        Flown to KSBP rather than KMRY: at 9500 ft the KMRY cruise leg is down
+        to about two and a half minutes, and a rate derived from a fuel figure
+        rounded to the tenth is then mostly rounding. KSBP leaves an hour of
+        cruise, so the two rates can be compared for what they are.
+        """
+        log = nl.build_navlog([KSQL, KSBP], 9500, conditions=CALM, planning_mode="auto")
         pattern = self._row(log, "pattern")
         cruise = self._row(log, "cruise")
         # More power available low down, so the circuit costs more per hour
@@ -1186,9 +1199,12 @@ class TestRowPressureAltitude:
             route,
             7500,
             conditions=CALM,
-            overrides={row: nl.LegOverride(pressure_altitude_ft=8000.0)},
+            overrides={row: nl.LegOverride(pressure_altitude_ft=10000.0)},
         )
-        # Thinner air for the level part of the row, so a lower worst-case burn.
+        # Thinner air for the level part of the row, so a lower worst-case
+        # burn. Typed 10000 rather than 8000: the level stretch is short, and
+        # now that the cruise chart is read a page at a time the 8000 ft page
+        # no longer separates from the floor by a whole tenth of a gallon.
         assert higher.legs[row].fuel_gal < base.legs[row].fuel_gal
 
 

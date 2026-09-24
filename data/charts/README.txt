@@ -27,7 +27,13 @@ updating a chart:
     make charts                     # or: make charts MAXZOOM=11
     git add data/charts/tiles
 
-The top zoom level is about three quarters of the bytes. The sectional is
-built to z11 and the terminal area charts to their native z13, which is
-roughly 80 MB for the Bay Area set. MAXZOOM trades sharpness for size;
-MapLibre overzooms past the top level rather than showing nothing.
+Each zoom level has four times the tiles of the one below, so the top one
+or two are most of the bytes. What is committed is the sectional to z10 and
+the terminal area charts to z12 -- 33 MB for the Bay Area set, against
+93 MB for the full pyramid. MAXZOOM sets the cap, and MapLibre overzooms
+past the top level rather than showing nothing, so a capped chart goes soft
+rather than blank.
+
+To trade storage back for sharpness:
+
+    make charts MAXZOOM=11      # or leave MAXZOOM off for native zoom
