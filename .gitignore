@@ -19,3 +19,17 @@ wheels/
 # the app ships with offline.
 .cache/
 data/nasr/
+
+# FAA raster charts are downloaded by hand into data/charts/<sectional|tac>/
+# (see data/charts/README.txt). At 30-80 MB each the source GeoTIFFs stay
+# out of the repo, so everything one level under data/charts/ is ignored --
+# each of those folders is one FAA download.
+data/charts/*/
+!data/charts/README.txt
+
+# Except the rendered tiles, which *are* committed, for the same reason
+# data/aero/airports.sqlite is: they are the build output the app actually
+# ships with. A deployed instance has no GeoTIFFs and not enough memory to
+# decode one, so pre-rendered tiles are the only form in which a chart
+# reaches the browser there. Rebuild with `make charts`.
+!data/charts/tiles/

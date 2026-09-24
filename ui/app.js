@@ -37,6 +37,11 @@ const api = {
     const r = await fetch('/api/status');
     return r.json();
   },
+  /** The raster charts on disk: where each sits, its tile URL, and its dates. */
+  async charts() {
+    const r = await fetch('/api/charts');
+    return r.ok ? r.json() : { charts: [] };
+  },
   /** Surface weather at one field, resolved from METAR, TAF and model.
    *
    *  No `time`: there is no departure time in the form, so this is the
@@ -219,6 +224,7 @@ map.addControl(new maplibregl.ScaleControl({ unit: 'nautical' }), 'bottom-right'
 
 map.on('load', async () => {
   await addBasemap();
+  await addChartLayers();
   addRouteLayers();
   bindMapInteractions();
   refreshAirportLayer();
@@ -336,6 +342,128 @@ async function addAirspace() {
     filter: ['==', ['get', 'class'], 'D'],
   });
 }
+
+// --- raster charts -------------------------------------------------------
+//
+// FAA sectionals and terminal area charts, as Web Mercator tiles the server
+// renders from the GeoTIFFs under data/charts/ (engine/chart_render.py). The
+// menu lists whatever is on disk, grouped by series. A chart is drawn under
+// the airspace outlines and the route so the plan stays legible on top of
+// it, and above the vector basemap, which it replaces where it covers.
+// Which charts are on is remembered per browser: a pilot flying the Bay
+// Area wants the TAC every time.
+
+const CHART_LAYERS_KEY = 'charts.visible';
+// key ("tac/san_francisco_tac") -> { chart, id } in menu (and draw) order.
+const chartLayers = new Map();
+
+function loadVisibleCharts() {
+  try {
+    return new Set(JSON.parse(localStorage.getItem(CHART_LAYERS_KEY) || '[]'));
+  } catch {
+    return new Set();
+  }
+}
+
+function saveVisibleCharts(keys) {
+  try { localStorage.setItem(CHART_LAYERS_KEY, JSON.stringify([...keys])); } catch { /* private mode */ }
+}
+
+async function addChartLayers() {
+  let charts = [];
+  try {
+    charts = (await api.charts()).charts || [];
+  } catch {
+    charts = [];
+  }
+  const visible = loadVisibleCharts();
+  for (const chart of charts) {
+    const key = `${chart.kind}/${chart.slug}`;
+    const id = `chart-${chart.kind}-${chart.slug}`;
+    map.addSource(id, {
+      type: 'raster',
+      tiles: [chart.tiles],
+      tileSize: 256,
+      minzoom: chart.min_zoom,
+      // Past this the source's own pixels are simply magnified; MapLibre
+      // overzooms the last level rather than asking for more.
+      maxzoom: chart.max_zoom,
+      // So no tile is requested for the empty ocean around the chart.
+      bounds: chart.bounds,
+    });
+    map.addLayer({
+      id, type: 'raster', source: id,
+      layout: { visibility: visible.has(key) ? 'visible' : 'none' },
+      paint: { 'raster-fade-duration': 0 },
+    }, 'airspace-fill');
+    chartLayers.set(key, { chart, id });
+  }
+  renderLayerMenu();
+}
+
+function setChartVisible(key, on) {
+  const entry = chartLayers.get(key);
+  if (!entry) return;
+  map.setLayoutProperty(entry.id, 'visibility', on ? 'visible' : 'none');
+  const visible = loadVisibleCharts();
+  if (on) visible.add(key); else visible.delete(key);
+  saveVisibleCharts(visible);
+}
+
+/** The chart's dates, the way the sidebar's currency list words them. */
+function chartDateText(chart) {
+  if (!chart.effective && !chart.expires) return 'edition dates unknown';
+  const span = `${chart.effective || '?'} → ${chart.expires || '?'}`;
+  if (chart.expired) return `${span} — expired`;
+  if (chart.days_remaining != null) return `${span} — ${chart.days_remaining} d left`;
+  return span;
+}
+
+function renderLayerMenu() {
+  const list = $('layers-list');
+  list.innerHTML = '';
+  $('layers-empty').hidden = chartLayers.size > 0;
+  const visible = loadVisibleCharts();
+  let lastKind = null;
+  for (const [key, { chart }] of chartLayers) {
+    if (chart.kind !== lastKind) {
+      const heading = document.createElement('div');
+      heading.className = 'kind';
+      heading.textContent = chart.kind_label;
+      list.appendChild(heading);
+      lastKind = chart.kind;
+    }
+    const label = document.createElement('label');
+    if (chart.expired) label.classList.add('expired');
+    const input = document.createElement('input');
+    input.type = 'checkbox';
+    input.checked = visible.has(key);
+    input.addEventListener('change', () => setChartVisible(key, input.checked));
+    const text = document.createElement('span');
+    text.textContent = chart.name;
+    const date = document.createElement('span');
+    date.className = 'date';
+    date.textContent = chartDateText(chart);
+    text.appendChild(date);
+    if (chart.note) {
+      const note = document.createElement('span');
+      note.className = 'note';
+      note.textContent = chart.note;
+      text.appendChild(note);
+    }
+    label.title = chart.expires
+      ? `Effective ${chart.effective}, expires ${chart.expires}`
+      : chart.name;
+    label.append(input, text);
+    list.appendChild(label);
+  }
+}
+
+$('layers-toggle').addEventListener('click', () => {
+  const panel = $('layers');
+  panel.hidden = !panel.hidden;
+  $('layers-toggle').setAttribute('aria-expanded', String(!panel.hidden));
+});
 
 function addRouteLayers() {
   map.addSource('airports', { type: 'geojson', data: emptyCollection() });

@@ -13,6 +13,7 @@ run modes will drift apart. See docs/ARCHITECTURE.md section 2.
 
 from __future__ import annotations
 
+import threading
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -24,6 +25,8 @@ from pydantic import BaseModel, Field
 from engine import airports as apt
 from engine import aloft as al
 from engine import atmosphere as atm
+from engine import chart_render as render
+from engine import charts as ch
 from engine import consistency as consistency_checks
 from engine import csv_download as csv_export
 from engine import currency as cur
@@ -1310,6 +1313,88 @@ def status() -> dict:
     }
 
 
+# --- raster charts -------------------------------------------------------
+
+# One tile store per chart, kept for the life of the process: the decoded
+# sectional is two hundred megabytes and takes a second to open, so it is
+# opened once and then answers every tile from memory.
+_tile_stores: dict[str, render.TileStore] = {}
+_tile_stores_lock = threading.Lock()
+
+
+def _tiles_url(chart: ch.Chart) -> str:
+    """Where the map should ask for this chart's tiles.
+
+    Pre-rendered, the whole pyramid is already under `data/`, which is
+    mounted as static files -- so the tiles are served by Starlette with no
+    Python in the path, and a deployed instance needs neither the GeoTIFFs
+    nor the memory to decode them. With the charts themselves on disk the
+    map goes through the render endpoint instead, which fills the same cache
+    on demand and so is never short of a zoom level.
+    """
+    root = "/data/charts/tiles" if chart.prerendered else "/api/charts/tiles"
+    return f"{root}/{chart.kind}/{chart.slug}/{{z}}/{{x}}/{{y}}.png"
+
+
+def _chart_json(chart: ch.Chart, today: date) -> dict:
+    dated = cur.Dataset(chart.key, chart.name, chart.effective, chart.expires, chart.note)
+    return {
+        "kind": chart.kind,
+        "kind_label": chart.kind_label,
+        "slug": chart.slug,
+        "name": chart.name,
+        "bounds": list(chart.bounds),
+        "min_zoom": chart.min_zoom,
+        "max_zoom": chart.max_zoom,
+        "effective": chart.effective.isoformat() if chart.effective else None,
+        "expires": chart.expires.isoformat() if chart.expires else None,
+        "expired": dated.expired(today),
+        "days_remaining": dated.days_remaining(today),
+        "note": chart.note,
+        "prerendered": chart.prerendered,
+        "tiles": _tiles_url(chart),
+    }
+
+
+@app.get("/api/charts")
+def list_charts() -> dict:
+    """Every chart this instance can draw, with its footprint and its dates.
+
+    From the GeoTIFFs under data/charts when they are there, and from the
+    tile manifest when they are not -- which is the deployed case.
+    """
+    today = datetime.now(tz=UTC).date()
+    return {"ok": True, "charts": [_chart_json(chart, today) for chart in ch.available()]}
+
+
+def _store_for(kind: str, slug: str) -> render.TileStore:
+    key = f"{kind}/{slug}"
+    with _tile_stores_lock:
+        store = _tile_stores.get(key)
+        if store is None:
+            chart = ch.find(kind, slug)
+            if chart is None:
+                raise HTTPException(status_code=404, detail=f"no chart {key}")
+            try:
+                store = _tile_stores[key] = chart.store()
+            except ch.NoChartFile as exc:
+                # Pre-rendered tiles are served from /data; nothing to render.
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return store
+
+
+@app.get("/api/charts/tiles/{kind}/{slug}/{z}/{x}/{y}.png")
+def chart_tile(kind: str, slug: str, z: int, x: int, y: int) -> Response:
+    """One Web Mercator tile of a chart, rendered on first request and kept."""
+    if not 0 <= z <= 20 or not 0 <= x < 2**z or not 0 <= y < 2**z:
+        raise HTTPException(status_code=404, detail="no such tile")
+    data = _store_for(kind, slug).get(z, x, y)
+    # Tiles change only when the chart file does, which is once per edition.
+    return Response(
+        data, media_type=render.PNG_MEDIA_TYPE, headers={"Cache-Control": "public, max-age=86400"}
+    )
+
+
 # --- static files --------------------------------------------------------
 
 
@@ -1328,6 +1413,11 @@ async def no_cache_the_ui(request, call_next):
         (".js", ".css")
     ):
         response.headers["Cache-Control"] = "no-store, must-revalidate"
+    elif request.url.path.startswith("/data/charts/tiles/"):
+        # The opposite case. A chart tile changes only when the edition does,
+        # once every 56 days, and a map pan asks for dozens of them. Without
+        # this each one is a conditional request to the server on every pan.
+        response.headers["Cache-Control"] = "public, max-age=86400"
     return response
 
 

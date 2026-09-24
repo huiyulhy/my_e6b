@@ -80,13 +80,35 @@ Built, with 672 tests:
 - [engine/weather.py](engine/weather.py) — METAR, TAF and model forecasts decoded and
   reconciled into one report per field, with the source recorded on every value. Pure and
   offline; [server/wx_surface.py](server/wx_surface.py) does the fetching
+- [engine/tiff_reader.py](engine/tiff_reader.py) + [engine/charts.py](engine/charts.py) +
+  [engine/chart_render.py](engine/chart_render.py) — FAA sectional and terminal area raster
+  charts, read straight out of the GeoTIFF (no GDAL), reprojected from Lambert Conformal
+  Conic into map tiles, and dated from the FAA's own metadata so the currency list says when
+  each edition lapses
 - [ui/](ui/) + [server/](server/) — MapLibre route editor with a live navigation log,
-  on a 535 KB offline basemap
+  on a 535 KB offline basemap, with the raster charts under it on a layer switch
+
+## Charts
+
+Sectional and terminal area charts are not in the repo — they are 30–80 MB apiece and the FAA
+reissues them every 56 days. Download the ones you fly, unzip them into
+`data/charts/sectional/` or `data/charts/tac/`, and they appear in the map's **Layers** button.
+See [data/charts/README.txt](data/charts/README.txt).
+
+```bash
+make charts     # render them into map tiles, and commit those
+```
+
+The tiles *are* committed, unlike the charts. A deployed instance has no GeoTIFFs on it and
+not enough memory to decode one, so pre-rendered tiles are the only form in which a chart
+reaches a browser anywhere but this desktop. While developing you can skip the step: the dev
+server renders each tile the first time the map asks for it.
 
 ## Sources
 - FAA NASR dataset:  https://www.faa.gov/air_traffic/flight_info/aeronav/aero_data/NASR_Subscription/
+- FAA VFR raster charts: https://www.faa.gov/air_traffic/flight_info/aeronav/digital_products/vfr/
 
-The NASR dataset requires updating every 28 days
+The NASR dataset requires updating every 28 days; VFR charts every 56.
 
 Next: the FAA NASR pipeline, then the map UI, then corridor-constrained A\* routing. See
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §6 for the design of everything not yet written.
