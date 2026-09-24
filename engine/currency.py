@@ -170,6 +170,33 @@ def _date_for_decimal_year(decimal_year: float) -> date:
     return start + timedelta(days=round((decimal_year - year) * days_in_year))
 
 
+def charts(on: date | None = None, *, charts_dir: Path | None = None) -> list[Dataset]:
+    """Currency of every raster chart on disk -- one entry per chart.
+
+    VFR charts are reissued every 56 days and the FAA metadata beside each
+    file states the edition's last valid day, so unlike NASR there is no
+    validity window to add: the file says when it stops being current.
+
+    Read from the GeoTIFFs where they exist and from the tile manifest
+    otherwise, so a deployed server -- which has only tiles -- still says how
+    old its charts are. That is the whole point of the list: nothing else
+    out there will tell a pilot the chart under the route has lapsed.
+    """
+    del on
+    from engine import charts as chart_files  # noqa: PLC0415  -- avoids a cycle
+
+    return [
+        Dataset(
+            f"chart:{chart.key}",
+            f"{chart.kind_label} chart: {chart.name}",
+            chart.effective,
+            chart.expires,
+            chart.note,
+        )
+        for chart in chart_files.available(charts_dir)
+    ]
+
+
 def datasets(on: date | None = None) -> list[Dataset]:
     """Every dated dataset, in the order the UI shows them."""
-    return [nasr(on), world_magnetic_model(on)]
+    return [nasr(on), world_magnetic_model(on), *charts(on)]

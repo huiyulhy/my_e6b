@@ -7,7 +7,7 @@
 
 UV := PYTHONPATH= uv
 
-.PHONY: test lint fmt validate serve check data airports basemap ui-shot requirements
+.PHONY: test lint fmt validate serve check data airports basemap airspace charts ui-shot requirements
 
 test:
 	$(UV) run pytest -q
@@ -48,6 +48,17 @@ basemap:
 # targets above this one downloads nothing.
 airspace:
 	$(UV) run python tools/build_airspace.py
+
+# Pre-render every chart under data/charts/ into Web Mercator PNG tiles, plus
+# the manifest that describes them. This is what puts charts on the deployed
+# service: it has no GeoTIFFs, so committed tiles are the only form a chart
+# reaches it in. MAXZOOM caps the pyramid -- the top level is most of the
+# bytes, and MapLibre overzooms past whatever the manifest advertises.
+#
+#     make charts              # native zoom
+#     make charts MAXZOOM=11   # smaller, softer past z11
+charts:
+	$(UV) run python tools/build_charts.py $(if $(MAXZOOM),--max-zoom $(MAXZOOM),)
 
 # Drive the map in a real browser and screenshot it. MapLibre needs WebGL, so
 # this is the only way to catch a broken layer style -- it fails at runtime,

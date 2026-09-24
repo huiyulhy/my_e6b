@@ -15,6 +15,9 @@ dependencies = [
     "fastapi>=0.140.0",
     "numpy>=2.5.1",
     "pandas>=3.0.5",
+    # Decodes the LZW-compressed chart GeoTIFFs and encodes the map tiles
+    # rendered from them (engine/chart_render.py). Pyodide ships it too.
+    "pillow>=11.0",
     "uvicorn>=0.51.0",
 ]
 

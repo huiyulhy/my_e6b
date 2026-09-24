@@ -782,6 +782,75 @@ rather than showing an empty panel.
 
 ---
 
+## 4e. Raster charts — `engine/tiff_reader.py`, `engine/charts.py`, `engine/chart_render.py` — [built]
+
+The sectional and terminal area charts, drawn under the route. The FAA publishes each
+as one palette GeoTIFF (30–80 MB, LZW, Lambert Conformal Conic) with a `.tfw` world file
+and an `.htm` of FGDC metadata. Unzip a download into `data/charts/sectional/` or
+`data/charts/tac/` and it appears in the map's **Layers** menu; nothing is committed
+(see `data/charts/README.txt`).
+
+Three modules, one job each:
+
+- **`tiff_reader`** parses the TIFF directory and GeoTIFF keys directly — pixel scale,
+  tie point, projection parameters — in a few `struct` calls, and implements the Lambert
+  projection both ways (Snyder 15-1 to 15-11). GDAL would do the same and cost a 100 MB
+  dependency that Pyodide does not have. Pixels are decoded by Pillow, which opens the
+  200-megapixel sectional in about a second.
+- **`charts`** walks the folder, and reads each chart's footprint from the tags and its
+  edition dates from the `.htm` (`Beginning_Date` / `Ending_Date`; VFR charts run a 56-day
+  cycle). Each chart becomes a `currency.Dataset`, so the sidebar's currency list shows it
+  going stale beside NASR and the magnetic model. The `.htm` and `.tif` are checked against
+  each other by image size, the way NASR's README is checked against the airport database.
+- **`chart_render`** resamples the Lambert image into Web Mercator XYZ tiles, which is the
+  only raster MapLibre draws. Every tile pixel is projected into chart pixel coordinates
+  and the nearest one taken — vectorised, a few milliseconds a tile. Zoomed out, tiles
+  sample a box-filtered pyramid built lazily so thin lines do not alias away. Outside the
+  image is transparent, so the basemap shows past the chart's edge. `TileStore` keeps
+  tiles as PNG under `data/charts/tiles/`; the dev server fills it on demand
+  (`/api/charts/tiles/…`), `make charts` fills all of it for the offline bundle, and
+  neither renders a tile twice.
+
+The choice that matters: **tiles are rendered outside the browser.** Decoding a
+200-megapixel TIFF and reprojecting it in JavaScript would hold several hundred megabytes
+in a tab and take tens of seconds. Pre-rendered PNG tiles load lazily and are what the PWA
+bundle will ship. Pillow joins the runtime dependencies for this — it is in Pyodide, so the
+rule from §1 holds, and on a deployed server it is never imported at all.
+
+### The deployed case — what is committed and why
+
+`data/charts/` holds the FAA downloads, which are **not** committed: 30–80 MB each, reissued
+every 56 days, and useless to a server that cannot afford to decode one. `data/charts/tiles/`
+holds the pyramid built from them, which **is** committed, on the same reasoning as
+`data/aero/airports.sqlite` — it is the build output the app ships with, and the only form in
+which a chart reaches a browser anywhere but this desktop.
+
+That makes the two run modes genuinely different, and `charts.available()` is where the fork
+lives:
+
+| | Desktop | Deployed |
+|---|---|---|
+| Charts listed from | GeoTIFF headers | `tiles/manifest.json` |
+| Tiles come from | `/api/charts/tiles/…`, rendered on demand | `/data/charts/tiles/…`, static files |
+| Peak memory | 410 MB for a sectional | nothing decoded, ever |
+
+The manifest carries what the headers would have said — footprint, zoom range, edition dates —
+so the layer menu and the currency list read identically either way. Its zoom range is read
+back off the tile directories rather than taken from the chart, because `make charts MAXZOOM=`
+caps the pyramid and a source advertising a level with no tiles behind it shows as holes.
+
+**Tiles are palette PNGs**, which is a third the size of RGBA and matters when every byte is
+committed and cloned on each deploy. A tile cut at the chart's own scale holds only palette
+colours, so its palette is exact and nothing is lost; a tile off a pyramid level holds blended
+colours and is quantised to 255, which is the one lossy step in the pipeline and sits on an
+image that is already a reduction. The palette is written no longer than the tile needs, since
+most tiles hold a handful of colours and a padded 256-entry table would be 768 bytes on each.
+
+Zoom is where the size is. The top level is roughly three quarters of a chart's tiles, so the
+sectional is capped at z11 and the terminal area charts run to their native z13, where the
+detail is actually wanted. MapLibre overzooms past whatever the manifest advertises, so a
+capped chart goes soft rather than blank.
+
 ## 5. Verification strategy
 
 The performance data is **digitized from an unofficial source with no license and no accuracy

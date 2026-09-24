@@ -22,6 +22,8 @@ numpy==2.5.1
     #   pandas
 pandas==3.0.5
     # via my-e6b
+pillow==12.3.0
+    # via my-e6b
 pydantic==2.13.4
     # via fastapi
 pydantic-core==2.46.4

@@ -1,0 +1,63 @@
+{
+  "version": 1,
+  "generated": "2026-09-24",
+  "charts": [
+    {
+      "kind": "sectional",
+      "slug": "san_francisco_sec",
+      "name": "San Francisco SEC",
+      "width": 16658,
+      "height": 12340,
+      "pixel_m": 42.33660067792304,
+      "bounds": [
+        -125.94649911976954,
+        35.857057251937604,
+        -117.63328140547777,
+        40.63945206180063
+      ],
+      "min_zoom": 5,
+      "max_zoom": 11,
+      "effective": "2026-09-03",
+      "expires": "2026-10-28",
+      "note": null
+    },
+    {
+      "kind": "tac",
+      "slug": "san_francisco_fly",
+      "name": "San Francisco FLY",
+      "width": 10823,
+      "height": 7098,
+      "pixel_m": 21.164659679388453,
+      "bounds": [
+        -123.94764494332966,
+        36.951833096280396,
+        -121.31415799388562,
+        38.32459909971787
+      ],
+      "min_zoom": 5,
+      "max_zoom": 13,
+      "effective": "2026-09-03",
+      "expires": "2026-10-28",
+      "note": null
+    },
+    {
+      "kind": "tac",
+      "slug": "san_francisco_tac",
+      "name": "San Francisco TAC",
+      "width": 10493,
+      "height": 7265,
+      "pixel_m": 21.16900811235895,
+      "bounds": [
+        -123.91023240682081,
+        36.85655996012309,
+        -121.35877140572487,
+        38.26107912643405
+      ],
+      "min_zoom": 5,
+      "max_zoom": 13,
+      "effective": "2026-09-03",
+      "expires": "2026-10-28",
+      "note": null
+    }
+  ]
+}

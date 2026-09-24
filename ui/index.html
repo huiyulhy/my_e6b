@@ -134,6 +134,18 @@
   <main id="map-wrap">
     <div id="map"></div>
     <div id="status" class="status">Loading…</div>
+    <!-- Chart layers. The list is built from whatever GeoTIFFs are under
+         data/charts/, so it is empty until a chart has been downloaded. -->
+    <button id="layers-toggle" type="button" aria-controls="layers" aria-expanded="false"
+            title="Choose which raster charts to draw under the route">Layers</button>
+    <div id="layers" class="layers" hidden>
+      <h3>Charts</h3>
+      <div id="layers-list"></div>
+      <p id="layers-empty" class="hint">
+        No charts found. Unzip FAA GeoTIFFs into data/charts/sectional/ or
+        data/charts/tac/ and reload.
+      </p>
+    </div>
     <!-- The E6B bar's handle. It sits on the map rather than in the bar so
          that it survives the bar being hidden -- a toggle inside the thing it
          toggles can only ever be pressed once. -->
