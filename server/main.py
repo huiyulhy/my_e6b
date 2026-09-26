@@ -13,7 +13,10 @@ run modes will drift apart. See docs/ARCHITECTURE.md section 2.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import logging
+import re
 import threading
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -31,6 +34,7 @@ from engine import charts as ch
 from engine import consistency as consistency_checks
 from engine import csv_download as csv_export
 from engine import currency as cur
+from engine import kml
 from engine import magnetic as mag
 from engine import navlog as nl
 from engine import notam as nt
@@ -218,6 +222,19 @@ class PlanRequest(BaseModel):
     # Fractions: 0.20 means "require 20% more than the book distance".
     runway_margin: float = pf.DEFAULT_RUNWAY_MARGIN
     fuel_margin: float = pf.DEFAULT_FUEL_MARGIN
+
+
+class RouteFileIn(BaseModel):
+    """A `.kml` or `.kmz` file, as the browser read it.
+
+    Base64 in JSON rather than a multipart upload: a KMZ is binary, every
+    other endpoint here speaks JSON, and multipart would be the one dependency
+    added for the one endpoint that used it. The size is bounded by the engine
+    before the file is parsed.
+    """
+
+    filename: str = ""
+    content_base64: str
 
 
 class StationIn(BaseModel):
@@ -775,6 +792,106 @@ def navlog_csv(request: PlanRequest, time_off: str | None = None) -> Response:
             )
         },
     )
+
+
+@app.post("/api/route.kml")
+def route_kml(request: PlanRequest) -> Response:
+    """The resolved route as KML, for Google Earth and the like.
+
+    Built from the plan rather than the request's waypoints so that the file
+    carries the planned altitude at every point, TOC and TOD included. The
+    format lives in `engine.kml`; this attaches a filename.
+    """
+    if len(request.waypoints) < 2:
+        return JSONResponse(
+            {"ok": False, "error": "Add a departure and a destination."},
+            status_code=400,
+        )
+    try:
+        solved, _aircraft, _conditions = _build_from_request(request)
+        text = kml.route_kml(solved.navlog)
+    except (nl.RouteError, OutsideModelValidity, ValueError) as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+    return Response(
+        content=text,
+        media_type="application/vnd.google-earth.kml+xml",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="{kml.kml_filename(solved.navlog)}"'
+            )
+        },
+    )
+
+
+# What an airport identifier looks like: KSQL, SQL, 1C9, O88. Used to decide
+# which placemarks in somebody else's file are worth looking up.
+_IDENT_LIKE = re.compile(r"^[A-Z0-9]{3,4}$")
+
+
+@app.post("/api/route/import")
+def import_route(request: RouteFileIn) -> dict:
+    """The waypoints in a KML file, in the shape the UI adds a waypoint in.
+
+    Parsing is the engine's. What this adds is the airport database: a point
+    that names an airport comes back as that airport, at its published
+    position, so that the runways and pattern altitude the go/no-go needs are
+    found again. A file of ours says which of its points are airports; for
+    anybody else's, anything that looks like an identifier is tried, and
+    silently kept as a plain waypoint when it is not one. Nothing is added to
+    the route here: the UI shows what was found and asks first.
+    """
+    try:
+        data = base64.b64decode(request.content_base64, validate=True)
+    except (binascii.Error, ValueError):
+        return JSONResponse({"ok": False, "error": "file content is not base64"}, status_code=400)
+    try:
+        points = kml.parse_kml(data)
+    except kml.KmlError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+    waypoints = []
+    warnings = []
+    for point in points:
+        claims_airport = point.from_extended_data and _is_airport(point)
+        worth_a_look = claims_airport or (
+            not point.from_extended_data and _IDENT_LIKE.match(point.name.upper())
+        )
+        airport = apt.find(point.name) if worth_a_look else None
+        if airport is not None:
+            waypoints.append(
+                {
+                    "name": airport.ident,
+                    "lat": airport.position.lat,
+                    "lon": airport.position.lon,
+                    "kind": airport.kind,
+                    "elevation_ft": airport.elevation_ft,
+                    "altitude_ft": point.altitude_ft,
+                    "segment_type": point.segment_type,
+                    "is_landing": point.is_landing,
+                    "label": airport.label,
+                }
+            )
+            continue
+        if claims_airport:
+            warnings.append(
+                f"{point.name} is not in the airport database; kept as a plain waypoint "
+                "at the position in the file."
+            )
+        waypoints.append(
+            {
+                "name": point.name,
+                "lat": point.lat,
+                "lon": point.lon,
+                "kind": "waypoint",
+                "elevation_ft": point.elevation_ft,
+                "altitude_ft": point.altitude_ft,
+                "segment_type": point.segment_type,
+                "is_landing": False,
+                "label": "",
+            }
+        )
+    return {"ok": True, "waypoints": waypoints, "warnings": warnings}
 
 
 @app.post("/api/notams")

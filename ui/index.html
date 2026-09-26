@@ -234,8 +234,17 @@
   </aside>
 
   <section id="navlog-wrap">
+    <!-- The panel's two faces: the log itself, and the route as a file. The
+         tab is the heading -- the log's own <h2> went with it. -->
+    <div class="tabs" role="tablist">
+      <button type="button" role="tab" id="tab-btn-navlog" aria-selected="true"
+              aria-controls="tab-navlog" data-tab="navlog">Navigation log</button>
+      <button type="button" role="tab" id="tab-btn-route-file" aria-selected="false"
+              aria-controls="tab-route-file" data-tab="route-file">Route file</button>
+    </div>
+
+    <div id="tab-navlog" role="tabpanel" aria-labelledby="tab-btn-navlog">
     <div class="navlog-head">
-      <h2>Navigation log</h2>
       <div class="navlog-actions">
         <button id="reset-edits" type="button" hidden>Reset manual edits</button>
         <!-- Beside the button that uses it, not in the sidebar with the other
@@ -309,6 +318,40 @@
         <span class="hint" id="notam-note"></span>
       </div>
       <div id="notam-list"></div>
+    </div>
+    </div>
+
+    <div id="tab-route-file" role="tabpanel" aria-labelledby="tab-btn-route-file" hidden>
+      <div class="route-file">
+        <section class="block">
+          <h2>Export</h2>
+          <p class="hint">
+            Every waypoint of the plan, TOC and TOD included, at its planned
+            altitude, plus the route as a line. Opens in Google Earth, ForeFlight
+            or anything else that reads KML, and imports back here as the same
+            route.
+          </p>
+          <button id="download-kml" type="button" data-label="Download KML">Download KML</button>
+        </section>
+        <section class="block">
+          <h2>Import</h2>
+          <p class="hint">
+            A <code>.kml</code> or <code>.kmz</code> file. One exported from here
+            comes back exactly; a file drawn elsewhere brings its positions and
+            leaves each leg's climb, cruise or descent to be chosen in the route
+            list.
+          </p>
+          <input id="kml-file" type="file" accept=".kml,.kmz,application/vnd.google-earth.kml+xml,application/vnd.google-earth.kmz">
+          <p id="kml-error" class="alert" hidden></p>
+          <ol id="kml-preview" class="kml-preview"></ol>
+          <p id="kml-warnings" class="hint" hidden></p>
+          <div id="kml-load-row" class="kml-load-row" hidden>
+            <label class="inline"><input type="radio" name="kml-mode" value="replace" checked> Replace route</label>
+            <label class="inline"><input type="radio" name="kml-mode" value="append"> Append to route</label>
+            <button id="kml-load" type="button">Load into route</button>
+          </div>
+        </section>
+      </div>
     </div>
 
   </section>

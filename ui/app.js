@@ -135,6 +135,33 @@ const api = {
     const named = /filename="([^"]+)"/.exec(disposition);
     return { blob: await r.blob(), filename: named ? named[1] : 'navlog.csv' };
   },
+  /** The route as KML, the same way: a file, named by the server. */
+  async routeKml(body) {
+    const r = await fetch('/api/route.kml', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) return { error: (await r.json()).error || 'could not export' };
+    const disposition = r.headers.get('Content-Disposition') || '';
+    const named = /filename="([^"]+)"/.exec(disposition);
+    return { blob: await r.blob(), filename: named ? named[1] : 'route.kml' };
+  },
+  /** The waypoints in a KML/KMZ file. The bytes go up base64 in JSON, like
+   *  every other request here; the server parses and resolves airports. */
+  async importRoute(file) {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    let binary = '';
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    }
+    const r = await fetch('/api/route/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filename: file.name, content_base64: btoa(binary) }),
+    });
+    return r.json();
+  },
   async consistency(body) {
     const r = await fetch('/api/consistency', {
       method: 'POST',
@@ -823,13 +850,39 @@ function insertWaypointAt(lngLat) {
     if (d < bestDistance) { bestDistance = d; bestLeg = i; }
   }
   route.splice(bestLeg + 1, 0, {
-    name: `WP${route.length - 1}`,
+    name: nextWaypointName(),
     lat: +lngLat.lat.toFixed(5),
     lon: +lngLat.lng.toFixed(5),
     kind: 'waypoint',
     elevation_ft: null,
   });
   onRouteChanged();
+}
+
+/** The next free `WP<n>`. Searched, not counted: `WP${route.length}` handed
+ *  out a name already in use after any insert-and-delete, and names have to
+ *  be unique -- see `renameWaypoint`. */
+function nextWaypointName() {
+  const taken = new Set(route.map((w) => w.name.toUpperCase()));
+  let n = 1;
+  while (taken.has(`WP${n}`)) n += 1;
+  return `WP${n}`;
+}
+
+/** Whether a name can be given to this waypoint.
+ *
+ *  Unique, because the route is matched by name in two places: the pilot's
+ *  own fields are carried across a re-resolve by name (`adoptResolvedRoute`),
+ *  and the field weather is cached by name (`fieldWx`). Two points called the
+ *  same thing would silently swap their crossing altitudes. And not one of the
+ *  planner's names: `TOC`, `TOD`, `TOC2`... are what it calls the points it
+ *  inserts, and a pilot's "TOD" would be stripped before every re-plan.
+ */
+function isNameAvailable(name, waypoint) {
+  if (!name) return false;
+  if (/^TO[CD]\d*$/i.test(name)) return false;
+  const upper = name.toUpperCase();
+  return !route.some((w) => w !== waypoint && w.name.toUpperCase() === upper);
 }
 
 /** Planar point-to-segment distance, with longitude scaled by latitude.
@@ -903,6 +956,14 @@ const LOW_ALTITUDE_FT = 3000;
  */
 function isAirport(waypoint) {
   return waypoint.kind === 'airport' || String(waypoint.kind || '').endsWith('_airport');
+}
+
+/** Text for an `innerHTML` template. A waypoint's name is the pilot's own
+ *  since it became renameable, and a name typed as `<b>` must print as one. */
+function escapeHtml(text) {
+  return String(text ?? '')
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 /** Whether this waypoint is somewhere the air *at the ground* matters.
@@ -1096,16 +1157,43 @@ function renderWaypointList() {
         `</div>`
       : `<div class="coords readonly">` +
           `${waypoint.lat.toFixed(4)}, ${waypoint.lon.toFixed(4)}</div>`;
+    // A dropped point's name is the pilot's to change -- it is what the navlog
+    // and the map label print. An airport's is its identifier: the server
+    // looks its runways up by it (`WaypointIn.ident`), so it stays as it is.
+    const name = freeform && !waypoint.generated
+      ? `<input class="wp-name" type="text" maxlength="10" spellcheck="false" ` +
+        `title="Rename this waypoint" value="${escapeHtml(waypoint.name)}">`
+      : `<span class="name">${escapeHtml(waypoint.name)}</span>`;
     li.innerHTML =
       `<div class="wp-row">` +
         `<span class="drag" title="Drag to reorder">⠿</span>` +
         `<span class="seq">${index + 1}</span>` +
-        `<span class="name">${waypoint.name}</span>` +
+        name +
         segment +
         landing +
         `<button class="remove" type="button" title="Remove">×</button>` +
       `</div>` + coords + fieldBlock(waypoint, index);
     li.querySelector('.remove').addEventListener('click', () => removeWaypoint(index));
+
+    const nameBox = li.querySelector('input.wp-name');
+    if (nameBox) {
+      // Ten characters because the text export lays its FROM and TO columns
+      // out that wide (`format_navlog`); a longer name would push the row.
+      nameBox.addEventListener('change', () => {
+        const value = nameBox.value.trim();
+        if (!isNameAvailable(value, waypoint)) {
+          nameBox.value = waypoint.name;
+          return;
+        }
+        if (value === waypoint.name) return;
+        waypoint.name = value;
+        onRouteChanged();
+      });
+      nameBox.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') nameBox.blur();
+        if (e.key === 'Escape') { nameBox.value = waypoint.name; nameBox.blur(); }
+      });
+    }
 
     {
       const bind = (selector, apply) => {
@@ -1654,7 +1742,8 @@ function adoptResolvedRoute(resolved) {
     && (!w.generated || settled(w, route[i])));
   if (same) return;
   route = resolved.map((w, i) => ({
-    // Keep anything of the pilot's the engine does not round-trip.
+    // Keep anything of the pilot's the engine does not round-trip. Matched by
+    // name, which `isNameAvailable` keeps unique across the route.
     ...(w.generated ? {} : route.find((r) => r.name === w.name) || {}),
     name: w.name, lat: w.lat, lon: w.lon, kind: w.kind,
     elevation_ft: w.elevation_ft,
@@ -2613,6 +2702,125 @@ $('copy').addEventListener('click', async () => {
   await navigator.clipboard.writeText(lastPlan.text);
   $('copy').textContent = 'Copied';
   setTimeout(() => { $('copy').textContent = 'Copy as text'; }, 1200);
+});
+
+// --- route file: the navlog panel's second tab -------------------------------
+
+function setTab(name) {
+  for (const button of document.querySelectorAll('.tabs [role="tab"]')) {
+    const selected = button.dataset.tab === name;
+    button.setAttribute('aria-selected', String(selected));
+    $(button.getAttribute('aria-controls')).hidden = !selected;
+  }
+}
+for (const button of document.querySelectorAll('.tabs [role="tab"]')) {
+  button.addEventListener('click', () => setTab(button.dataset.tab));
+}
+
+/** Hand a file the server built to the browser, the way the CSV is. */
+function saveBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
+$('download-kml').addEventListener('click', async () => {
+  const button = $('download-kml');
+  if (!lastPlan?.ok) {
+    button.textContent = route.length < 2 ? 'Nothing to export yet' : 'Plan the route first';
+    setTimeout(() => { button.textContent = button.dataset.label; }, 1600);
+    return;
+  }
+  const { blob, filename, error } = await api.routeKml(planBody());
+  if (error) {
+    button.textContent = 'Export failed';
+    setTimeout(() => { button.textContent = button.dataset.label; }, 1600);
+    return;
+  }
+  saveBlob(blob, filename);
+});
+
+/** What the last chosen file parsed to, waiting for "Load into route". Kept
+ *  apart from the route so that choosing a file changes nothing until asked. */
+let pendingImport = null;
+
+function renderImportPreview(result) {
+  const error = $('kml-error');
+  const preview = $('kml-preview');
+  const warnings = $('kml-warnings');
+  preview.innerHTML = '';
+  error.hidden = true;
+  warnings.hidden = true;
+  $('kml-load-row').hidden = true;
+  pendingImport = null;
+  if (!result) return;
+  if (!result.ok) {
+    error.textContent = result.error || 'could not read the file';
+    error.hidden = false;
+    return;
+  }
+  pendingImport = result.waypoints;
+  for (const w of result.waypoints) {
+    const li = document.createElement('li');
+    const alt = w.altitude_ft != null ? `cross ${w.altitude_ft} ft` : '';
+    const what = isAirport(w) ? (w.label || 'airport') : w.kind;
+    li.innerHTML =
+      `<span class="name">${escapeHtml(w.name)}</span>` +
+      `<span class="meta">${w.lat.toFixed(4)}, ${w.lon.toFixed(4)}</span>` +
+      `<span class="meta">${escapeHtml(what)}</span>` +
+      (alt ? `<span class="meta">${alt}</span>` : '');
+    preview.appendChild(li);
+  }
+  if (result.warnings?.length) {
+    warnings.textContent = result.warnings.join(' ');
+    warnings.hidden = false;
+  }
+  $('kml-load-row').hidden = false;
+}
+
+$('kml-file').addEventListener('change', async () => {
+  const [file] = $('kml-file').files;
+  if (!file) { renderImportPreview(null); return; }
+  let result;
+  try {
+    result = await api.importRoute(file);
+  } catch (err) {
+    result = { ok: false, error: `could not read ${file.name}: ${err.message}` };
+  }
+  renderImportPreview(result);
+});
+
+$('kml-load').addEventListener('click', () => {
+  if (!pendingImport?.length) return;
+  const mode = document.querySelector('input[name="kml-mode"]:checked')?.value || 'replace';
+  // Same defaults a point added from the search box gets; the file's own
+  // segment type and crossing altitude win where it had them.
+  let points = pendingImport.map(({ label, ...w }) => ({
+    segment_type: 'automatic', generated: false, ...w,
+  }));
+  route = mode === 'append' ? route : [];
+  const last = route[route.length - 1];
+  // A file that starts where the route ends is a continuation, not a
+  // zero-length leg.
+  if (last && points.length && Math.abs(points[0].lat - last.lat) < 1e-4
+      && Math.abs(points[0].lon - last.lon) < 1e-4) {
+    points = points.slice(1);
+  }
+  // Names stay unique across the whole route, see `isNameAvailable`. A file
+  // drawn elsewhere can call two points the same thing; an airport visited
+  // twice keeps its identifier, as it would if added twice from the search.
+  for (const p of points) {
+    if (!isAirport(p) && !isNameAvailable(p.name, p)) p.name = nextWaypointName();
+    route.push(p);
+  }
+  renderImportPreview(null);
+  $('kml-file').value = '';
+  onRouteChanged();
+  fitRoute();
+  setTab('navlog');
 });
 
 // --- planning mode ------------------------------------------------------

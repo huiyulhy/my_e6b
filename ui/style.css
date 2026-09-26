@@ -127,6 +127,16 @@ input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 }
 .waypoints .seq { font-family: var(--mono); font-size: 11px; color: var(--ink-dim); width: 16px; }
 .waypoints .name { flex: 1; font-family: var(--mono); font-weight: 600; }
+/* A point the pilot dropped can be renamed in place. Drawn as the name until
+   it is focused, so the row reads the same as an airport's, which cannot be. */
+.waypoints input.wp-name {
+  flex: 1; min-width: 0; width: 7ch; padding: 1px 4px; margin: -2px 0;
+  font-family: var(--mono); font-weight: 600; font-size: inherit;
+  background: transparent; color: inherit;
+  border: 1px solid transparent; border-radius: 4px;
+}
+.waypoints input.wp-name:hover { border-color: var(--line); }
+.waypoints input.wp-name:focus { outline: none; border-color: var(--accent); background: var(--panel); }
 .waypoints .drag {
   cursor: grab; color: var(--ink-dim);
   /* A finger needs more than the glyph to aim at. */
@@ -217,11 +227,46 @@ input:disabled { opacity: .45; cursor: not-allowed; }
   padding: 10px 14px 6px; border-bottom: 1px solid var(--line);
 }
 .navlog-head h2 { margin: 0; }
-#copy {
+
+/* The panel's tab strip: the log, or the route as a file. The selected tab
+   is underlined in the accent rather than boxed, so it reads as a heading. */
+.tabs {
+  display: flex; gap: 2px; padding: 6px 14px 0; border-bottom: 1px solid var(--line);
+  flex: none;
+}
+.tabs [role="tab"] {
+  background: none; border: none; border-bottom: 2px solid transparent;
+  margin-bottom: -1px; padding: 6px 10px; font: inherit; font-size: 13px;
+  font-weight: 600; color: var(--ink-dim); cursor: pointer;
+}
+.tabs [role="tab"]:hover { color: var(--ink); }
+.tabs [role="tab"][aria-selected="true"] { color: var(--accent); border-bottom-color: var(--accent); }
+/* The log's tab panel takes over the column layout its parent had, so the
+   table below still gets `flex: 1` against the blocks around it. */
+#tab-navlog:not([hidden]) {
+  display: flex; flex-direction: column; flex: 1; min-height: 0; min-width: 0;
+}
+#tab-route-file:not([hidden]) { overflow-y: auto; flex: 1; min-height: 0; }
+.route-file { padding: 0 14px 14px; max-width: 560px; }
+.route-file .block:first-child { border-top: none; margin-top: 0; padding-top: 12px; }
+.route-file h2 { margin: 0 0 4px; }
+.route-file .hint { margin: 0 0 10px; }
+.route-file input[type="file"] { font-size: 12px; color: var(--ink-dim); margin-bottom: 8px; }
+.route-file .alert { margin: 0 0 8px; }
+.kml-preview { list-style: none; margin: 0 0 8px; padding: 0; font-size: 12px; }
+.kml-preview li {
+  display: flex; gap: 10px; align-items: baseline; padding: 4px 8px; margin-bottom: 3px;
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: 5px;
+}
+.kml-preview .name { font-family: var(--mono); font-weight: 600; min-width: 7ch; }
+.kml-preview .meta { color: var(--ink-dim); font-family: var(--mono); font-size: 11px; }
+.kml-load-row:not([hidden]) { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
+.kml-load-row label.inline { display: flex; align-items: center; gap: 4px; font-size: 12px; }
+#copy, #download-kml, #kml-load {
   background: var(--panel-2); color: var(--ink); border: 1px solid var(--line);
   border-radius: 5px; padding: 4px 10px; font: inherit; font-size: 11px; cursor: pointer;
 }
-#copy:hover { border-color: var(--accent); color: var(--accent); }
+#copy:hover, #download-kml:hover, #kml-load:hover { border-color: var(--accent); color: var(--accent); }
 
 .table-scroll { overflow: auto; flex: 1; min-height: 0; }
 /* The navigation log is this panel's subject, and it may never be squeezed
@@ -230,8 +275,9 @@ input:disabled { opacity: .45; cursor: not-allowed; }
    fetching weather for a nine-leg route left the table at exactly zero height
    with "Weather by leg" sitting directly under the heading, which reads as
    the log having been replaced rather than scrolled. Enough rows here to be
-   recognisably a navigation log, and it scrolls within that. */
-#navlog-wrap > .table-scroll { min-height: 180px; }
+   recognisably a navigation log, and it scrolls within that. (The table now
+   sits inside the log's tab panel, which carries the same column layout.) */
+#tab-navlog > .table-scroll { min-height: 180px; }
 table { width: 100%; border-collapse: collapse; font-size: 12px; }
 th, td { padding: 5px 9px; text-align: left; white-space: nowrap; }
 th {
@@ -448,7 +494,8 @@ table.runways tr.note td { color: var(--ink-dim); font-size: 10px; border-bottom
   transform: translateY(4px); pointer-events: none; white-space: nowrap;
 }
 .popup-title.vfr { color: #e58fc4; }
-.waypoints li.kind-vfr_waypoint .name { color: #e58fc4; }
+.waypoints li.kind-vfr_waypoint .name,
+.waypoints li.kind-vfr_waypoint .wp-name { color: #e58fc4; }
 
 /* --- segment type, planning mode and consistency ------------------------ */
 
