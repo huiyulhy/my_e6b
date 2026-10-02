@@ -37,7 +37,8 @@ html, body {
 #app {
   display: grid; height: 100%;
   grid-template-columns: 340px 1fr 260px;
-  grid-template-rows: 1fr 260px;
+  /* The log's height is the pilot's to drag; see `setNavlogHeight`. */
+  grid-template-rows: 1fr var(--navlog-h, 260px);
   grid-template-areas: "panel map e6b" "panel navlog e6b";
 }
 
@@ -48,7 +49,8 @@ html, body {
 /* min-width: 0 so the wide navlog table scrolls inside its column instead of
    stretching it and pushing the E6B bar off the screen. */
 #navlog-wrap { grid-area: navlog; background: var(--panel); border-top: 1px solid var(--line);
-               display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+               display: flex; flex-direction: column; min-height: 0; min-width: 0;
+               position: relative; }
 #e6b { grid-area: e6b; background: var(--panel); border-left: 1px solid var(--line);
        overflow-y: auto; padding: 16px; }
 
@@ -127,6 +129,16 @@ input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 }
 .waypoints .seq { font-family: var(--mono); font-size: 11px; color: var(--ink-dim); width: 16px; }
 .waypoints .name { flex: 1; font-family: var(--mono); font-weight: 600; }
+/* A point the pilot dropped can be renamed in place. Drawn as the name until
+   it is focused, so the row reads the same as an airport's, which cannot be. */
+.waypoints input.wp-name {
+  flex: 1; min-width: 0; width: 7ch; padding: 1px 4px; margin: -2px 0;
+  font-family: var(--mono); font-weight: 600; font-size: inherit;
+  background: transparent; color: inherit;
+  border: 1px solid transparent; border-radius: 4px;
+}
+.waypoints input.wp-name:hover { border-color: var(--line); }
+.waypoints input.wp-name:focus { outline: none; border-color: var(--accent); background: var(--panel); }
 .waypoints .drag {
   cursor: grab; color: var(--ink-dim);
   /* A finger needs more than the glyph to aim at. */
@@ -217,11 +229,46 @@ input:disabled { opacity: .45; cursor: not-allowed; }
   padding: 10px 14px 6px; border-bottom: 1px solid var(--line);
 }
 .navlog-head h2 { margin: 0; }
-#copy {
+
+/* The panel's tab strip: the log, or the route as a file. The selected tab
+   is underlined in the accent rather than boxed, so it reads as a heading. */
+.tabs {
+  display: flex; gap: 2px; padding: 6px 14px 0; border-bottom: 1px solid var(--line);
+  flex: none;
+}
+.tabs [role="tab"] {
+  background: none; border: none; border-bottom: 2px solid transparent;
+  margin-bottom: -1px; padding: 6px 10px; font: inherit; font-size: 13px;
+  font-weight: 600; color: var(--ink-dim); cursor: pointer;
+}
+.tabs [role="tab"]:hover { color: var(--ink); }
+.tabs [role="tab"][aria-selected="true"] { color: var(--accent); border-bottom-color: var(--accent); }
+/* The log's tab panel takes over the column layout its parent had, so the
+   table below still gets `flex: 1` against the blocks around it. */
+#tab-navlog:not([hidden]) {
+  display: flex; flex-direction: column; flex: 1; min-height: 0; min-width: 0;
+}
+#tab-route-file:not([hidden]) { overflow-y: auto; flex: 1; min-height: 0; }
+.route-file { padding: 0 14px 14px; max-width: 560px; }
+.route-file .block:first-child { border-top: none; margin-top: 0; padding-top: 12px; }
+.route-file h2 { margin: 0 0 4px; }
+.route-file .hint { margin: 0 0 10px; }
+.route-file input[type="file"] { font-size: 12px; color: var(--ink-dim); margin-bottom: 8px; }
+.route-file .alert { margin: 0 0 8px; }
+.kml-preview { list-style: none; margin: 0 0 8px; padding: 0; font-size: 12px; }
+.kml-preview li {
+  display: flex; gap: 10px; align-items: baseline; padding: 4px 8px; margin-bottom: 3px;
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: 5px;
+}
+.kml-preview .name { font-family: var(--mono); font-weight: 600; min-width: 7ch; }
+.kml-preview .meta { color: var(--ink-dim); font-family: var(--mono); font-size: 11px; }
+.kml-load-row:not([hidden]) { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
+.kml-load-row label.inline { display: flex; align-items: center; gap: 4px; font-size: 12px; }
+#copy, #download-kml, #kml-load {
   background: var(--panel-2); color: var(--ink); border: 1px solid var(--line);
   border-radius: 5px; padding: 4px 10px; font: inherit; font-size: 11px; cursor: pointer;
 }
-#copy:hover { border-color: var(--accent); color: var(--accent); }
+#copy:hover, #download-kml:hover, #kml-load:hover { border-color: var(--accent); color: var(--accent); }
 
 .table-scroll { overflow: auto; flex: 1; min-height: 0; }
 /* The navigation log is this panel's subject, and it may never be squeezed
@@ -230,8 +277,9 @@ input:disabled { opacity: .45; cursor: not-allowed; }
    fetching weather for a nine-leg route left the table at exactly zero height
    with "Weather by leg" sitting directly under the heading, which reads as
    the log having been replaced rather than scrolled. Enough rows here to be
-   recognisably a navigation log, and it scrolls within that. */
-#navlog-wrap > .table-scroll { min-height: 180px; }
+   recognisably a navigation log, and it scrolls within that. (The table now
+   sits inside the log's tab panel, which carries the same column layout.) */
+#tab-navlog > .table-scroll { min-height: 180px; }
 table { width: 100%; border-collapse: collapse; font-size: 12px; }
 th, td { padding: 5px 9px; text-align: left; white-space: nowrap; }
 th {
@@ -420,7 +468,7 @@ table.runways tr.note td { color: var(--ink-dim); font-size: 10px; border-bottom
 .waypoints li { flex-direction: column; align-items: stretch; gap: 4px; }
 .wp-row { display: flex; align-items: center; gap: 8px; }
 .coords { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; }
-.coords.readonly { display: block; font-family: var(--mono); font-size: 10px;
+.coords.readonly { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; font-family: var(--mono); font-size: 10px;
   color: var(--ink-dim); padding-left: 24px; }
 .coords label { display: flex; align-items: center; gap: 4px;
   font-size: 10px; color: var(--ink-dim); }
@@ -448,7 +496,8 @@ table.runways tr.note td { color: var(--ink-dim); font-size: 10px; border-bottom
   transform: translateY(4px); pointer-events: none; white-space: nowrap;
 }
 .popup-title.vfr { color: #e58fc4; }
-.waypoints li.kind-vfr_waypoint .name { color: #e58fc4; }
+.waypoints li.kind-vfr_waypoint .name,
+.waypoints li.kind-vfr_waypoint .wp-name { color: #e58fc4; }
 
 /* --- segment type, planning mode and consistency ------------------------ */
 
@@ -625,3 +674,138 @@ table.runways td.over { color: var(--warn); font-weight: 600; }
 .layers .expired .date { color: var(--warn); }
 .layers .note { display: block; font-size: 10px; color: var(--edit); }
 .layers .hint { margin: 2px 0 4px; }
+
+/* --- leg events (hybrid) ------------------------------------------------ */
+/* "Start climb here" and "level by here", pinned to the leg arriving at a
+   waypoint. Listed under the waypoint whose leg they are on. */
+.waypoints .events {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px;
+  margin-top: 4px; padding-top: 4px; border-top: 1px dashed var(--line);
+  font-size: 11px; color: var(--ink-dim);
+}
+.waypoints .events-title { width: 100%; }
+.waypoints .event {
+  display: inline-flex; align-items: center; gap: 3px;
+  padding: 1px 4px; border: 1px solid var(--line); border-radius: 4px;
+  font-family: var(--mono);
+}
+.waypoints .event.ev-start { border-color: var(--climb); }
+.waypoints .event.ev-complete { border-color: var(--cruise); }
+.waypoints .event input {
+  width: 58px; padding: 0 3px; font-size: 11px; font-family: var(--mono);
+}
+.waypoints .event button, .waypoints .ev-add {
+  padding: 0 5px; font-size: 11px; cursor: pointer;
+  background: var(--panel-2); color: var(--ink-dim);
+  border: 1px solid var(--line); border-radius: 4px;
+}
+.waypoints .ev-adds { display: flex; gap: 4px; width: 100%; }
+.waypoints .ev-add.picking { color: var(--accent); border-color: var(--accent); }
+body.picking-event .maplibregl-canvas-container canvas { cursor: crosshair; }
+
+.marker.event {
+  width: 10px; height: 10px; border-radius: 2px; transform: rotate(45deg);
+  background: var(--panel); border: 2px solid var(--climb); cursor: grab;
+}
+.marker.event.ev-complete { border-color: var(--cruise); }
+.marker.event .marker-label { transform: rotate(-45deg); left: 12px; top: -8px; }
+
+/* --- navlog rows grouped by the leg they were drawn on ------------------ */
+#navlog tr.leg-head td {
+  padding: 6px 6px 2px; font-size: 11px; color: var(--ink-dim);
+  border-top: 1px solid var(--line); background: var(--panel);
+}
+#navlog tr.leg-head .leg-name { color: var(--ink); font-weight: 600; margin-right: 8px; }
+#navlog tr.leg-head .leg-meta { margin-right: 8px; }
+#navlog tr.leg-head .leg-meta.edited { color: var(--edit); }
+#navlog tr.leg-head .leg-reset {
+  padding: 0 6px; font-size: 11px; cursor: pointer;
+  background: var(--panel-2); color: var(--ink-dim);
+  border: 1px solid var(--line); border-radius: 4px;
+}
+#navlog tr.in-leg td:first-child { padding-left: 14px; }
+.since-saved { color: var(--accent); }
+
+/* --- the navlog as CSV, pulled down over the map ------------------------ */
+#csv-handle {
+  position: absolute; top: 0; left: 50%; transform: translateX(-50%); z-index: 21;
+  padding: 3px 14px 5px; cursor: grab; touch-action: none;
+  background: rgba(16,21,28,.9); color: var(--ink-dim);
+  border: 1px solid var(--line); border-top: none; border-radius: 0 0 8px 8px;
+  font: inherit; font-size: 11px; line-height: 1;
+  transition: top .18s ease-out;
+}
+.csv-drawer.dragging ~ #csv-handle { transition: none; }
+#csv-handle:hover, #csv-handle[aria-expanded="true"] { color: var(--ink); border-color: var(--accent); }
+/* Rides the drawer's bottom edge while it is open. */
+.csv-drawer.open ~ #csv-handle, .csv-drawer.dragging ~ #csv-handle { top: var(--csv-drawer-h, 50vh); }
+
+.csv-drawer {
+  position: absolute; top: 0; left: 0; right: 0; z-index: 20;
+  height: 0; max-height: 50vh; overflow: hidden;
+  background: rgba(16,21,28,.97); border-bottom: 1px solid var(--accent);
+  box-shadow: 0 6px 18px rgba(0,0,0,.45);
+  transition: height .18s ease-out;
+}
+.csv-drawer:not([hidden]) { display: flex; flex-direction: column; }
+.csv-drawer.open { height: 50vh; }
+.csv-drawer.dragging { transition: none; }
+.csv-drawer-bar {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 6px 10px; border-bottom: 1px solid var(--line);
+}
+.csv-drawer-bar .csv-title { font-weight: 600; color: var(--ink); }
+.csv-drawer-bar .hint { flex: 1; margin: 0; font-size: 11px; }
+.csv-drawer-bar button {
+  padding: 3px 10px; font-size: 12px; cursor: pointer;
+  background: var(--panel-2); color: var(--ink); border: 1px solid var(--line); border-radius: 5px;
+}
+.csv-scroll { flex: 1; min-height: 0; overflow: auto; }
+#csv-table { border-collapse: collapse; font-family: var(--mono); font-size: 11px; white-space: nowrap; }
+#csv-table th {
+  position: sticky; top: 0; background: var(--panel); color: var(--ink-dim);
+  font-weight: 500; text-align: right; padding: 4px 5px; border-bottom: 1px solid var(--line);
+  /* Headers wrap -- "Dist Rem" over two lines -- so the column is as wide as
+     its numbers and the whole log fits across the map. */
+  white-space: normal; text-transform: none; letter-spacing: 0; vertical-align: bottom;
+  max-width: 5.5em; line-height: 1.2;
+}
+#csv-table th:first-child { text-align: left; }
+#csv-table td { padding: 3px 5px; border-bottom: 1px solid rgba(42,54,68,.6); color: var(--ink); }
+#csv-table td.num { text-align: right; }
+#csv-table tr.phase-row-climb td:first-child { border-left: 2px solid var(--climb); }
+#csv-table tr.phase-row-cruise td:first-child { border-left: 2px solid var(--cruise); }
+#csv-table tr.phase-row-descent td:first-child { border-left: 2px solid var(--descent); }
+#csv-table tr.phase-row-taxi td, #csv-table tr.phase-row-pattern td { color: var(--ink-dim); }
+#csv-table tr.totals td { font-weight: 600; border-top: 1px solid var(--line); }
+#csv-empty { padding: 10px; }
+
+/* --- resizing the navigation log --------------------------------------- */
+/* A strip along the top edge, taller than it looks so it is easy to catch,
+   straddling the border between the map and the log. */
+.navlog-resize {
+  position: absolute; top: -5px; left: 0; right: 0; height: 10px; z-index: 30;
+  cursor: ns-resize; touch-action: none;
+}
+.navlog-resize::after {
+  content: ""; position: absolute; left: 50%; top: 3px; width: 44px; height: 4px;
+  transform: translateX(-50%); border-radius: 2px; background: var(--line);
+}
+.navlog-resize:hover::after, .navlog-resize:focus-visible::after,
+body.resizing-navlog .navlog-resize::after { background: var(--accent); }
+.navlog-resize:focus { outline: none; }
+body.resizing-navlog { cursor: ns-resize; user-select: none; }
+body.resizing-navlog #map { pointer-events: none; }
+.tabs .navlog-size {
+  margin-left: auto; align-self: center; padding: 2px 9px; font-size: 11px; cursor: pointer;
+  background: var(--panel-2); color: var(--ink-dim); border: 1px solid var(--line); border-radius: 5px;
+}
+.tabs .navlog-size:hover { color: var(--ink); border-color: var(--accent); }
+@media (max-width: 900px) {
+  /* Stacked, the page scrolls instead; there is no row to trade. */
+  .navlog-resize, .tabs .navlog-size { display: none; }
+}
+
+/* An airport's crossing altitude sits beside its fixed position. */
+.coords.readonly label { display: inline-flex; align-items: center; gap: 4px; font-family: var(--font); }
+.coords.readonly input.alt { width: 72px; padding: 2px 4px; font-size: 11px; font-family: var(--mono); }

@@ -13,10 +13,14 @@ run modes will drift apart. See docs/ARCHITECTURE.md section 2.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import logging
+import re
 import threading
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from typing import Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -31,7 +35,9 @@ from engine import charts as ch
 from engine import consistency as consistency_checks
 from engine import csv_download as csv_export
 from engine import currency as cur
+from engine import kml
 from engine import magnetic as mag
+from engine import mission as ms
 from engine import navlog as nl
 from engine import notam as nt
 from engine import planwx as pw
@@ -71,6 +77,20 @@ app = FastAPI(title="my_e6b", description="Offline VFR cross-country planner")
 # --- request and response models -----------------------------------------
 
 
+class VerticalEventIn(BaseModel):
+    """An altitude change pinned to a place on the leg arriving at a waypoint.
+
+    `start`: hold altitude until here, then change to the target (BOC/TOD
+    pinned). `complete`: be at the target by here (TOC/BOD pinned). Sent as
+    the place the pilot clicked; the engine projects it onto the leg.
+    """
+
+    kind: Literal["start", "complete"]
+    lat: float
+    lon: float
+    target_altitude_ft: float
+
+
 class WaypointIn(BaseModel):
     name: str
     lat: float
@@ -92,6 +112,11 @@ class WaypointIn(BaseModel):
     # True for a TOC/TOD the planner inserted. Sent back so a later request can
     # be told which points to discard before re-planning.
     generated: bool = False
+    # A stable identity for the pilot's own waypoint. What `segment_overrides`
+    # and a saved mission name the legs by: "<id>><id>".
+    id: str | None = None
+    # Altitude changes pinned to places on the leg arriving here. Hybrid only.
+    events: list[VerticalEventIn] = Field(default_factory=list)
     # Field weather at an airport, which sets the density altitude the
     # takeoff and landing distances are read at. Null falls back to the
     # route-wide altimeter setting and ISA deviation.
@@ -188,11 +213,31 @@ class LegOverrideIn(BaseModel):
     pressure_altitude_ft: float | None = None
 
 
+class SegmentOverrideIn(BaseModel):
+    """A manually entered value for one leg the pilot drew.
+
+    Filed under the leg -- `"<from id>><to id>"` -- rather than a navlog row,
+    so it reaches every row cut from that leg however the wind has cut it this
+    time. `phase` narrows it to the climb, cruise or descent part of the leg;
+    null holds for all of it. `altitude_ft` is user-driven mode only.
+    """
+
+    segment_key: str
+    phase: Literal["climb", "cruise", "descent"] | None = None
+    wind_from_deg: float | None = None
+    wind_speed_kt: float | None = None
+    tas_kt: float | None = None
+    cruise_rpm: float | None = None
+    altitude_ft: float | None = None
+    oat_c: float | None = None
+    pressure_altitude_ft: float | None = None
+
+
 class PlanRequest(BaseModel):
     waypoints: list[WaypointIn]
     # "manual" -- the default -- takes the profile from each waypoint's
-    # segment_type; "auto" lets the planner place TOC/TOD against
-    # cruise_altitude_ft instead.
+    # segment_type; "hybrid" (or its old name "auto") lets the planner place
+    # TOC/TOD against cruise_altitude_ft and the legs' events instead.
     planning_mode: str = "manual"
     cruise_altitude_ft: float = 6500
     cruise_rpm: float = 2400
@@ -203,6 +248,9 @@ class PlanRequest(BaseModel):
     night: bool = False
     flight_date: date | None = None
     overrides: list[LegOverrideIn] = Field(default_factory=list)
+    # Edits filed under the leg they were typed on. What the UI sends; the
+    # row-indexed `overrides` above remain for callers that want one row.
+    segment_overrides: list[SegmentOverrideIn] = Field(default_factory=list)
     # One forecast series per waypoint the pilot drew, in route order, from
     # "Get weather". Each leg is then costed at both of its ends and planned
     # in whichever costs more. Empty is the ordinary case and means every leg
@@ -218,6 +266,19 @@ class PlanRequest(BaseModel):
     # Fractions: 0.20 means "require 20% more than the book distance".
     runway_margin: float = pf.DEFAULT_RUNWAY_MARGIN
     fuel_margin: float = pf.DEFAULT_FUEL_MARGIN
+
+
+class RouteFileIn(BaseModel):
+    """A `.kml` or `.kmz` file, as the browser read it.
+
+    Base64 in JSON rather than a multipart upload: a KMZ is binary, every
+    other endpoint here speaks JSON, and multipart would be the one dependency
+    added for the one endpoint that used it. The size is bounded by the engine
+    before the file is parsed.
+    """
+
+    filename: str = ""
+    content_base64: str
 
 
 class StationIn(BaseModel):
@@ -602,6 +663,17 @@ def _waypoint_json(waypoint: nl.Waypoint, conditions: nl.Conditions) -> dict:
         "altitude_ft": waypoint.altitude_ft,
         "segment_type": waypoint.segment_type,
         "generated": waypoint.generated,
+        "id": waypoint.id,
+        "segment_key": waypoint.segment_key,
+        "events": [
+            {
+                "kind": e.kind,
+                "lat": e.position.lat,
+                "lon": e.position.lon,
+                "target_altitude_ft": e.target_altitude_ft,
+            }
+            for e in waypoint.events
+        ],
         "altimeter_inhg": waypoint.altimeter_inhg,
         "oat_c": waypoint.oat_c,
         "wind_from_deg": waypoint.wind_from_deg,
@@ -636,6 +708,11 @@ def _build_from_request(request: PlanRequest):
             altitude_ft=w.altitude_ft,
             segment_type=w.segment_type,
             generated=w.generated,
+            id=w.id,
+            events=tuple(
+                nl.VerticalEvent(e.kind, LatLon(e.lat, e.lon), e.target_altitude_ft)
+                for e in w.events
+            ),
             altimeter_inhg=w.altimeter_inhg,
             oat_c=w.oat_c,
             wind_from_deg=w.wind_from_deg,
@@ -683,6 +760,18 @@ def _build_from_request(request: PlanRequest):
         )
         for o in request.overrides
     }
+    segment_overrides = {
+        (o.segment_key, o.phase): nl.LegOverride(
+            wind_from_deg=o.wind_from_deg,
+            wind_speed_kt=o.wind_speed_kt,
+            tas_kt=o.tas_kt,
+            cruise_rpm=o.cruise_rpm,
+            altitude_ft=o.altitude_ft,
+            oat_c=o.oat_c,
+            pressure_altitude_ft=o.pressure_altitude_ft,
+        )
+        for o in request.segment_overrides
+    }
     margins = pf.Margins(runway=request.runway_margin, fuel=request.fuel_margin)
     # Not `build_navlog` directly: with a forecast on the route the weather
     # and the log are each an input to the other, and `planwx.solve` settles
@@ -698,6 +787,7 @@ def _build_from_request(request: PlanRequest):
         overrides=overrides,
         margins=margins,
         planning_mode=request.planning_mode,
+        segment_overrides=segment_overrides,
     )
     return solved, aircraft, conditions
 
@@ -743,16 +833,15 @@ def consistency(request: PlanRequest) -> dict:
 
 
 @app.post("/api/navlog.csv")
-def navlog_csv(request: PlanRequest, time_off: str | None = None) -> Response:
-    """The same plan, as the columns of a paper navigation log.
+def navlog_csv(request: PlanRequest) -> Response:
+    """The same plan, as the navlog's own columns.
 
     A download rather than JSON, so the browser saves a file the pilot can open
     in a spreadsheet. Everything about the format lives in
     `engine.csv_download`; this only builds the plan and attaches a filename.
 
-    `time_off` is an optional `HH:MM` departure time, which fills the ETA
-    column. Errors come back as JSON like every other endpoint's: a browser
-    that asked for a file and got a 400 can still read the reason out of it.
+    Errors come back as JSON like every other endpoint's: a browser that asked
+    for a file and got a 400 can still read the reason out of it.
     """
     if len(request.waypoints) < 2:
         return JSONResponse(
@@ -762,7 +851,7 @@ def navlog_csv(request: PlanRequest, time_off: str | None = None) -> Response:
     try:
         solved, _aircraft, _conditions = _build_from_request(request)
         log = solved.navlog
-        text = csv_export.navlog_csv(log, time_off=time_off)
+        text = csv_export.navlog_csv(log)
     except (nl.RouteError, OutsideModelValidity, ValueError) as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
 
@@ -775,6 +864,149 @@ def navlog_csv(request: PlanRequest, time_off: str | None = None) -> Response:
             )
         },
     )
+
+
+@app.post("/api/route.kml")
+def route_kml(request: PlanRequest) -> Response:
+    """The mission as KML, for Google Earth and for loading back in here.
+
+    Built from the plan rather than the request's waypoints so that the file
+    carries the planned altitude at every point, TOC and TOD included. The
+    request itself rides along as the mission (`engine.mission`), with a
+    snapshot of this solve, so importing the file restores the plan and
+    re-solves it in whatever the weather is by then.
+
+    A plan that does not solve today is still saved: the file then holds the
+    pilot's own points and the mission, without a profile or a snapshot.
+    """
+    if len(request.waypoints) < 2:
+        return JSONResponse(
+            {"ok": False, "error": "Add a departure and a destination."},
+            status_code=400,
+        )
+    mission = ms.mission_json(request.model_dump(mode="json"))
+    try:
+        solved, _aircraft, _conditions = _build_from_request(request)
+        text = kml.route_kml(
+            solved.navlog, mission=mission, snapshot=ms.snapshot_json(solved.navlog)
+        )
+        filename = kml.kml_filename(solved.navlog)
+    except (nl.RouteError, OutsideModelValidity, ValueError):
+        pilot_points = [
+            nl.Waypoint(
+                name=w.name,
+                position=LatLon(w.lat, w.lon),
+                kind=w.kind,
+                elevation_ft=w.elevation_ft,
+                altitude_ft=w.altitude_ft,
+                segment_type=w.segment_type,
+                is_landing=w.is_landing,
+                generated=w.generated,
+            )
+            for w in request.waypoints
+        ]
+        try:
+            text = kml.mission_kml(pilot_points, mission=mission)
+        except kml.KmlError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+        filename = "route-" + "-".join(
+            re.sub(r"[^A-Za-z0-9_-]", "", p.name) for p in (pilot_points[0], pilot_points[-1])
+        ) + ".kml"
+
+    return Response(
+        content=text,
+        media_type="application/vnd.google-earth.kml+xml",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# What an airport identifier looks like: KSQL, SQL, 1C9, O88. Used to decide
+# which placemarks in somebody else's file are worth looking up.
+_IDENT_LIKE = re.compile(r"^[A-Z0-9]{3,4}$")
+
+
+@app.post("/api/route/import")
+def import_route(request: RouteFileIn) -> dict:
+    """The waypoints in a KML file, in the shape the UI adds a waypoint in.
+
+    Parsing is the engine's. What this adds is the airport database: a point
+    that names an airport comes back as that airport, at its published
+    position, so that the runways and pattern altitude the go/no-go needs are
+    found again. A file of ours says which of its points are airports; for
+    anybody else's, anything that looks like an identifier is tried, and
+    silently kept as a plain waypoint when it is not one. Nothing is added to
+    the route here: the UI shows what was found and asks first.
+    """
+    try:
+        data = base64.b64decode(request.content_base64, validate=True)
+    except (binascii.Error, ValueError):
+        return JSONResponse({"ok": False, "error": "file content is not base64"}, status_code=400)
+    try:
+        read = kml.read_kml(data)
+    except kml.KmlError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    points = read.waypoints
+
+    waypoints = []
+    warnings = list(read.warnings)
+    # A mission of ours is checked exactly as a plan request typed into the
+    # page would be, so a file cannot put anything in front of the planner
+    # the page itself could not.
+    mission = None
+    if read.mission is not None:
+        try:
+            mission = PlanRequest.model_validate(read.mission).model_dump(mode="json")
+        except ValueError as exc:
+            warnings.append(f"the mission in this file is not a plan this version reads ({exc}); only the route was imported.")
+    for point in points:
+        claims_airport = point.from_extended_data and _is_airport(point)
+        worth_a_look = claims_airport or (
+            not point.from_extended_data and _IDENT_LIKE.match(point.name.upper())
+        )
+        airport = apt.find(point.name) if worth_a_look else None
+        if airport is not None:
+            waypoints.append(
+                {
+                    "name": airport.ident,
+                    "lat": airport.position.lat,
+                    "lon": airport.position.lon,
+                    "kind": airport.kind,
+                    "elevation_ft": airport.elevation_ft,
+                    "altitude_ft": point.altitude_ft,
+                    "segment_type": point.segment_type,
+                    "is_landing": point.is_landing,
+                    "label": airport.label,
+                }
+            )
+            continue
+        if claims_airport:
+            warnings.append(
+                f"{point.name} is not in the airport database; kept as a plain waypoint "
+                "at the position in the file."
+            )
+        waypoints.append(
+            {
+                "name": point.name,
+                "lat": point.lat,
+                "lon": point.lon,
+                "kind": "waypoint",
+                "elevation_ft": point.elevation_ft,
+                "altitude_ft": point.altitude_ft,
+                "segment_type": point.segment_type,
+                "is_landing": False,
+                "label": "",
+            }
+        )
+    return {
+        "ok": True,
+        "waypoints": waypoints,
+        "warnings": warnings,
+        # The whole plan, when the file is one of ours: the UI restores it
+        # rather than asking about each point. `snapshot` is the solve it was
+        # exported with, for saying what the new weather changed.
+        "mission": mission,
+        "snapshot": read.snapshot if mission is not None else None,
+    }
 
 
 @app.post("/api/notams")
@@ -978,6 +1210,13 @@ def plan(request: PlanRequest) -> dict:
                 "wind_speed_kt": leg.wind_speed_kt,
                 "headwind_kt": leg.headwind_kt,
                 "tas_kt": leg.tas_kt,
+                # What the airspeed indicator reads for that TAS in this row's
+                # air. Null on the ground rows, which have no airspeed.
+                "cas_kt": (
+                    atm.cas_from_tas(leg.tas_kt, leg.density_altitude_ft)
+                    if leg.covers_ground and leg.density_altitude_ft is not None
+                    else None
+                ),
                 "ground_speed_kt": leg.ground_speed_kt,
                 "distance_nm": leg.distance_nm,
                 "cumulative_distance_nm": leg.cumulative_distance_nm,
@@ -1012,6 +1251,9 @@ def plan(request: PlanRequest) -> dict:
                 # "TOC" / "TOD" beside the name, never replacing it.
                 "start_role": leg.start_role,
                 "end_role": leg.end_role,
+                # The leg the pilot drew this row on: what an edit typed on
+                # it is filed under.
+                "segment_key": leg.segment_key,
             }
             for leg in log.legs
         ],

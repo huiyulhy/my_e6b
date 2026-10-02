@@ -1,35 +1,30 @@
-"""Export a finished navlog as the columns of a paper navigation log.
+"""Export a finished navlog as CSV, in the columns the navlog shows on screen.
 
-The commercial VFR nav log pads (Jeppesen, ASA and the rest) all print the same
-column set in the same order, and a pilot who has filled one in knows where to
-look on it. This writes that column order out as CSV, so the plan can be pasted
-into a spreadsheet shaped like the pad and read in the cockpit without
-translating anything.
+One row per navlog row -- taxi, each piece of each leg, the pattern -- and a
+totals row, with the same columns in the same order as the table in the app,
+so the file and the screen can be read against each other line for line. Two
+differences, both for a file read away from the map:
 
-It is a **work-alike, not a copy**: the same columns, order and sign
-conventions, none of anybody's artwork or branding.
+* **Leg Start and Leg End** name each row by the points it runs between, TOC
+  and TOD included, rather than by position. The latitude and longitude the
+  screen shows are left out: a pilot reading the file navigates by the names.
+* **End Alt** is the altitude the row *ends* at -- what the screen's Alt column
+  shows for a flown row, and what a climb is labelled by -- spelled out so it
+  cannot be read as the altitude flown throughout.
 
-Three things the format needs that the rest of the engine does not, and they
-are the reason this is its own module:
+Conventions kept from the screen, which a spreadsheet user would otherwise
+trip over:
 
-* **The rows are checkpoints, not legs.** The pad's diagonal cells mean the
-  course, wind and time written on a row belong to the leg *arriving* at the
-  checkpoint that row names. Our rows are legs, so a row is labelled by where
-  its leg ends -- the same "the leg arriving here" convention the profile uses
-  for `segment_type`.
-* **The variation column is east-positive**, as it is everywhere else in this
-  program and on the navlog on screen: `+12.8` means 12.8 degrees east, and a
-  magnetic course is true course *minus* variation -- east is least. Printed
-  pads head the column `-E / +W` and want the number to add instead, so the
-  sign is the other way round from theirs. Ours is kept, so that one number
-  means one thing wherever a pilot reads it. The wind correction column,
-  headed `-L / +R`, matches ours already.
-* **Some columns are deliberately empty.** Deviation and compass heading come
-  off the aircraft's own compass card, which this program does not model; the
-  actuals -- ATE, ATA, actual ground speed -- are filled in the air. They are
-  written as empty cells rather than dropped, because a blank box on a nav log
-  is an instruction to the pilot and a missing column is a format that no
-  longer lines up with the pad.
+* **Variation is east-positive**, as everywhere else in this program: `+12.8`
+  is 12.8 degrees east, and a magnetic course is the true course *minus* it.
+  Printed paper pads head the column `-E / +W` and want the number the other
+  way round; ours is kept so one number means one thing wherever it is read.
+* **Bearings keep three digits** (`007`) and corrections keep their sign.
+* **Time Rem** counts down the minutes left after each row, to the end of
+  the flight, the pattern included -- the way Rem counts down the fuel.
+* **Rows that go nowhere** -- taxi and the pattern -- carry their time, fuel
+  and air, and leave every navigation column empty. A heading printed for a
+  leg with no length would invite somebody to fly one.
 """
 
 from __future__ import annotations
@@ -37,79 +32,51 @@ from __future__ import annotations
 import csv
 import io
 import re
-from datetime import time as Time
 
 from engine.atmosphere import cas_from_tas
 from engine.navlog import Leg, Navlog, leg_label
 
 __all__ = ["COLUMNS", "csv_filename", "navlog_csv"]
 
-# The pad's columns, left to right, flattened out of its stacked headers --
-# `Wind Dir`/`Wind Vel` sit under one "Wind" heading, `ETE`/`ETA` over
-# `ATE`/`ATA`, and so on. `Phase` is ours and is deliberately last, where an
-# extra column falls clear of the pad's own when the file is pasted alongside
-# one.
+# The navlog table's columns, left to right, minus its Lat/Lon.
 COLUMNS: tuple[str, ...] = (
-    "Check Point",
-    "VOR Ident",
-    "VOR Freq",
-    "Course (Route)",
-    "Altitude",
-    "Wind Dir",
-    "Wind Vel",
-    "Temp",
-    "CAS",
-    "TAS",
+    "Leg Start",
+    "Leg End",
+    "Phase",
+    "End Alt",
+    "OAT",
+    "PA",
+    "DA",
     "TC",
     "WCA",
-    "Var",
     "TH",
+    "Var",
     "MH",
-    "Dev",
-    "CH",
-    "Dist Leg",
-    "Dist Rem",
-    "GS Est",
-    "GS Act",
+    "Wind Dir",
+    "Wind Kt",
+    "CAS",
+    "TAS",
+    "GS",
+    "Dist",
     "ETE",
-    "ETA",
-    "ATE",
-    "ATA",
+    "Time Rem",
     "Fuel",
-    "Fuel Rem",
-    "GPH",
-    "Phase",
+    "Rem",
 )
 
-# Columns nothing in this program can fill. Named rather than left implicit so
-# that adding, say, a compass deviation card later is a matter of deleting a
-# name from this tuple and filling it in.
-BLANK_COLUMNS: tuple[str, ...] = (
-    "VOR Ident",  # the route is flown off the map, not off a radial
-    "VOR Freq",
-    "Course (Route)",  # the airway or radial, if the pilot is flying one
-    "Dev",  # off the aircraft's compass card
-    "CH",
-    "GS Act",  # the actuals, all filled in the air
-    "ATE",
-    "ATA",
+# The columns a row that goes nowhere leaves empty.
+NAVIGATION_COLUMNS: tuple[str, ...] = (
+    "TC", "WCA", "TH", "Var", "MH", "Wind Dir", "Wind Kt", "CAS", "TAS", "GS", "Dist",
 )
 
 
-def navlog_csv(navlog: Navlog, *, time_off: str | Time | None = None) -> str:
-    """The whole log as CSV, one row per checkpoint plus a totals row.
-
-    `time_off` is the departure time, as `HH:MM` or a `datetime.time`. It fills
-    the ETA column; without one those cells are left empty, since an estimated
-    arrival with no departure to count from would be a guess dressed as a
-    number.
-    """
-    departure = _parse_time_off(time_off)
+def navlog_csv(navlog: Navlog) -> str:
+    """The whole log as CSV, one row per navlog row plus a totals row."""
     buffer = io.StringIO()
     writer = csv.DictWriter(buffer, fieldnames=COLUMNS, extrasaction="raise")
     writer.writeheader()
     for leg in navlog.legs:
-        writer.writerow(_row(leg, navlog, departure))
+        writer.writerow(_row(leg, navlog.total_time_min))
     writer.writerow(_totals_row(navlog))
     return buffer.getvalue()
 
@@ -127,63 +94,56 @@ def csv_filename(navlog: Navlog) -> str:
 # --- one row -------------------------------------------------------------
 
 
-def _row(leg: Leg, navlog: Navlog, departure: Time | None) -> dict[str, str]:
-    """One checkpoint's row.
-
-    A row that goes nowhere -- the taxi allowance, the traffic pattern -- keeps
-    its fuel and its time and nothing else. Printing a course and a heading for
-    a leg with no length would invite somebody to fly one.
-    """
+def _row(leg: Leg, total_min: float) -> dict[str, str]:
+    """One navlog row, as the table shows it."""
     row = dict.fromkeys(COLUMNS, "")
     ground = not leg.covers_ground
 
-    row["Check Point"] = (
-        leg.from_name if ground else leg_label(leg.to_name, leg.end_role)
-    )
+    row["Leg Start"] = leg.from_name if ground else leg_label(leg.from_name, leg.start_role)
+    row["Leg End"] = "" if ground else leg_label(leg.to_name, leg.end_role)
     row["Phase"] = leg.phase
-    # The altitude the row *ends* at, which is what the navlog's own altitude
-    # column shows and what a pilot edits: a climb row is labelled by where the
-    # climb gets to, not by the midpoint it is solved at.
-    row["Altitude"] = _round(
-        leg.altitude_ft if ground else (leg.exit_altitude_ft or leg.altitude_ft)
+    # Where the row ends up: a climb is labelled by where it gets to, not by
+    # the midpoint it is solved at. A ground row is at the field, or at the
+    # pattern it flies.
+    row["End Alt"] = _round(
+        leg.altitude_ft if ground or leg.exit_altitude_ft is None else leg.exit_altitude_ft
     )
-    row["Temp"] = _round(leg.oat_c)
+    row["OAT"] = _round(leg.oat_c)
+    row["PA"] = _round(leg.pressure_altitude_ft)
+    row["DA"] = _round(leg.density_altitude_ft)
     row["ETE"] = _round(leg.ete_min, 1)
-    row["ETA"] = _clock(departure, leg.cumulative_ete_min)
+    # Minutes left after this row, to the end of the flight -- the pattern
+    # included, as the fuel column counts it. Counts down to 0.
+    row["Time Rem"] = _round(max(0.0, total_min - leg.cumulative_ete_min), 1)
     row["Fuel"] = _round(leg.fuel_gal, 1)
-    row["Fuel Rem"] = _round(leg.fuel_remaining_gal, 1)
-    row["GPH"] = _round(_gph(leg), 1)
+    row["Rem"] = _round(leg.fuel_remaining_gal, 1)
     if ground:
         return row
 
-    row["Wind Dir"] = _bearing(leg.wind_from_deg)
-    row["Wind Vel"] = _round(leg.wind_speed_kt)
-    row["CAS"] = _round(_cas(leg))
-    row["TAS"] = _round(leg.tas_kt)
     row["TC"] = _bearing(leg.true_course_deg)
     row["WCA"] = _signed(leg.wind_correction_angle_deg)
     row["TH"] = _bearing(leg.true_heading_deg)
-    # East-positive, the same number the navlog shows: subtract it from the
-    # true course. A printed pad's own column is signed the other way, so this
-    # is the one place the export deliberately does not follow the pad.
+    # East-positive, the same number the screen shows: subtract it from the
+    # true course.
     row["Var"] = _signed(leg.variation_deg)
     row["MH"] = _bearing(leg.magnetic_heading_deg)
-    row["Dist Leg"] = _round(leg.distance_nm, 1)
-    row["Dist Rem"] = _round(
-        max(0.0, navlog.total_distance_nm - leg.cumulative_distance_nm), 1
-    )
-    row["GS Est"] = _round(leg.ground_speed_kt)
+    row["Wind Dir"] = _bearing(leg.wind_from_deg)
+    row["Wind Kt"] = _round(leg.wind_speed_kt)
+    row["CAS"] = _round(_cas(leg))
+    row["TAS"] = _round(leg.tas_kt)
+    row["GS"] = _round(leg.ground_speed_kt)
+    row["Dist"] = _round(leg.distance_nm, 1)
     return row
 
 
 def _totals_row(navlog: Navlog) -> dict[str, str]:
-    """The pad's `Totals »` line: distance, time and fuel, and nothing else."""
+    """Distance, time, fuel and what is left -- the table's footer."""
     row = dict.fromkeys(COLUMNS, "")
-    row["Check Point"] = "Totals"
-    row["Dist Leg"] = _round(navlog.total_distance_nm, 1)
+    row["Leg Start"] = "Total"
+    row["Dist"] = _round(navlog.total_distance_nm, 1)
     row["ETE"] = _round(navlog.total_time_min, 1)
     row["Fuel"] = _round(navlog.total_fuel_gal, 1)
-    row["Fuel Rem"] = _round(navlog.fuel_remaining_gal, 1)
+    row["Rem"] = _round(navlog.fuel_remaining_gal, 1)
     return row
 
 
@@ -220,46 +180,6 @@ def _cas(leg: Leg) -> float | None:
     if leg.tas_kt is None or leg.density_altitude_ft is None:
         return None
     return cas_from_tas(leg.tas_kt, leg.density_altitude_ft)
-
-
-def _gph(leg: Leg) -> float | None:
-    """The rate this row burned at, which is what the pad's GPH column wants."""
-    if leg.ete_min <= 0:
-        return None
-    return leg.fuel_gal / (leg.ete_min / 60.0)
-
-
-def _clock(departure: Time | None, minutes_elapsed: float) -> str:
-    """`HH:MM` this many minutes after the departure time, wrapping at midnight.
-
-    Rounded to the nearest minute, not truncated, so that the column adds up:
-    a leg of 12.99 minutes prints as 13.0 in the ETE column, and an ETA that
-    threw the fraction away would land a minute before the one a pilot gets by
-    adding that column down the page.
-
-    Each ETA is taken from the exact running total rather than from the printed
-    ETEs, so the rounding cannot accumulate over a long route.
-    """
-    if departure is None:
-        return ""
-    total = round(departure.hour * 60 + departure.minute + minutes_elapsed)
-    total %= 24 * 60
-    return f"{total // 60:02d}:{total % 60:02d}"
-
-
-def _parse_time_off(time_off: str | Time | None) -> Time | None:
-    if time_off is None or isinstance(time_off, Time):
-        return time_off
-    text = time_off.strip()
-    if not text:
-        return None
-    # `13:45` and `1345` both, since a pilot writes the second one.
-    match = re.fullmatch(r"([01]?\d|2[0-3]):?([0-5]\d)", text)
-    if match is None:
-        raise ValueError(
-            f"time off {time_off!r} is not a 24-hour time like 13:45 or 1345"
-        )
-    return Time(int(match.group(1)), int(match.group(2)))
 
 
 def _safe(name: str) -> str:

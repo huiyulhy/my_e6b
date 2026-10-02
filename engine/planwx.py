@@ -185,6 +185,7 @@ def solve(
     margins: Margins | None = None,
     planning_mode: str = "manual",
     max_passes: int = MAX_PASSES,
+    segment_overrides: nl.SegmentOverrides | None = None,
 ) -> SolvedPlan:
     """Build a navlog and the weather list it agrees with.
 
@@ -209,6 +210,7 @@ def solve(
             overrides=overrides,
             margins=margins,
             planning_mode=planning_mode,
+            segment_overrides=segment_overrides,
         )
 
     # Pass zero: no forecast at all, purely to learn roughly when each

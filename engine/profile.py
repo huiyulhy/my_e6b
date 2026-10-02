@@ -9,10 +9,13 @@ Two ways to get there, sharing one model:
 * **User-driven.** The pilot declares each leg's `segment_type`. Where no
   altitude is given, it calculates the maximum altitude reachable based on POH
   ,same for descend at the configured rate.
-* **Automatic.** Legs are declared `automatic`; `resolve_route` expands them
+* **Hybrid.** Legs are declared `automatic`; `resolve_route` expands them
   against a target cruise altitude, **inserting TOC and TOD waypoints into the
   route** so that afterwards every leg is concrete and the user-driven walk
-  runs unchanged.
+  runs unchanged. A drawn leg may also carry `VerticalEvent`s -- "start the
+  climb here", "be level by here" -- which pin one end of an altitude change
+  to a place and let the other end float with the wind (BOC/TOC, BOD/TOD).
+  A leg with no events is flown exactly as the old automatic mode flew it.
 """
 
 from __future__ import annotations
@@ -44,7 +47,15 @@ SegmentType = Literal["climb", "cruise", "descent", "automatic"]
 LegWinds = dict[int, dict[str, "object"]]
 
 CONCRETE_SEGMENT_TYPES: tuple[str, ...] = ("climb", "cruise", "descent")
-PLANNING_MODES: tuple[str, ...] = ("manual", "auto")
+PLANNING_MODES: tuple[str, ...] = ("manual", "hybrid")
+# Hybrid grew out of the automatic mode and plans a leg with no events exactly
+# as it did, so the old name is still accepted -- saved missions and callers
+# written against it keep working.
+_MODE_ALIASES = {"auto": "hybrid", "automatic": "hybrid"}
+
+EVENT_KINDS: tuple[str, ...] = ("start", "complete")
+# An event clicked further than this off its leg is probably on the wrong one.
+_EVENT_OFF_TRACK_NM = 2.0
 
 # Below this, an altitude change is not worth a row of its own.
 _ALTITUDE_EPSILON_FT = 1.0
@@ -58,6 +69,40 @@ _PROFILE_BAND_FT = 1000.0
 
 class RouteError(ValueError):
     """The route cannot be flown as given."""
+
+
+def normalise_planning_mode(mode: str) -> str:
+    """The canonical name of a planning mode, or `RouteError` if there is none."""
+    mode = _MODE_ALIASES.get(mode, mode)
+    if mode not in PLANNING_MODES:
+        raise RouteError(
+            f"unknown planning mode {mode!r}; "
+            f"expected one of {', '.join(PLANNING_MODES)}"
+        )
+    return mode
+
+
+@dataclass(frozen=True)
+class VerticalEvent:
+    """An altitude change pinned to a place on a drawn leg.
+
+    * `start`: hold altitude until here, then change to the target. The bottom
+      of the change (BOC/TOD) is pinned; its top (TOC/BOD) floats downstream
+      by however far the change takes in the wind.
+    * `complete`: be at the target by here. The end of the change is pinned and
+      its beginning floats upstream.
+
+    Whether it is a climb or a descent follows from the target against the
+    altitude the aeroplane arrives with, so one shape covers all four points.
+
+    Kept as a *place* rather than a distance along the leg: the reason for it
+    is usually on the chart -- the edge of a Class B shelf -- and it should stay
+    there if a fix at either end of the leg is moved.
+    """
+
+    kind: str  # start | complete
+    position: LatLon
+    target_altitude_ft: float
 
 
 @dataclass(frozen=True)
@@ -95,6 +140,19 @@ class Waypoint:
     # True for a TOC/TOD the automatic planner inserted. `resolve_route`
     # discards these before re-expanding
     generated: bool = False
+
+    # A stable identity for a pilot's waypoint, so that what is said about the
+    # leg between two of them -- its events, a typed wind -- survives the
+    # route being edited around it. `None` for callers that never key anything.
+    id: str | None = None
+
+    # Altitude changes pinned to places on the leg arriving here. Hybrid mode
+    # only; user-driven mode declares its legs outright.
+    events: tuple[VerticalEvent, ...] = ()
+
+    # On a generated point, the drawn leg it was inserted into -- see
+    # `segment_key`. `None` on the pilot's own points.
+    segment_key: str | None = None
 
     # Field weather, for airports. The route's altimeter setting and ISA
     # deviation describe the air en route; used to calculate density altitude.
@@ -176,7 +234,8 @@ class ProfileSegment:
     # The POH climb segment this piece came from, so its fuel can be charged
     # from the published figure. `None` for level and descending flight.
     climb: perf.ClimbSegment | None
-    # "TOC" / "TOD" when this segment's boundary is a top of climb or descent.
+    # "TOC" / "TOD" / "BOC" / "BOD" when this segment's boundary is a top or
+    # bottom of climb or descent.
     # Carried rather than baked into the waypoint name, so a charted point used
     # as a top of climb keeps the name printed on the sectional.
     start_role: str | None = None
@@ -191,18 +250,62 @@ class ProfileSegment:
     level_minutes: float = 0.0
 
 
+def segment_key(start: Waypoint, end: Waypoint) -> str | None:
+    """The name of the drawn leg from `start` to `end`: `"<id>><id>"`.
+
+    `None` unless both ends carry an id. This is what the pilot's statements
+    about a leg are filed under, rather than a navlog row, because the rows a
+    leg is cut into change every time the wind moves a top of climb.
+    """
+    if start.id is None or end.id is None:
+        return None
+    return f"{start.id}>{end.id}"
+
+
+def pattern_altitude(waypoint: Waypoint, default_pattern_agl_ft: float = 1000.0) -> float:
+    """A field's traffic pattern altitude, MSL.
+
+    Its published pattern height, or `default_pattern_agl_ft`, above its
+    elevation, rounded to the nearest 100 ft as TPAs are published: KMOD at
+    99 ft comes out at 1,100.
+    """
+    agl = (
+        waypoint.pattern_altitude_agl_ft
+        if waypoint.pattern_altitude_agl_ft is not None
+        else default_pattern_agl_ft
+    )
+    return round(((waypoint.elevation_ft or 0.0) + agl) / 100.0) * 100.0
+
+
+def arrival_altitude(waypoint: Waypoint, default_pattern_agl_ft: float = 1000.0) -> float:
+    """The altitude a flight arrives over a field it lands at.
+
+    The descent ends at traffic pattern altitude, not on the runway -- the
+    pattern is its own row, and the landing is part of it. A crossing altitude
+    the pilot set on the field wins: a published TPA that is not a round
+    1,000 ft, or an overhead join above the pattern.
+    """
+    if waypoint.altitude_ft is not None:
+        return waypoint.altitude_ft
+    return pattern_altitude(waypoint, default_pattern_agl_ft)
+
+
 class PhaseNamer:
-    """Names the inserted points: TOC, TOD, TOC2, TOD2 ...
+    """Names the inserted points: TOC, TOD, BOC, BOD, then TOC2, TOD2 ...
+
+    `role` is what the point is: the top or bottom of a climb or descent.
     """
 
-    def __init__(self) -> None:
-        self._counts = {"climb": 0, "descent": 0}
+    _ROLES = ("TOC", "TOD", "BOC", "BOD")
 
-    def next(self, phase: str) -> str:
-        self._counts[phase] += 1
-        n = self._counts[phase]
-        stem = "TOC" if phase == "climb" else "TOD"
-        return stem if n == 1 else f"{stem}{n}"
+    def __init__(self) -> None:
+        self._counts = dict.fromkeys(self._ROLES, 0)
+
+    def next(self, phase_or_role: str) -> str:
+        role = {"climb": "TOC", "descent": "TOD"}.get(phase_or_role, phase_or_role)
+        self._counts[role] += 1
+        n = self._counts[role]
+        return role if n == 1 else f"{role}{n}"
 
 
 # --- resolution: every leg gets a concrete type --------------------------
@@ -236,8 +339,7 @@ def resolve_route(
     map keyed by the resolved route it produces, which is not the same list
     once tops of climb have been inserted into it.
     """
-    if mode not in PLANNING_MODES:
-        raise RouteError(f"unknown planning mode {mode!r}")
+    mode = normalise_planning_mode(mode)
 
     route = strip_generated(waypoints)
     if len(route) < 2:
@@ -291,7 +393,7 @@ def _expand_automatic(
     rather than the one that was aimed for.
     """
     plateaus = _plateau_altitudes(waypoints, cruise_altitude_ft)
-    ceilings = _descent_ceilings(
+    ceilings, caps = _descent_ceilings(
         waypoints,
         plateaus,
         destination_elevation=destination_elevation,
@@ -302,10 +404,11 @@ def _expand_automatic(
 
     resolved: list[Waypoint] = [waypoints[0]]
     entry = departure_elevation
+    arriving = "cruise"
     for index, (start, end) in enumerate(pairwise(waypoints)):
         # Never aim higher than the point from which the rest of the route can
         # still be flown down.
-        plateau = min(plateaus[index], ceilings[index])
+        plateau = min(plateaus[index], caps[index])
         exit_ = ceilings[index + 1]
 
         inserted, end_type, entry = _expand_leg(
@@ -319,8 +422,25 @@ def _expand_automatic(
             winds_by_phase=(leg_winds or {}).get(index),
             names=names,
             warnings=warnings,
+            from_the_ground=index == 0,
+            # A climb still going at the last waypoint carries on through it.
+            climbing_in=arriving == "climb",
         )
+        arriving = end_type
         resolved.extend(inserted)
+        # A crossing altitude the aeroplane cannot make is the pilot's to hear
+        # about, not the planner's to quietly lower. The rows are built to the
+        # declared altitude either way (see `build_segments`), so planning on
+        # from it is what keeps the legs after it continuous with them.
+        if end.altitude_ft is not None and abs(entry - end.altitude_ft) > 50.0:
+            verb = "climb" if end.altitude_ft > entry else "descend"
+            warnings.append(
+                f"The aeroplane cannot {verb} to {end.altitude_ft:,.0f} ft by "
+                f"{end.name}; by the POH it gets to {entry:,.0f} ft there. "
+                f"Start the {'climb' if verb == 'climb' else 'descent'} earlier "
+                f"or move the waypoint."
+            )
+            entry = end.altitude_ft
         # Only the *type* is written back onto the pilot's own waypoints, never
         # an altitude. Writing an altitude would make the next resolve read it
         # as a crossing restriction, which changes the plateau, which changes
@@ -343,6 +463,8 @@ def _expand_leg(
     winds_by_phase: dict[str, object] | None = None,
     names: PhaseNamer,
     warnings: list[str],
+    from_the_ground: bool = False,
+    climbing_in: bool = False,
 ) -> tuple[list[Waypoint], str, float]:
     """Split one leg, returning the points to insert before `end`.
 
@@ -351,105 +473,418 @@ def _expand_leg(
     A waypoint dropped three miles into a fourteen mile climb leaves the
     aeroplane part way up, and the caller carries that forward so the climb
     continues on the next leg and the top of climb lands where it really falls.
+
+    The leg is walked from its start. The pilot's events on it come first, in
+    the order they fall along it, each pinning one end of an altitude change
+    to a place; the aeroplane holds its altitude between them. Whatever is
+    left of the leg after the last event is laid out as the automatic planner
+    always has: a climb to the plateau out of the cursor, a descent to the
+    exit into the end, and level flight in between. A leg with no events is
+    therefore exactly the automatic leg.
+
+    `from_the_ground` is the first leg of a flight, which starts on the
+    runway. There is no holding altitude there, so a "be level by here" is
+    climbed to straight away rather than as late as possible.
     """
     geo = inverse(start.position, end.position)
     if geo.distance_nm <= 0:
         return [], "cruise", entry_altitude_ft
 
-    # A leg the pilot drew can hold two changes -- up to the plateau and back
-    # down off it -- and a wind was typed against each of them separately, so
-    # each is solved in its own. Which is which comes from the direction the
-    # piece goes, not from what the leg is called.
-    lead_conditions = _in_phase_wind(
-        conditions, winds_by_phase, entry_altitude_ft, plateau_altitude_ft
+    walk = _LegWalk(
+        start=start,
+        end=end,
+        geo=geo,
+        altitude_ft=entry_altitude_ft,
+        aircraft=aircraft,
+        conditions=conditions,
+        winds_by_phase=winds_by_phase,
+        warnings=warnings,
+        on_the_ground=from_the_ground,
+        climbing_in=climbing_in,
     )
-    tail_conditions = _in_phase_wind(
-        conditions, winds_by_phase, plateau_altitude_ft, exit_altitude_ft
-    )
-    lead = _solve_change(
-        entry_altitude_ft, plateau_altitude_ft, geo, aircraft, lead_conditions
-    )
-    tail = _solve_change(
-        plateau_altitude_ft, exit_altitude_ft, geo, aircraft, tail_conditions
-    )
+    for along_nm, event in _events_along(start, end, geo, warnings):
+        if not walk.fly_event(along_nm, event):
+            # The change ran off the end of the leg; the next leg finishes it.
+            return walk.finish(names)
 
-    if lead is None and tail is None:
-        return [], "cruise", plateau_altitude_ft
+    # With events, the plateau is where the last of them left the aeroplane
+    # unless the pilot asked for more at the end of the leg; the planner never
+    # climbs past what the pilot pinned.
+    plateau = plateau_altitude_ft
+    walk.fly_remainder(plateau, min(exit_altitude_ft, max(plateau, walk.altitude_ft)))
+    walk.check_holds()
+    return walk.finish(names)
 
-    # The leg is still changing altitude when it ends: it runs out of distance
-    # before the plateau, and there is no descent to fit in afterwards. Fly as
-    # much of the change as fits and hand the rest to the next leg. This is the
-    # ordinary case for a waypoint placed inside the climb, so it is not a
-    # warning -- nothing is wrong with the route.
-    if lead is not None and tail is None and lead["distance_nm"] > geo.distance_nm:
-        achieved = reachable_altitude(
-            entry_altitude_ft,
-            plateau_altitude_ft,
-            geo.distance_nm,
-            geo,
-            aircraft,
-            lead_conditions,
+
+# The role of the point that ends a piece of a leg, by the piece's phase and
+# the phase that follows it.
+_HANDOVER_ROLES = {
+    ("climb", "cruise"): "TOC",
+    ("climb", "descent"): "TOC",
+    ("cruise", "climb"): "BOC",
+    ("cruise", "descent"): "TOD",
+    ("descent", "cruise"): "BOD",
+    ("descent", "climb"): "BOD",
+}
+
+
+class _LegWalk:
+    """One drawn leg, cut into pieces from its start to its end.
+
+    Each piece is `(phase, ends_at_nm, altitude_at_end_ft)`. The cursor is the
+    distance flown so far and the altitude the aeroplane is at there.
+    """
+
+    def __init__(
+        self,
+        *,
+        start: Waypoint,
+        end: Waypoint,
+        geo: Segment,
+        altitude_ft: float,
+        aircraft: Aircraft,
+        conditions: Conditions,
+        winds_by_phase: dict[str, object] | None,
+        warnings: list[str],
+        on_the_ground: bool = False,
+        climbing_in: bool = False,
+    ) -> None:
+        self.start, self.end, self.geo = start, end, geo
+        self.aircraft, self.conditions = aircraft, conditions
+        self.winds_by_phase, self.warnings = winds_by_phase, warnings
+        self.cursor_nm = 0.0
+        self.altitude_ft = altitude_ft
+        self.pieces: list[tuple[str, float, float]] = []
+        # Still on the runway: nothing has been flown yet on a departure leg.
+        self._on_the_ground = on_the_ground
+        # The leg starts part way up a climb carried in from the last one, so
+        # that climb's first stretch here is not a bottom of climb.
+        self._climbing_in = climbing_in
+        # "Start here" events that asked for the altitude already held:
+        # (distance along, altitude). Checked once the leg is laid out.
+        self._holds: list[tuple[float, float]] = []
+
+    # --- the pieces ------------------------------------------------------
+
+    def _change(self, to_altitude_ft: float) -> tuple[dict | None, Conditions]:
+        conditions = _in_phase_wind(
+            self.conditions, self.winds_by_phase, self.altitude_ft, to_altitude_ft
         )
-        piece = _solve_change(
-            entry_altitude_ft, achieved, geo, aircraft, lead_conditions
+        return (
+            _solve_change(
+                self.altitude_ft, to_altitude_ft, self.geo, self.aircraft, conditions,
+                open_start=self._climbing_in,
+            ),
+            conditions,
         )
-        if piece is None:
-            return [], "cruise", entry_altitude_ft
-        return [], piece["phase"], achieved
 
-    needed = sum(p["distance_nm"] for p in (lead, tail) if p)
-    if needed > geo.distance_nm:
-        warnings.append(
-            f"{start.name} to {end.name} is {geo.distance_nm:.0f} nm but the "
-            f"altitude changes on it need {needed:.0f} nm; the airplane never "
-            f"levels off. Choose a lower altitude or move the waypoint."
-        )
-        # Scale in proportion rather than letting the pieces overlap.
-        scale = geo.distance_nm / needed
-        for piece in (lead, tail):
-            if piece:
-                piece["distance_nm"] *= scale
-        needed = geo.distance_nm
-
-    # Lay the pieces out along the leg as (piece, distance-at-which-it-ends).
-    # A climb out of the start comes first, a descent into the end comes last,
-    # and whatever distance is left over in between is flown level.
-    plan: list[tuple[dict | None, float]] = []
-    cursor = 0.0
-    if lead:
-        cursor += lead["distance_nm"]
-        plan.append((lead, cursor))
-    level_distance = geo.distance_nm - needed
-    if level_distance > _BOUNDARY_EPSILON_NM:
-        cursor += level_distance
-        plan.append((None, cursor))
-    if tail:
-        plan.append((tail, geo.distance_nm))
-
-    inserted: list[Waypoint] = []
-    for index, (piece, ends_at) in enumerate(plan[:-1]):
-        # The point that ends this piece is named for the phase it hands over
-        # to: the end of a climb is the top of climb, and the end of a level
-        # stretch before a descent is the top of descent.
-        handover = plan[index + 1][0]
-        phase = piece["phase"] if piece else handover["phase"]
-        inserted.append(
-            Waypoint(
-                name=names.next(phase),
-                position=geo.point_at_nm(ends_at),
-                kind="phase",
-                # The altitude is carried on the point itself, so rebuilding
-                # the profile from the resolved route reproduces it exactly.
-                altitude_ft=plateau_altitude_ft,
-                segment_type=piece["phase"] if piece else "cruise",
-                generated=True,
+    def _reach(
+        self, toward_ft: float, available_nm: float, conditions: Conditions
+    ) -> float:
+        """How far toward `toward_ft` the aeroplane gets in `available_nm`."""
+        if toward_ft > self.altitude_ft:
+            return reachable_altitude(
+                self.altitude_ft, toward_ft, available_nm, self.geo, self.aircraft,
+                conditions, open_start=self._climbing_in,
             )
+        return _descent_reachable(
+            self.altitude_ft, toward_ft, available_nm, self.geo, self.aircraft, conditions
         )
 
-    final_piece = plan[-1][0]
-    end_type = final_piece["phase"] if final_piece else "cruise"
-    achieved = exit_altitude_ft if tail else plateau_altitude_ft
-    return inserted, end_type, achieved
+    def _level_until(self, along_nm: float) -> None:
+        if along_nm - self.cursor_nm > _BOUNDARY_EPSILON_NM:
+            self.pieces.append(("cruise", along_nm, self.altitude_ft))
+            self._climbing_in = False
+        self.cursor_nm = max(self.cursor_nm, along_nm)
+
+    def _changed(self, phase: str, along_nm: float, altitude_ft: float) -> None:
+        self.pieces.append((phase, along_nm, altitude_ft))
+        self.cursor_nm, self.altitude_ft = along_nm, altitude_ft
+        self._on_the_ground = False
+        self._climbing_in = False
+
+    # --- the pilot's events ----------------------------------------------
+
+    def fly_event(self, along_nm: float, event: VerticalEvent) -> bool:
+        """Fly one event. False if its change is still going at the leg's end."""
+        piece, conditions = self._change(event.target_altitude_ft)
+        leg = f"{self.start.name} to {self.end.name}"
+        late = along_nm < self.cursor_nm - _BOUNDARY_EPSILON_NM
+        if piece is None and event.kind == "complete" and late:
+            # At the target now, but only since the cursor: the change before
+            # this event runs past its point. A tailwind stretching the climb
+            # out of an earlier "start here" is the usual way in.
+            self.warnings.append(
+                f"On {leg}, the aeroplane is not at "
+                f"{event.target_altitude_ft:,.0f} ft by the point {along_nm:.1f} nm "
+                f"along: the change before it gets there "
+                f"{self.cursor_nm - along_nm:.1f} nm later. Start it earlier or "
+                f"move the point."
+            )
+            return True
+        if piece is None:
+            # Already at the target. A "start here" still means "not before
+            # here": hold to the point, and let the rest of the leg climb or
+            # descend from there, toward wherever the leg is headed -- the
+            # usual way to say "start the climb to the next fix's altitude
+            # here". Only if nothing follows is it worth a word; see
+            # `check_holds`.
+            if event.kind == "start":
+                self._level_until(min(along_nm, self.geo.distance_nm))
+                self._holds.append((along_nm, event.target_altitude_ft))
+            return True
+        phase, needed = piece["phase"], piece["distance_nm"]
+        length = self.geo.distance_nm
+
+        if along_nm < self.cursor_nm - _BOUNDARY_EPSILON_NM:
+            self.warnings.append(
+                f"On {leg}, the {_event_label(event, phase)} {along_nm:.1f} nm along "
+                f"falls inside the altitude change before it, which ends "
+                f"{self.cursor_nm:.1f} nm along."
+            )
+
+        if event.kind == "start":
+            if self._on_the_ground:
+                self.warnings.append(
+                    f"On {leg}, the {_event_label(event, phase)} {along_nm:.1f} nm "
+                    f"along would hold field elevation until then. Add a "
+                    f"level-off before it for the altitude to climb out to."
+                )
+            begin = max(along_nm, self.cursor_nm)
+            self._level_until(begin)
+            if begin + needed > length + _BOUNDARY_EPSILON_NM:
+                reached = self._reach(event.target_altitude_ft, length - begin, conditions)
+                self._changed(phase, length, reached)
+                return False
+            self._changed(phase, begin + needed, event.target_altitude_ft)
+            return True
+
+        # complete: the end of the change is pinned, its beginning floats --
+        # except off the runway, where the climb starts at once and the point
+        # is where it must be done by.
+        along_nm = max(along_nm, self.cursor_nm)
+        begin = along_nm - needed
+        if self._on_the_ground and begin >= self.cursor_nm:
+            self._changed(phase, needed, event.target_altitude_ft)
+            return True
+        if begin < self.cursor_nm - _BOUNDARY_EPSILON_NM:
+            reached = self._reach(
+                event.target_altitude_ft, along_nm - self.cursor_nm, conditions
+            )
+            self.warnings.append(
+                f"On {leg}, the aeroplane cannot {phase} to "
+                f"{event.target_altitude_ft:,.0f} ft by the point {along_nm:.1f} nm "
+                f"along; it is {self.cursor_nm - begin:.1f} nm short and gets to "
+                f"{reached:,.0f} ft there."
+            )
+            self._changed(phase, along_nm, reached)
+            return True
+        self._level_until(begin)
+        self._changed(phase, along_nm, event.target_altitude_ft)
+        return True
+
+    # --- what is left of the leg -----------------------------------------
+
+    def fly_remainder(self, plateau_ft: float, exit_ft: float) -> None:
+        """Climb to the plateau out of the cursor, descend to the exit into
+        the end, and fly level in between -- the automatic leg.
+
+        The rule for what the planner adds on its own: at most three pieces,
+        a change, level, a change, and never two changes the same way with
+        level between them. A stepped climb or descent is the pilot's to ask
+        for with events, which are flown before this and are not merged.
+        """
+        available = self.geo.distance_nm - self.cursor_nm
+        lead, lead_conditions = self._change(plateau_ft)
+        entry = self.altitude_ft
+        self.altitude_ft = plateau_ft
+        tail, _ = self._change(exit_ft)
+        self.altitude_ft = entry
+
+        if lead is None and tail is None:
+            self._level_until(self.geo.distance_nm)
+            if not self.pieces:
+                self.altitude_ft = plateau_ft
+            return
+
+        # Down to the plateau, level, then down again is one descent with a
+        # step in it that nobody would fly. It happens where the aeroplane
+        # arrives above the most this leg can lose; descend once, as late as
+        # the exit allows, and let `_fly_straight_to` say if it cannot fit.
+        if (
+            lead is not None
+            and tail is not None
+            and lead["phase"] == "descent"
+            and tail["phase"] == "descent"
+        ):
+            self._fly_straight_to(exit_ft)
+            return
+
+        # The leg is still changing altitude when it ends: it runs out of
+        # distance before the plateau, and there is no descent to fit in
+        # afterwards. Fly as much of the change as fits and hand the rest to
+        # the next leg. This is the ordinary case for a waypoint placed inside
+        # the climb, so it is not a warning -- nothing is wrong with the route.
+        if lead is not None and tail is None and lead["distance_nm"] > available:
+            reached = self._reach(plateau_ft, available, lead_conditions)
+            if abs(reached - entry) <= _ALTITUDE_EPSILON_FT:
+                self._level_until(self.geo.distance_nm)
+                return
+            self._changed(lead["phase"], self.geo.distance_nm, reached)
+            return
+
+        needed = sum(p["distance_nm"] for p in (lead, tail) if p)
+        if needed > available:
+            # Up to the plateau and back down does not fit. Never squeeze it
+            # in by shrinking the distances and keeping the altitudes: that
+            # draws a climb the POH says cannot be flown (2,500 fpm out of
+            # Palo Alto). Nor climb above where the leg ends only to come back
+            # down -- odd flying, and over a "cross at" below a Class B shelf
+            # it is the shelf. Change straight toward the exit instead, as far
+            # as the performance allows.
+            self._fly_straight_to(exit_ft)
+            return
+
+        if lead:
+            self._changed(lead["phase"], self.cursor_nm + lead["distance_nm"], plateau_ft)
+        else:
+            self.altitude_ft = plateau_ft
+        if tail:
+            self._level_until(self.geo.distance_nm - tail["distance_nm"])
+            self._changed(tail["phase"], self.geo.distance_nm, exit_ft)
+        else:
+            self._level_until(self.geo.distance_nm)
+
+    def _fly_straight_to(self, exit_ft: float) -> None:
+        """Change from the cursor toward `exit_ft`, level once there.
+
+        A climb that runs out of leg carries on into the next, as any climb
+        does. A descent that runs out of leg arrives high, which the pilot is
+        told: the next constraint may not be met.
+        """
+        available = self.geo.distance_nm - self.cursor_nm
+        change, conditions = self._change(exit_ft)
+        if change is None:
+            self._level_until(self.geo.distance_nm)
+            return
+        if change["distance_nm"] <= available:
+            if change["phase"] == "climb":
+                self._changed("climb", self.cursor_nm + change["distance_nm"], exit_ft)
+                self._level_until(self.geo.distance_nm)
+            else:
+                self._level_until(self.geo.distance_nm - change["distance_nm"])
+                self._changed("descent", self.geo.distance_nm, exit_ft)
+            return
+        reached = self._reach(exit_ft, available, conditions)
+        if change["phase"] == "descent":
+            self.warnings.append(
+                f"{self.start.name} to {self.end.name}: the descent to "
+                f"{exit_ft:,.0f} ft needs {change['distance_nm']:.1f} nm at "
+                f"{self.aircraft.descent_rate_fpm:.0f} fpm but only "
+                f"{available:.1f} nm is left; the airplane reaches "
+                f"{self.end.name} at {reached:,.0f} ft. Descend sooner or faster."
+            )
+        if abs(reached - self.altitude_ft) <= _ALTITUDE_EPSILON_FT:
+            self._level_until(self.geo.distance_nm)
+            return
+        self._changed(change["phase"], self.geo.distance_nm, reached)
+
+    def check_holds(self) -> None:
+        """Say so where a "start here" held its altitude and nothing followed.
+
+        Holding to the point and then climbing toward the leg's own altitude
+        is what the event is for, and needs no comment. Holding to the end of
+        the leg with no change at all means the event did nothing the pilot
+        could have wanted.
+        """
+        leg = f"{self.start.name} to {self.end.name}"
+        for along_nm, altitude_ft in self._holds:
+            changes_after = any(
+                phase != "cruise" and ends_at > along_nm + _BOUNDARY_EPSILON_NM
+                for phase, ends_at, _ in self.pieces
+            )
+            if not changes_after:
+                self.warnings.append(
+                    f"On {leg}, the start-of-climb event {along_nm:.1f} nm along "
+                    f"asks for {altitude_ft:,.0f} ft, which is where the aeroplane "
+                    f"already is, and nothing after it changes altitude. Set the "
+                    f"event to the altitude to climb or descend to."
+                )
+
+    # --- the result ------------------------------------------------------
+
+    def finish(self, names: PhaseNamer) -> tuple[list[Waypoint], str, float]:
+        """The points to insert, the arriving phase, and the altitude reached."""
+        merged: list[tuple[str, float, float]] = []
+        for piece in self.pieces:
+            # Two pieces in the same phase back to back -- a climb resumed at
+            # the point the last one stopped -- are one piece of flying.
+            if merged and merged[-1][0] == piece[0]:
+                merged[-1] = piece
+            else:
+                merged.append(piece)
+        if not merged:
+            return [], "cruise", self.altitude_ft
+
+        key = segment_key(self.start, self.end)
+        inserted: list[Waypoint] = []
+        for (phase, ends_at, altitude), (following, _, _) in pairwise(merged):
+            inserted.append(
+                Waypoint(
+                    name=names.next(_HANDOVER_ROLES[(phase, following)]),
+                    position=self.geo.point_at_nm(ends_at),
+                    kind="phase",
+                    # The altitude is carried on the point itself, so
+                    # rebuilding the profile from the resolved route
+                    # reproduces it exactly.
+                    altitude_ft=altitude,
+                    segment_type=phase,
+                    generated=True,
+                    segment_key=key,
+                )
+            )
+        phase, _, altitude = merged[-1]
+        return inserted, phase, altitude
+
+
+def _event_label(event: VerticalEvent, phase: str) -> str:
+    if event.kind == "start":
+        return f"start of {phase}"
+    return f"level-off at {event.target_altitude_ft:,.0f} ft"
+
+
+def _events_along(
+    start: Waypoint, end: Waypoint, geo: Segment, warnings: list[str]
+) -> list[tuple[float, VerticalEvent]]:
+    """The events on a leg as `(distance along it, event)`, in flying order.
+
+    Each is projected onto the leg where it is flown. One that projects off
+    either end is held at that end, and one well to the side of the leg is
+    most likely on a different leg; both are said out loud rather than
+    silently moved.
+    """
+    placed: list[tuple[float, VerticalEvent]] = []
+    for event in end.events:
+        if event.kind not in EVENT_KINDS:
+            raise RouteError(
+                f"unknown event {event.kind!r} on {start.name} to {end.name}; "
+                f"expected one of {', '.join(EVENT_KINDS)}"
+            )
+        along = geo.along_track_nm(event.position)
+        off = abs(geo.cross_track_nm(event.position))
+        if off > _EVENT_OFF_TRACK_NM:
+            warnings.append(
+                f"An event on {start.name} to {end.name} is {off:.1f} nm off "
+                f"the leg; it is flown at the point abeam it."
+            )
+        if along < 0.0 or along > geo.distance_nm:
+            warnings.append(
+                f"An event on {start.name} to {end.name} lies beyond the end "
+                f"of the leg; it is flown at the nearer end."
+            )
+            along = min(max(along, 0.0), geo.distance_nm)
+        placed.append((along, event))
+    return sorted(placed, key=lambda item: item[0])
 
 
 # --- building the segments -----------------------------------------------
@@ -497,6 +932,7 @@ def build_segments(
     cruise_point: perf.CruisePoint,
     altitude_overrides: dict[int, float] | None = None,
     leg_winds: LegWinds | None = None,
+    arrival_altitude_ft: float | None = None,
 ) -> list[ProfileSegment]:
     """One segment per leg, from a route whose legs all have concrete types.
 
@@ -531,6 +967,14 @@ def build_segments(
             )
 
         geo = inverse(start.position, end.position)
+        # A climb that carries on through either end of this leg is read
+        # mid-climb there, not rounded to the book's row.
+        open_start = phase == "climb" and bool(segments) and segments[-1].phase == "climb"
+        open_end = (
+            phase == "climb"
+            and index + 2 < len(waypoints)
+            and waypoints[index + 2].segment_type == "climb"
+        )
         # Every reading for this leg -- the top it reaches and the marching
         # that gets it there -- is taken in the leg's own wind.
         leg_conditions = _in_leg_wind(conditions, leg_winds, index, phase)
@@ -543,6 +987,12 @@ def build_segments(
                 geo=geo,
                 aircraft=aircraft,
                 conditions=leg_conditions,
+                open_start=open_start,
+                # The last leg descends to the arrival altitude, the pattern,
+                # rather than all the way to the runway.
+                floor_ft=(
+                    arrival_altitude_ft if index == len(waypoints) - 2 else None
+                ),
             )
         segments.append(
             _segment_for(
@@ -555,6 +1005,8 @@ def build_segments(
                 aircraft=aircraft,
                 conditions=leg_conditions,
                 cruise_point=cruise_point,
+                open_start=open_start,
+                open_end=open_end,
             )
         )
         entry = exit_altitude
@@ -570,6 +1022,8 @@ def _exit_altitude(
     geo: Segment,
     aircraft: Aircraft,
     conditions: Conditions,
+    open_start: bool = False,
+    floor_ft: float | None = None,
 ) -> float:
     """Where this leg leaves the aeroplane."""
     if end.altitude_ft is not None:
@@ -584,10 +1038,13 @@ def _exit_altitude(
             geo,
             aircraft,
             conditions,
+            open_start=open_start,
         )
+    if floor_ft is None:
+        floor_ft = end.elevation_ft if end.elevation_ft is not None else 0.0
     return _descent_reachable(
         entry_altitude_ft,
-        end.elevation_ft if end.elevation_ft is not None else 0.0,
+        floor_ft,
         geo.distance_nm,
         geo,
         aircraft,
@@ -618,17 +1075,21 @@ def _segment_for(
     aircraft: Aircraft,
     conditions: Conditions,
     cruise_point: perf.CruisePoint,
+    open_start: bool = False,
+    open_end: bool = False,
 ) -> ProfileSegment:
     """Airspeed and POH climb figures for one declared leg."""
     mid = 0.5 * (entry_altitude_ft + exit_altitude_ft)
     change = _solve_change(
-        entry_altitude_ft, exit_altitude_ft, geo, aircraft, conditions
+        entry_altitude_ft, exit_altitude_ft, geo, aircraft, conditions,
+        open_start=open_start, open_end=open_end,
     )
     level_nm = level_minutes = 0.0
 
     if phase == "climb" and change is not None and change["phase"] == "climb":
         change = _fitted_to_the_leg(
-            change, entry_altitude_ft, exit_altitude_ft, geo, aircraft, conditions
+            change, entry_altitude_ft, exit_altitude_ft, geo, aircraft, conditions,
+            open_start=open_start,
         )
         tas_kt, climb = change["tas_kt"], change["climb"]
         tas_kt, level_nm, level_minutes = _with_level_remainder(
@@ -666,6 +1127,7 @@ def _fitted_to_the_leg(
     geo: Segment,
     aircraft: Aircraft,
     conditions: Conditions,
+    open_start: bool = False,
 ) -> dict:
     """Charge only the climb the leg has room for.
 
@@ -688,8 +1150,12 @@ def _fitted_to_the_leg(
         geo,
         aircraft,
         conditions,
+        open_start=open_start,
     )
-    fitted = _solve_change(entry_altitude_ft, reachable, geo, aircraft, conditions)
+    fitted = _solve_change(
+        entry_altitude_ft, reachable, geo, aircraft, conditions,
+        open_start=open_start, open_end=True,
+    )
     return fitted if fitted is not None and fitted["climb"] is not None else change
 
 
@@ -738,7 +1204,11 @@ def _with_level_remainder(
 
 
 def _mark_boundaries(segments: list[ProfileSegment]) -> list[ProfileSegment]:
-    """Tag the tops of climb and descent.
+    """Tag the tops and bottoms of climb and descent.
+
+    A level leg that hands over to a climb ends at a bottom of climb, and a
+    descent that levels off (or turns back into a climb) ends at a bottom of
+    descent. A descent into the destination has no bottom: it lands.
 
     A climb's end is a top of climb only if the climb actually stops there --
     two climb legs in a row have no TOC between them. Symmetrically a descent's
@@ -752,7 +1222,13 @@ def _mark_boundaries(segments: list[ProfileSegment]) -> list[ProfileSegment]:
     for index, segment in enumerate(segments):
         after = segments[index + 1].phase if index + 1 < len(segments) else None
         before = segments[index - 1].phase if index else None
-        end_role = "TOC" if segment.phase == "climb" and after != "climb" else None
+        end_role = None
+        if segment.phase == "climb" and after != "climb":
+            end_role = "TOC"
+        elif segment.phase == "cruise" and after == "climb":
+            end_role = "BOC"
+        elif segment.phase == "descent" and after in ("cruise", "climb"):
+            end_role = "BOD"
         start_role = (
             "TOD" if segment.phase == "descent" and before != "descent" else None
         )
@@ -769,12 +1245,21 @@ def _plateau_altitudes(
     """The altitude to level off at on each leg.
 
     A waypoint's altitude applies to the leg arriving at it and to every leg
-    after, until another waypoint overrides it.
+    after, until another waypoint overrides it. So does the target of the last
+    event on a leg.
     """
     current = cruise_altitude_ft
     plateaus: list[float] = []
-    for _, end in pairwise(waypoints):
-        if end.altitude_ft is not None:
+    last = len(waypoints) - 1
+    for index, (start, end) in enumerate(pairwise(waypoints)):
+        # An event's target holds from where it is flown onward, as a
+        # crossing altitude does; the last one on the leg is what is left.
+        if end.events:
+            geo = inverse(start.position, end.position)
+            current = _events_along(start, end, geo, [])[-1][1].target_altitude_ft
+        # The landing field's altitude is where the descent ends, not an
+        # altitude to fly the last leg at.
+        if end.altitude_ft is not None and index + 1 < last:
             current = end.altitude_ft
         plateaus.append(current)
     return plateaus
@@ -788,18 +1273,28 @@ def _descent_ceilings(
     aircraft: Aircraft,
     conditions: Conditions,
     leg_winds: LegWinds | None = None,
-) -> list[float]:
+) -> tuple[list[float], list[float]]:
     """The highest altitude each waypoint may be crossed at, walking backwards.
 
-    The destination must be arrived at at field elevation. Working back from
+    The destination must be arrived at at `destination_elevation` -- which is
+    the arrival altitude over the field, the pattern altitude when called from
+    `navlog`, field elevation for a caller that lands on it. Working back from
     there, each waypoint may be as high as the next one plus whatever can be
     lost on the leg between them -- capped by the altitude actually planned
     for, since this is a limit and not a target.
 
-    Returns one altitude per waypoint, so `ceilings[i]` applies at
-    `waypoints[i]`.
+    Returns two lists, one altitude per waypoint:
+
+    * `ceilings[i]`, the altitude to be at over `waypoints[i]` -- what the leg
+      arriving there descends to, and what the leg before it is planned down
+      toward. A crossing altitude the pilot set replaces it.
+    * `caps[i]`, the highest the leg *leaving* `waypoints[i]` may go and still
+      get down to `ceilings[i + 1]` by its end. Never a crossing altitude: a
+      "cross VPKGO at 2500" says where the aeroplane is at VPKGO, not that it
+      must stay there all the way to the next fix.
     """
     ceilings = [float("inf")] * len(waypoints)
+    caps = [float("inf")] * len(waypoints)
     ceilings[-1] = destination_elevation
 
     for index in range(len(waypoints) - 2, -1, -1):
@@ -810,22 +1305,70 @@ def _descent_ceilings(
             below,
             aircraft,
             _in_leg_wind(conditions, leg_winds, index, "descent"),
+            up_to_ft=plateaus[index],
         )
-        ceilings[index] = min(plateaus[index], below + gain)
+        caps[index] = ceilings[index] = min(plateaus[index], below + gain)
+        # A crossing altitude the pilot set is theirs, not a limit to plan
+        # under: planning to cross lower so the next descent fits would be
+        # overruled when the rows are built, and leave a descent of no height.
+        # If what follows cannot be flown from it, the forward pass says so.
+        if index > 0 and waypoints[index].altitude_ft is not None:
+            ceilings[index] = waypoints[index].altitude_ft
 
-    return ceilings
+    return ceilings, caps
 
 
 def _descendable_ft(
-    geo: Segment, from_altitude_ft: float, aircraft: Aircraft, conditions: Conditions
+    geo: Segment,
+    from_altitude_ft: float,
+    aircraft: Aircraft,
+    conditions: Conditions,
+    up_to_ft: float | None = None,
 ) -> float:
     """Height that can be shed over a leg at the configured descent rate.
 
-    Ground speed is needed to calculate descent distance, so we need airspeed and 
-    wind for this.
+    Solved with the same band-by-band descent the forward pass flies
+    (`_solve_change`), so the two passes agree on where a descent has to
+    start. A single sample at the bottom of the descent -- the airspeed and
+    wind at `from_altitude_ft` alone -- disagreed with it by a few hundred feet
+    in shear, and the forward pass made up the difference with a second, tiny
+    descent at the start of the next leg.
+
+    `up_to_ft` bounds the search: nothing above the leg's own plateau is ever
+    used, and a long leg's estimate would otherwise reach past the top of the
+    atmosphere model.
     """
     if geo.distance_nm <= 0 or aircraft.descent_rate_fpm <= 0:
         return 0.0
+    estimate = _descendable_ft_at_the_bottom(geo, from_altitude_ft, aircraft, conditions)
+    if estimate <= 0.0:
+        return 0.0
+
+    def distance_from(top_ft: float) -> float:
+        piece = _solve_change(top_ft, from_altitude_ft, geo, aircraft, conditions)
+        return piece["distance_nm"] if piece else 0.0
+
+    high = 2.0 * estimate + 1000.0
+    if up_to_ft is not None:
+        high = min(high, max(0.0, up_to_ft - from_altitude_ft))
+    if high <= 0.0:
+        return 0.0
+    if distance_from(from_altitude_ft + high) <= geo.distance_nm:
+        return high
+    low = 0.0
+    for _ in range(40):
+        middle = 0.5 * (low + high)
+        if distance_from(from_altitude_ft + middle) <= geo.distance_nm:
+            low = middle
+        else:
+            high = middle
+    return low
+
+
+def _descendable_ft_at_the_bottom(
+    geo: Segment, from_altitude_ft: float, aircraft: Aircraft, conditions: Conditions
+) -> float:
+    """The quick estimate: airspeed and wind read at the bottom only."""
     tas_kt = tas_from_cas(
         aircraft.descent_speed_kias, conditions.density_altitude_ft(from_altitude_ft)
     )
@@ -849,6 +1392,8 @@ def reachable_altitude(
     geo: Segment,
     aircraft: Aircraft,
     conditions: Conditions,
+    *,
+    open_start: bool = False,
 ) -> float:
     """Calculate the maximum altitude the airplane can reach, given a ground speed
 
@@ -856,21 +1401,29 @@ def reachable_altitude(
     and the relationship is not linear. Used both when a leg is too short to
     finish its climb, or when a "climb to" states no altitude at all and the
     answer is simply "as high as it gets".
+
+    Reaching the target is a top of climb, and costs the book's rounded time
+    to it. Falling short is not: the climb is still going where the distance
+    runs out, so that end is read mid-climb. `open_start` says the climb was
+    already under way where this distance begins.
     """
     if available_nm <= 0 or toward_altitude_ft <= from_altitude_ft:
         return from_altitude_ft
 
-    def distance_to(altitude: float) -> float:
-        piece = _solve_change(from_altitude_ft, altitude, geo, aircraft, conditions)
+    def distance_to(altitude: float, *, open_end: bool) -> float:
+        piece = _solve_change(
+            from_altitude_ft, altitude, geo, aircraft, conditions,
+            open_start=open_start, open_end=open_end,
+        )
         return piece["distance_nm"] if piece else 0.0
 
-    if distance_to(toward_altitude_ft) <= available_nm:
+    if distance_to(toward_altitude_ft, open_end=False) <= available_nm:
         return toward_altitude_ft
 
     low, high = from_altitude_ft, toward_altitude_ft
     for _ in range(48):
         middle = 0.5 * (low + high)
-        if distance_to(middle) <= available_nm:
+        if distance_to(middle, open_end=True) <= available_nm:
             low = middle
         else:
             high = middle
@@ -981,8 +1534,17 @@ def _solve_change(
     geo: Segment,
     aircraft: Aircraft,
     conditions: Conditions,
+    *,
+    open_start: bool = False,
+    open_end: bool = False,
 ) -> dict | None:
     """Time, airspeed and ground distance for one altitude change.
+
+    A climb's time is the book's, rounded out to the printed rows at the
+    climb's real start and top only (see `perf.climb_from_to`). `open_start`
+    and `open_end` say this change begins or ends mid-climb -- at a waypoint
+    the climb carries on through -- where it is interpolated instead, as it
+    is at every band edge inside the change.
 
     `None` when there is no change worth flying, which is what lets the caller
     treat "climb then level" and "level all the way" as one shape.
@@ -1015,7 +1577,8 @@ def _solve_change(
     total_distance = 0.0
     climb_time = climb_fuel = climb_kias_minutes = 0.0
 
-    for band_low, band_high in _altitude_bands(from_altitude_ft, to_altitude_ft):
+    bands = _altitude_bands(from_altitude_ft, to_altitude_ft)
+    for band_index, (band_low, band_high) in enumerate(bands):
         band_mid = 0.5 * (band_low + band_high)
         if phase == "climb":
             # Time and fuel come from differencing the cumulative table at
@@ -1025,6 +1588,8 @@ def _solve_change(
                 conditions.pressure_altitude_ft(band_low),
                 conditions.pressure_altitude_ft(band_high),
                 oat_c=conditions.oat_c(band_mid),
+                round_from=band_index == 0 and not open_start,
+                round_to=band_index == len(bands) - 1 and not open_end,
             )
             minutes = piece.time_min
             climb_time += piece.time_min

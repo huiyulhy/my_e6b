@@ -1,7 +1,8 @@
-"""Cessna 172S POH Section 5 performance tables and interpolation.
-
-Loads the digitized section 5 performance charts and interpolates
-between charts for performance
+"""Cessna 172S POH Section 5 performance tables and interpolation:
+- Takeoff distance charts
+- Landing distance chart
+- Climb distance charts
+- Cruise performance charts
 
 Main rules:
 1. Never extrapolate beyond table boundaries
@@ -70,21 +71,6 @@ MAX_CHART_HEADWIND_KT = 30.0
 
 # How far outside the cruise chart's published temperature columns a reading
 # may be taken before it counts as an extrapolation.
-#
-# The chart prints three columns per altitude page -- ISA-20, ISA, ISA+20 --
-# so a query inside ISA +/-20 is read straight off it and is not in question.
-# Outside that band there is no column, and `cruise_at_density` finds the same
-# air somewhere else on the chart instead. That reading is still taken from
-# published cells, but it is not the cell the query asked for, and past some
-# distance from the printed band it stops being a reading of this operating
-# point at all.
-#
-# Zero, deliberately: the line sits exactly at the chart's edge, so anything
-# needing the density substitution at all is an extrapolation. A positive
-# value would allow that much slop either side before the label applies --
-# treating ISA+22 as close enough to the printed ISA+20 column -- which is a
-# judgement about how far a reading may travel before it stops describing
-# this operating point, and not one to make silently.
 CRUISE_ISA_TOLERANCE_C = 0.0
 
 # Taxi takeoff fuel consumption (based on POH)
@@ -98,15 +84,8 @@ class OutsidePOHEnvelope(ValueError):
 
 @dataclass(frozen=True)
 class OffChart:
-    """One reading the POH does not publish, and what was read instead.
-
-    Nothing in this module extrapolates -- a query past the edge of a chart is
-    refused, not projected. But refusing everything would fail ordinary days
-    for ordinary reasons: a high-pressure morning at a sea-level field is below
-    the bottom row of every takeoff chart, and a hot afternoon is off the right
-    of the cruise chart's temperature band. Where a *published* cell can stand
-    in for the query, one is read and this records that it happened.
-
+    """ Which reading was not published in the POH
+    
     `conservative` is the field that decides what a caller should do about it.
     True means the substitute errs on the safe side -- it reads a longer
     ground roll, or a lower rate of climb, than the aeroplane will actually
@@ -350,6 +329,10 @@ class _Tables:
     climb_cum_time: _Grid
     climb_cum_fuel: _Grid
     climb_table_kias: _Grid
+    # The time-to-climb table's printed rows and their cumulative minutes,
+    # read row by row rather than interpolated; see `_book_climb_minutes`.
+    climb_table_palts: np.ndarray
+    climb_table_minutes: np.ndarray
     cruise: _CruiseTable
 
 @lru_cache(maxsize=4)
@@ -439,6 +422,8 @@ def _build_tables(data_dir: Path | None = None) -> _Tables:
         climb_cum_time=_regular((d_palts,), cum_time),
         climb_cum_fuel=_regular((d_palts,), cum_fuel),
         climb_table_kias=_regular((d_palts,), table_kias),
+        climb_table_palts=d_palts.astype(float),
+        climb_table_minutes=cum_time.astype(float),
         cruise=_CruiseTable(
             altitudes=cr_alts,
             isa_devs=cr_devs,
@@ -564,7 +549,7 @@ def landing_distance(
 def _apply_wind(
     roll: float, over: float, headwind_kt: float
 ) -> tuple[float, float, OffChart | None]:
-    """POH wind corrections, shared by the takeoff and landing charts. (based on 172s)
+    """Apply POH wind corrections, shared by the takeoff and landing charts. (based on 172s)
     1. Add 15% of takeoff for dry grass
     2. Subtract 10% per 9 kts of headwind, add 10% per 2 kts of tailwind
 
@@ -619,23 +604,30 @@ def climb_from_to(
     *,
     oat_c: float | None = None,
     data_dir: Path | None = None,
+    round_from: bool = True,
+    round_to: bool = True,
 ) -> ClimbSegment:
     """Time, fuel and climb speed between two pressure altitudes.
 
-    Time and fuel are the **difference** between the cumulative-from-sea-level
-    columns read at the two altitudes, interpolated on pressure altitude, so a
-    climb starting at a field elevation is not charged for the part of the
-    table below it and adjacent segments telescope back to the whole.
+    Time is read the way the POH is read by hand: the cumulative time at the
+    printed row at or *below* where the climb starts, subtracted from the one
+    at or *above* where it ends. Nearest row, rounded outward, so a climb is
+    never credited with being quicker than the book says -- 5,500 ft is
+    planned as the time to 6,000.
+
+    Only at the ends of a climb. `round_from=False` / `round_to=False` say an
+    end is a place the climb passes through -- a waypoint mid-climb, the edge
+    of one integration band and the start of the next -- where the time is
+    interpolated in the same column instead. Rounding there would charge the
+    part-row twice, once on each side, and stop the climb dead at every row. 
+    Fuel is the difference of the cumulative fuel column interpolated at the two altitudes
 
     The climb speed is the average of the table's speed column at the two ends,
-    which is the speed that represents the segment as a whole -- the column
-    falls with altitude, so the top-of-band value alone reads slow for the
-    lower half of the climb.
+    which is the speed that represents the segment as a whol
 
-    The published table assumes standard temperature. If `oat_c` is given the
-    POH note is applied to time and fuel: "increase by 10% for each 10 degC
-    above standard", taken symmetrically so a cold day is credited the same
-    10% per 10 degC below. Climb speed is not a function of temperature.
+    POH: 
+    1. Published table is at standard temperature
+    2. Increase climb time, fuel and distance by 10% for each 10 degC
     """
     # Checked before the floor is applied, so a "climb" that really descends is
     # still a caller error rather than two clamped altitudes quietly agreeing.
@@ -648,9 +640,7 @@ def climb_from_to(
         _call(t.climb_table_kias, (bottom,), "climb speed")
         + _call(t.climb_table_kias, (top,), "climb speed")
     )
-    time_min = _call(t.climb_cum_time, (top,), "climb time") - _call(
-        t.climb_cum_time, (bottom,), "climb time"
-    )
+    time_min = _book_climb_minutes(t, bottom, top, round_from, round_to)
     fuel_gal = _call(t.climb_cum_fuel, (top,), "climb fuel") - _call(
         t.climb_cum_fuel, (bottom,), "climb fuel"
     )
@@ -665,6 +655,40 @@ def climb_from_to(
         time_min *= factor
         fuel_gal *= factor
     return ClimbSegment(time_min=time_min, fuel_gal=fuel_gal, kias=kias)
+
+
+def _book_climb_minutes(
+    t: _Tables,
+    bottom_ft: float,
+    top_ft: float,
+    round_from: bool = True,
+    round_to: bool = True,
+) -> float:
+    """Minutes to climb, from the table's printed rows, rounded outward.
+
+    The start snaps down to the row at or below it and the end up to the row
+    at or above it -- each only if it is asked to; an end that is not is read
+    by linear interpolation in the same cumulative column. Within a hundredth of a foot of a row counts as on it, so
+    a climb that ends at 3000 is not charged for 4000 over floating-point
+    noise.
+    """
+    palts, minutes = t.climb_table_palts, t.climb_table_minutes
+    if top_ft > palts[-1] + _ON_ROW_FT:
+        raise OutsidePOHEnvelope(
+            f"climb time query ({top_ft},) is outside the published POH range "
+            f"[{palts[0]:.0f}, {palts[-1]:.0f}]"
+        )
+    below = int(np.searchsorted(palts, bottom_ft + _ON_ROW_FT, side="right")) - 1
+    above = int(np.searchsorted(palts, top_ft - _ON_ROW_FT, side="left"))
+    below = max(0, below)
+    above = min(len(palts) - 1, max(above, below))
+    start = minutes[below] if round_from else float(np.interp(bottom_ft, palts, minutes))
+    end = minutes[above] if round_to else float(np.interp(top_ft, palts, minutes))
+    return float(max(0.0, end - start))
+
+
+# How close to a printed row an altitude has to be to be read as on it.
+_ON_ROW_FT = 0.01
 
 
 def cruise(

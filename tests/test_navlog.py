@@ -90,7 +90,13 @@ class TestPhaseStructure:
         """Two nearby airports cannot climb to 10500 and descend again."""
         nearby = nl.Waypoint("KPAO", LatLon(37.4611, -122.1150), "airport", elevation_ft=7)
         log = nl.build_navlog([KSQL, nearby], 10500, conditions=CALM, planning_mode="auto")
-        assert any("never levels off" in w for w in log.warnings)
+        assert any("never reaches the 10,500 ft" in w for w in log.warnings)
+        # And what is flown instead is a climb the POH allows, not the whole
+        # climb squeezed into the distance there is.
+        for leg in log.legs:
+            if leg.phase == "climb":
+                book = nl.perf.climb_from_to(leg.entry_altitude_ft, leg.exit_altitude_ft)
+                assert leg.ete_min >= book.time_min * 0.99
 
 
 class TestAccounting:
@@ -333,16 +339,15 @@ class TestConditions:
         The lesson, which has caught this project three times now: a fixed RPM
         is not a fixed power setting. See docs/ARCHITECTURE.md section 5.
 
-        Flown at 8500 ft rather than 7500. Since `cruise` rounds the altitude
-        down to a published page, 7500 ft reads the 6000 ft page, where the
-        saving and the penalty happen to cancel to within the tenth of a
-        gallon a navlog prints -- a genuine tie, not a regression, but it
-        cannot carry the lesson. Every other cruising altitude still shows it.
+        Flown at 9500 ft. At some altitudes the saving and the penalty cancel
+        to within the tenth of a gallon a navlog prints -- 7500 ft on the
+        6000 ft page, and 8500 ft once descents ended at pattern altitude --
+        a genuine tie, not a regression, but it cannot carry the lesson.
         """
-        standard = nl.build_navlog([KSQL, KSBP], 8500, conditions=CALM, planning_mode="auto")
+        standard = nl.build_navlog([KSQL, KSBP], 9500, conditions=CALM, planning_mode="auto")
         hot = nl.build_navlog(
             [KSQL, KSBP],
-            8500,
+            9500,
             conditions=nl.Conditions(isa_deviation_c=15.0, flight_date=date(2026, 8, 15)),
             planning_mode="auto",
         )
@@ -1560,3 +1565,265 @@ class TestWindsAloftByLeg:
         )
         cruise = next(r for r in self.rows(warm) if r.phase == "cruise")
         assert cruise.density_altitude_ft > cruise.pressure_altitude_ft + 1500
+
+
+# --- edits filed under the leg the pilot drew ------------------------------
+
+A = replace(KSQL, id="a")
+B = replace(KSBP, id="b")
+M = replace(VPWDM, id="m")
+Z = replace(KMRY, id="z")
+
+
+def segment_log(route=(A, B), altitude=9500, segment_overrides=None, **kwargs):
+    return nl.build_navlog(
+        list(route), altitude, conditions=kwargs.pop("conditions", CALM),
+        planning_mode=kwargs.pop("planning_mode", "hybrid"),
+        segment_overrides=segment_overrides, **kwargs,
+    )
+
+
+def flown(log):
+    return [leg for leg in log.legs if leg.covers_ground]
+
+
+class TestSegmentOverrides:
+    def test_every_row_knows_its_drawn_leg(self):
+        log = segment_log()
+        assert {leg.segment_key for leg in flown(log)} == {"a>b"}
+        assert all(leg.segment_key is None for leg in log.legs if not leg.covers_ground)
+
+    def test_a_wind_on_the_leg_reaches_every_row_cut_from_it(self):
+        log = segment_log(
+            segment_overrides={("a>b", None): nl.LegOverride(wind_from_deg=160, wind_speed_kt=30)}
+        )
+        for leg in flown(log):
+            assert (leg.wind_from_deg, leg.wind_speed_kt) == (160, 30)
+            assert "wind_from_deg" in leg.overridden
+
+    def test_a_wind_on_the_leg_moves_the_top_of_climb(self):
+        def climb(wind_from):
+            edits = {("a>b", None): nl.LegOverride(wind_from_deg=wind_from, wind_speed_kt=30)}
+            return next(leg for leg in segment_log(segment_overrides=edits).legs
+                        if leg.phase == "climb")
+
+        calm = next(leg for leg in segment_log().legs if leg.phase == "climb")
+        assert climb(160).distance_nm < calm.distance_nm < climb(340).distance_nm
+
+    def test_a_phase_edit_beats_the_legs_own(self):
+        log = segment_log(segment_overrides={
+            ("a>b", None): nl.LegOverride(wind_from_deg=160, wind_speed_kt=30),
+            ("a>b", "descent"): nl.LegOverride(wind_speed_kt=5),
+        })
+        descent = next(leg for leg in flown(log) if leg.phase == "descent")
+        cruise = next(leg for leg in flown(log) if leg.phase == "cruise")
+        assert (descent.wind_from_deg, descent.wind_speed_kt) == (160, 5)
+        assert (cruise.wind_from_deg, cruise.wind_speed_kt) == (160, 30)
+
+    def test_an_edit_survives_the_rows_moving(self):
+        """The bug this replaces: a row-indexed wind was dropped when a new
+        TOC shifted the rows. Filed under the leg, it lands however many rows
+        the leg is cut into."""
+        edits = {("a>b", "cruise"): nl.LegOverride(tas_kt=101)}
+        plain = segment_log(segment_overrides=edits)
+        stepped = segment_log(
+            route=(A, replace(B, events=(
+                nl.VerticalEvent("complete", inverse(A.position, B.position).point_at_nm(10), 3500),
+                nl.VerticalEvent("start", inverse(A.position, B.position).point_at_nm(40), 9500),
+            ))),
+            segment_overrides=edits,
+        )
+        assert len(flown(stepped)) != len(flown(plain))
+        for log in (plain, stepped):
+            cruises = [leg for leg in flown(log) if leg.phase == "cruise"]
+            assert cruises and all(leg.tas_kt == 101 for leg in cruises)
+
+    def test_it_stays_on_its_own_leg(self):
+        edits = {("m>z", None): nl.LegOverride(wind_from_deg=90, wind_speed_kt=40)}
+        log = segment_log(route=(A, M, Z), altitude=6500, segment_overrides=edits)
+        for leg in flown(log):
+            typed = (leg.wind_from_deg, leg.wind_speed_kt) == (90, 40)
+            assert typed == (leg.segment_key == "m>z")
+
+    def test_the_forecast_fills_in_an_untyped_half(self):
+        windy = replace(CALM, winds=nl.WindsAloft.uniform(200.0, 12.0))
+        log = segment_log(
+            segment_overrides={("a>b", None): nl.LegOverride(wind_speed_kt=25)},
+            conditions=windy,
+        )
+        for leg in flown(log):
+            assert (leg.wind_from_deg, leg.wind_speed_kt) == (200.0, 25)
+
+    def test_a_row_edit_beats_its_legs(self):
+        log = segment_log(
+            segment_overrides={("a>b", None): nl.LegOverride(tas_kt=100)},
+            overrides={2: nl.LegOverride(tas_kt=90)},
+        )
+        assert log.legs[2].tas_kt == 90
+        assert all(leg.tas_kt == 100 for i, leg in enumerate(log.legs)
+                   if leg.covers_ground and i != 2 and leg.phase == "cruise")
+
+    def test_user_driven_matches_the_row_edit_it_replaces(self):
+        route = [A, replace(M, segment_type="climb", altitude_ft=5500),
+                 replace(Z, segment_type="descent")]
+        by_row = nl.build_navlog(route, 7500, conditions=CALM, overrides={
+            1: nl.LegOverride(wind_from_deg=150, wind_speed_kt=30, altitude_ft=4500)})
+        by_leg = nl.build_navlog(route, 7500, conditions=CALM, segment_overrides={
+            ("a>m", None): nl.LegOverride(wind_from_deg=150, wind_speed_kt=30, altitude_ft=4500)})
+        assert [(leg.exit_altitude_ft, leg.ete_min, leg.fuel_gal) for leg in by_row.legs] == [
+            (leg.exit_altitude_ft, leg.ete_min, leg.fuel_gal) for leg in by_leg.legs]
+
+    def test_an_altitude_on_a_leg_is_refused_in_hybrid(self):
+        log = segment_log(segment_overrides={("a>b", None): nl.LegOverride(altitude_ft=4500)})
+        assert any("event on the leg" in w for w in log.warnings)
+
+    def test_a_temperature_on_the_leg_is_read_back_on_its_rows(self):
+        log = segment_log(segment_overrides={("a>b", "cruise"): nl.LegOverride(oat_c=30)})
+        cruise = next(leg for leg in flown(log) if leg.phase == "cruise")
+        assert cruise.oat_c == 30
+
+
+class TestClimbIsWhatThePOHAllows:
+    """KPAO to VPBDX is 2.16 nm. The POH's time-to-climb table puts 1000 ft at
+    1 min and 2000 ft at 3 min, so by VPBDX the aeroplane is part way between.
+    The planner once drew a climb to 3,200 ft there -- a climb and a descent
+    squeezed into the leg by shrinking their distances -- about 2,500 fpm. And
+    once, after that, stopped the climb dead at 1000 ft at VPBDX, because the
+    book's rounding was applied where the climb only passes a waypoint."""
+
+    KPAO = nl.Waypoint("KPAO", LatLon(37.46112138, -122.11504666), "airport", elevation_ft=6.7)
+    VPBDX = nl.Waypoint("VPBDX", LatLon(37.49162222, -122.13918055), "vfr_waypoint")
+    VPKGO = nl.Waypoint(
+        "VPKGO", LatLon(37.52626944, -122.10165555), "vfr_waypoint", altitude_ft=2500
+    )
+    KSQL_ = nl.Waypoint("KSQL", LatLon(37.5119, -122.2495), "airport", elevation_ft=5)
+
+    def log(self):
+        return nl.build_navlog(
+            [self.KPAO, self.VPBDX, self.VPKGO, self.KSQL_], 5500,
+            conditions=CALM, planning_mode="hybrid",
+        )
+
+    def test_vpbdx_is_crossed_below_what_the_book_needs_4_nm_for(self):
+        arriving = next(leg for leg in self.log().legs if leg.to_name == "VPBDX")
+        assert arriving.phase == "climb"
+        assert 1000 < arriving.exit_altitude_ft < 2000
+
+    def test_the_climb_carries_on_through_vpbdx(self):
+        """No level stretch before VPKGO: nothing restricts the altitude there."""
+        flown = [leg for leg in self.log().legs if leg.covers_ground]
+        to_vpkgo = flown[: next(i for i, leg in enumerate(flown) if leg.to_name == "VPKGO") + 1]
+        assert all(leg.phase == "climb" for leg in to_vpkgo)
+
+    def test_the_climb_takes_the_books_time(self):
+        """Mid-climb, the book's own time column, read between its rows."""
+        arriving = next(leg for leg in self.log().legs if leg.to_name == "VPBDX")
+        book = nl.perf.climb_from_to(
+            arriving.entry_altitude_ft, arriving.exit_altitude_ft, round_to=False
+        )
+        assert arriving.ete_min >= book.time_min * 0.99
+
+    def test_2500_at_vpkgo_is_made(self):
+        assert not any("cannot climb" in w for w in self.log().warnings)
+
+
+class TestCrossingAltitudesDoNotCapTheNextLeg:
+    """"Cross VPKGO at 2500" is where the aeroplane is at VPKGO. It once also
+    capped the leg leaving VPKGO at 2500, so the climb to "cross VPMIN at 3500"
+    could never start -- and a 17 nm leg could not climb 2000 ft."""
+
+    KPAO = nl.Waypoint("KPAO", LatLon(37.46112138, -122.11504666), "airport", elevation_ft=6.7)
+    VPKGO = nl.Waypoint("VPKGO", LatLon(37.52626944, -122.10165555), "vfr_waypoint", altitude_ft=2500)
+    VPMIN = nl.Waypoint("VPMIN", LatLon(37.56960833, -121.87380277), "vfr_waypoint", altitude_ft=3500)
+    VPALT = nl.Waypoint("VPALT", LatLon(37.73916666, -121.59027777), "vfr_waypoint", altitude_ft=5500)
+    KSQL_ = nl.Waypoint("KSQL", LatLon(37.5119, -122.2495), "airport", elevation_ft=5)
+
+    def log(self, vpmin=None):
+        return nl.build_navlog(
+            [self.KPAO, self.VPKGO, vpmin or self.VPMIN, self.VPALT, self.KSQL_], 5500,
+            conditions=CALM, planning_mode="hybrid",
+        )
+
+    def test_each_crossing_altitude_is_made(self):
+        log = self.log()
+        # KPAO to VPKGO direct is too short for 2500 by the book, and says so;
+        # the legs after it are what this is about.
+        assert not any("by VPMIN" in w or "by VPALT" in w for w in log.warnings)
+        at = {leg.to_name: leg.exit_altitude_ft for leg in log.legs if leg.covers_ground}
+        assert at["VPMIN"] == pytest.approx(3500)
+        assert at["VPALT"] == pytest.approx(5500)
+
+    def test_a_start_event_holds_until_its_point(self):
+        mid = inverse(self.VPKGO.position, self.VPMIN.position).point_at_nm(5.5)
+        vpmin = replace(self.VPMIN, events=(nl.VerticalEvent("start", mid, 3500),))
+        legs = [leg for leg in self.log(vpmin).legs if leg.covers_ground]
+        boc = next(leg for leg in legs if leg.to_name == "BOC")
+        assert boc.phase == "cruise" and boc.exit_altitude_ft == pytest.approx(2500)
+        assert inverse(self.VPKGO.position, boc.to_position).distance_nm == pytest.approx(5.5, abs=0.05)
+
+    def test_a_start_event_at_the_current_altitude_holds_then_climbs_quietly(self):
+        """"Start the climb here" toward the leg's own altitude: VPMIN's 3500.
+        Nothing is wrong with that, so nothing is said."""
+        mid = inverse(self.VPKGO.position, self.VPMIN.position).point_at_nm(5.5)
+        vpmin = replace(self.VPMIN, events=(nl.VerticalEvent("start", mid, 2500),))
+        log = self.log(vpmin)
+        assert not any("already is" in w for w in log.warnings)
+        at = {leg.to_name: leg.exit_altitude_ft for leg in log.legs if leg.covers_ground}
+        assert at["VPMIN"] == pytest.approx(3500)
+        first = next(leg for leg in log.legs if leg.from_name == "VPKGO")
+        assert first.phase == "cruise"
+        assert inverse(self.VPKGO.position, first.to_position).distance_nm == pytest.approx(5.5, abs=0.05)
+
+
+    def test_a_start_event_that_leads_nowhere_is_said_out_loud(self):
+        """Holding 2500 to the point, with the leg going nowhere higher."""
+        mid = inverse(self.VPKGO.position, self.VPMIN.position).point_at_nm(5.5)
+        vpmin = replace(
+            self.VPMIN, altitude_ft=2500, events=(nl.VerticalEvent("start", mid, 2500),)
+        )
+        log = self.log(vpmin)
+        assert any("nothing after it changes altitude" in w for w in log.warnings)
+
+
+
+class TestArrivalAtPatternAltitude:
+    """A flight's descent ends at the field's traffic pattern altitude, not on
+    the runway: the pattern is its own row, flown there. The pilot can set the
+    arrival altitude on the field itself."""
+
+    KMOD = nl.Waypoint("KMOD", LatLon(37.6258, -120.9544), "airport", elevation_ft=99.2)
+
+    def log(self, destination, mode="hybrid"):
+        return nl.build_navlog([KSQL, destination], 5500, conditions=CALM, planning_mode=mode)
+
+    def arriving(self, log):
+        return [leg for leg in log.legs if leg.covers_ground][-1]
+
+    def test_the_descent_ends_at_pattern_altitude(self):
+        log = self.log(self.KMOD)
+        assert self.arriving(log).exit_altitude_ft == pytest.approx(1100)
+        pattern = next(leg for leg in log.legs if leg.phase == "pattern")
+        assert pattern.altitude_ft == pytest.approx(1100)
+
+    def test_a_crossing_altitude_on_the_field_sets_where_the_descent_ends(self):
+        log = self.log(replace(self.KMOD, altitude_ft=1500))
+        assert self.arriving(log).exit_altitude_ft == pytest.approx(1500)
+        # The pattern itself is still flown at the field's pattern altitude.
+        pattern = next(leg for leg in log.legs if leg.phase == "pattern")
+        assert pattern.altitude_ft == pytest.approx(1100)
+
+    def test_the_field_crossing_is_not_flown_as_the_last_legs_cruise(self):
+        """It ends the descent; the leg before it still cruises at 5500."""
+        log = self.log(replace(self.KMOD, altitude_ft=1500))
+        assert any(leg.phase == "cruise" and leg.altitude_ft == pytest.approx(5500) for leg in log.legs)
+
+    def test_a_published_pattern_height_is_used(self):
+        log = self.log(replace(self.KMOD, pattern_altitude_agl_ft=800))
+        assert self.arriving(log).exit_altitude_ft == pytest.approx(900)
+
+    def test_user_driven_descents_end_at_pattern_altitude_too(self):
+        route = [KSQL, replace(VPWDM, segment_type="climb", altitude_ft=4500),
+                 replace(self.KMOD, segment_type="descent")]
+        log = nl.build_navlog(route, 5500, conditions=CALM)
+        assert self.arriving(log).exit_altitude_ft >= 1100 - 1
+

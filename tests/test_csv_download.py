@@ -1,8 +1,9 @@
-"""Paper-nav-log CSV export tests.
+"""Navlog CSV export tests.
 
-The format's job is to line up with a printed pad, so what is tested is the
-column order, the two inverted sign conventions, and which cells are left for
-the pilot to fill in the aircraft.
+The format's job is to match the navlog on screen, row for row and column for
+column, with Leg Start / Leg End in place of the positions. What is tested is
+the column order, the conventions the screen uses, and which cells a row that
+goes nowhere leaves empty.
 """
 
 import csv
@@ -36,58 +37,70 @@ def flying(navlog, **kwargs):
     return [r for r in rows(navlog, **kwargs) if r["Phase"] == "cruise"]
 
 
+def body(navlog, **kwargs):
+    return [r for r in rows(navlog, **kwargs) if r["Leg Start"] != "Total"]
+
+
 class TestShape:
-    def test_the_header_is_the_pads_column_order(self):
+    def test_the_header_is_the_screens_column_order(self):
         text = cd.navlog_csv(log())
         assert text.splitlines()[0] == ",".join(cd.COLUMNS)
+        assert cd.COLUMNS[:4] == ("Leg Start", "Leg End", "Phase", "End Alt")
+        assert "Lat" not in cd.COLUMNS and "Lon" not in cd.COLUMNS
 
-    def test_one_row_per_leg_plus_a_totals_row(self):
+    def test_one_row_per_navlog_row_plus_a_totals_row(self):
         navlog = log()
         assert len(rows(navlog)) == len(navlog.legs) + 1
 
     def test_the_totals_row_carries_the_totals(self):
         navlog = log()
         totals = rows(navlog)[-1]
-        assert totals["Check Point"] == "Totals"
-        assert float(totals["Dist Leg"]) == pytest.approx(
-            navlog.total_distance_nm, abs=0.05
-        )
+        assert totals["Leg Start"] == "Total"
+        assert float(totals["Dist"]) == pytest.approx(navlog.total_distance_nm, abs=0.05)
         assert float(totals["ETE"]) == pytest.approx(navlog.total_time_min, abs=0.05)
         assert float(totals["Fuel"]) == pytest.approx(navlog.total_fuel_gal, abs=0.05)
+        assert float(totals["Rem"]) == pytest.approx(navlog.fuel_remaining_gal, abs=0.05)
 
-    def test_a_row_is_named_for_where_its_leg_ends(self):
-        """The pad's rows are checkpoints; the leg arriving there is written on it."""
+    def test_a_row_runs_from_its_leg_start_to_its_leg_end(self):
         climb = next(r for r in rows(log()) if r["Phase"] == "climb")
-        assert climb["Check Point"] == "TOC"
+        assert (climb["Leg Start"], climb["Leg End"]) == ("KSQL", "TOC")
+        cruise = next(r for r in rows(log()) if r["Phase"] == "cruise")
+        assert (cruise["Leg Start"], cruise["Leg End"]) == ("TOC", "TOD")
 
-    def test_the_last_row_is_the_destination(self):
-        body = [r for r in rows(log()) if r["Check Point"] != "Totals"]
-        assert body[-1]["Check Point"] == "KSBP"
+    def test_the_last_flown_row_ends_at_the_destination(self):
+        flown = [r for r in body(log()) if r["Leg End"]]
+        assert flown[-1]["Leg End"] == "KSBP"
+
+    def test_end_alt_is_where_the_row_ends(self):
+        navlog = log()
+        for leg, row in zip(navlog.legs, rows(navlog), strict=False):
+            if leg.covers_ground:
+                assert float(row["End Alt"]) == pytest.approx(leg.exit_altitude_ft, abs=0.5)
+
+    def test_it_matches_the_screens_numbers(self):
+        """CAS, TAS, GS, the air: the same figures the table shows."""
+        navlog = log()
+        for leg, row in zip(navlog.legs, rows(navlog), strict=False):
+            if not leg.covers_ground:
+                continue
+            assert float(row["TAS"]) == pytest.approx(leg.tas_kt, abs=0.5)
+            assert float(row["GS"]) == pytest.approx(leg.ground_speed_kt, abs=0.5)
+            assert float(row["DA"]) == pytest.approx(leg.density_altitude_ft, abs=0.5)
+            assert float(row["Dist"]) == pytest.approx(leg.distance_nm, abs=0.05)
 
 
 class TestConventions:
     def test_variation_is_east_positive_as_everywhere_else(self):
-        """One number means one thing: `+12.8` is 12.8 east, subtracted from TC.
-
-        A printed pad heads its column `-E / +W` and wants the opposite sign.
-        This is the one column the export deliberately does not follow the pad
-        on, rather than have the file disagree with the screen.
-        """
+        """One number means one thing: `+12.8` is 12.8 east, subtracted from TC."""
         navlog = log()
         leg = next(leg for leg in navlog.legs if leg.phase == "cruise")
         row = flying(navlog)[0]
         assert float(row["Var"]) == pytest.approx(leg.variation_deg, abs=0.05)
-        # California is easterly variation, so the column reads positive.
         assert leg.variation_deg > 0
         assert row["Var"].startswith("+")
-        # And it is the number that turns this row's true course into its
-        # magnetic heading, east being least.
-        assert float(row["TH"]) - float(row["Var"]) == pytest.approx(
-            float(row["MH"]), abs=1.0
-        )
+        assert float(row["TH"]) - float(row["Var"]) == pytest.approx(float(row["MH"]), abs=1.0)
 
     def test_the_wind_correction_column_keeps_our_sign(self):
-        """Both are `-L / +R`, so this one passes through."""
         navlog = log()
         leg = next(leg for leg in navlog.legs if leg.phase == "cruise")
         assert float(flying(navlog)[0]["WCA"]) == pytest.approx(
@@ -102,6 +115,7 @@ class TestConventions:
         for row in flying(log()):
             assert len(row["TC"]) == 3
             assert len(row["MH"]) == 3
+            assert len(row["Wind Dir"]) == 3
 
     def test_corrections_always_show_their_sign(self):
         for row in flying(log()):
@@ -109,69 +123,51 @@ class TestConventions:
             assert row["Var"][0] in "+-"
 
     def test_cas_is_below_tas_at_altitude(self):
-        """The one derived airspeed: what the ASI reads for this row's TAS."""
         row = flying(log())[0]
         assert float(row["CAS"]) < float(row["TAS"])
 
 
-class TestWhatIsLeftBlank:
-    def test_the_columns_nothing_can_fill_are_empty(self):
-        for row in rows(log()):
-            for column in cd.BLANK_COLUMNS:
-                assert row[column] == "", column
-
-    def test_a_row_that_goes_nowhere_carries_only_its_fuel_and_time(self):
-        """Taxi and the pattern: no course, no heading, nothing to fly."""
+class TestRowsThatGoNowhere:
+    def test_taxi_and_pattern_carry_time_fuel_and_air_only(self):
         for row in rows(log()):
             if row["Phase"] not in ("taxi", "pattern"):
                 continue
-            assert row["TC"] == "" and row["MH"] == "" and row["GS Est"] == ""
+            for column in cd.NAVIGATION_COLUMNS:
+                assert row[column] == "", column
+            assert row["Leg End"] == ""
             assert float(row["Fuel"]) > 0
-            assert row["Altitude"] != ""
+            assert row["End Alt"] != "" and row["DA"] != ""
 
 
-class TestTimeOff:
-    def test_no_departure_time_leaves_the_eta_blank(self):
-        assert all(row["ETA"] == "" for row in rows(log()))
+class TestTimeRemaining:
+    """Minutes left after each row, to the end of the flight: it counts down
+    the way the fuel Rem column does, and needs no departure time."""
 
-    def test_a_departure_time_fills_the_eta_column(self):
+    def test_it_counts_down_to_zero(self):
+        lines = body(log())
+        remaining = [float(r["Time Rem"]) for r in lines]
+        assert remaining == sorted(remaining, reverse=True)
+        assert remaining[-1] == pytest.approx(0.0, abs=0.05)
+
+    def test_it_starts_at_the_whole_flight(self):
         navlog = log()
-        body = [r for r in rows(navlog, time_off="13:45") if r["Check Point"] != "Totals"]
-        assert body[0]["ETA"] == "13:45"  # the taxi row, before anything is flown
-        assert body[-1]["ETA"] != ""
+        # After the taxi row, which takes no time on the log, all of it is left.
+        assert float(body(navlog)[0]["Time Rem"]) == pytest.approx(navlog.total_time_min, abs=0.05)
 
-    def test_the_eta_is_the_departure_plus_the_time_so_far(self):
+    def test_it_is_the_total_less_the_time_so_far(self):
         navlog = log()
-        body = [r for r in rows(navlog, time_off="13:45") if r["Check Point"] != "Totals"]
-        last = navlog.legs[-1]
-        expected = (13 * 60 + 45 + int(last.cumulative_ete_min)) % (24 * 60)
-        hh, mm = (int(p) for p in body[-1]["ETA"].split(":"))
-        assert abs((hh * 60 + mm) - expected) <= 1
+        for leg, row in zip(navlog.legs, body(navlog), strict=True):
+            assert float(row["Time Rem"]) == pytest.approx(
+                navlog.total_time_min - leg.cumulative_ete_min, abs=0.05
+            )
 
-    def test_the_eta_column_agrees_with_the_ete_column(self):
-        """A pilot adding the ETE column down the page must land on the ETA.
-
-        Minutes are rounded, not truncated: a 12.99-minute leg prints 13.0, and
-        an ETA a minute early would be a plan that disagrees with itself.
-        """
+    def test_the_pattern_is_what_is_left_on_arrival(self):
         navlog = log()
-        body = [r for r in rows(navlog, time_off="13:45") if r["Check Point"] != "Totals"]
-        running = 0.0
-        for row in body:
-            running += float(row["ETE"])
-            hh, mm = (int(p) for p in row["ETA"].split(":"))
-            assert (hh * 60 + mm) == round(13 * 60 + 45 + running), row["Check Point"]
+        arriving = [r for r in body(navlog) if r["Leg End"]][-1]
+        assert float(arriving["Time Rem"]) == pytest.approx(navlog.legs[-1].ete_min, abs=0.05)
 
-    def test_it_wraps_past_midnight(self):
-        assert cd._clock(cd._parse_time_off("23:30"), 60.0) == "00:30"
-
-    def test_a_bare_four_digit_time_is_accepted(self):
-        """Because that is how a pilot writes one."""
-        assert cd._parse_time_off("1345") == cd._parse_time_off("13:45")
-
-    def test_a_time_that_is_not_a_time_is_refused(self):
-        with pytest.raises(ValueError, match="24-hour time"):
-            cd._parse_time_off("quarter to two")
+    def test_the_totals_row_has_none(self):
+        assert rows(log())[-1]["Time Rem"] == ""
 
 
 class TestFilename:
@@ -187,9 +183,7 @@ class TestQuoting:
         odd = nl.Waypoint(
             "HALF MOON, CA", LatLon(37.5133, -122.5011), "airport", elevation_ft=66
         )
-        navlog = nl.build_navlog(
-            [KSQL, odd], 4500, conditions=CALM, planning_mode="auto"
-        )
+        navlog = nl.build_navlog([KSQL, odd], 4500, conditions=CALM, planning_mode="auto")
         assert any(
-            row["Check Point"] == "HALF MOON, CA" for row in rows(navlog)
+            row["Leg End"] == "HALF MOON, CA" for row in rows(navlog)
         ), cd.navlog_csv(navlog)
