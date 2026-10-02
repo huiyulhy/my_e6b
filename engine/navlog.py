@@ -27,6 +27,7 @@ climb distance column. Time and fuel stay the published figures.
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
 from datetime import UTC
@@ -63,9 +64,14 @@ from engine.profile import (
     ProfileSegment,
     RouteError,
     SegmentType,
+    VerticalEvent,
     Waypoint,
+    arrival_altitude,
     build_segments,
+    normalise_planning_mode,
+    pattern_altitude,
     resolve_route,
+    segment_key,
     strip_generated,
 )
 
@@ -76,6 +82,8 @@ __all__ = [
     "Conditions",
     "Leg",
     "LegOverride",
+    "SegmentOverrides",
+    "VerticalEvent",
     "Navlog",
     "PhaseNamer",
     "ProfileSegment",
@@ -430,6 +438,75 @@ class LegOverride:
         )
 
 
+# A pilot's edit filed under the leg they drew rather than a navlog row:
+# `(segment_key, phase)`, where a phase of `None` holds for the whole leg and a
+# named phase for just that part of it. See `profile.segment_key`.
+SegmentOverrides = dict[tuple[str, str | None], LegOverride]
+
+
+def _merged(under: LegOverride | None, over: LegOverride | None) -> LegOverride | None:
+    """`over` on top of `under`, field by field: a typed field wins."""
+    if under is None or over is None:
+        return over if under is None else under
+    return LegOverride(
+        **{
+            name: getattr(over, name)
+            if getattr(over, name) is not None
+            else getattr(under, name)
+            for name in LegOverride.__dataclass_fields__
+        }
+    )
+
+
+@dataclass(frozen=True)
+class _SegmentEdits:
+    """The pilot's edits on the legs they drew, looked up by leg and phase.
+
+    This is what keeps an edit alive while the wind moves the rows about. A row
+    is found its leg by the ids at its ends -- a generated point records the
+    leg it was inserted into -- so nothing here depends on where in the table
+    the row happens to fall this time.
+    """
+
+    by_key: SegmentOverrides
+
+    def __bool__(self) -> bool:
+        return bool(self.by_key)
+
+    def on(self, key: str | None, phase: str | None) -> LegOverride | None:
+        """The edit for one phase of one leg: the phase's own over the leg's."""
+        if key is None or not self.by_key:
+            return None
+        return _merged(self.by_key.get((key, None)), self.by_key.get((key, phase)))
+
+    def wind_on(self, key: str | None, phase: str, base: object) -> TypedWind | None:
+        edit = self.on(key, phase)
+        if edit is None or (edit.wind_from_deg is None and edit.wind_speed_kt is None):
+            return None
+        return TypedWind(base, edit.wind_from_deg, edit.wind_speed_kt)
+
+    @property
+    def any_temperature(self) -> bool:
+        return any(o.oat_c is not None for o in self.by_key.values())
+
+    @property
+    def any_altitude(self) -> bool:
+        return any(o.altitude_ft is not None for o in self.by_key.values())
+
+
+def row_segment_key(start: Waypoint, end: Waypoint) -> str | None:
+    """The drawn leg a resolved leg lies on, from its two ends.
+
+    A generated point knows the leg it was inserted into; two of the pilot's
+    own points are the leg.
+    """
+    if end.generated:
+        return end.segment_key
+    if start.generated:
+        return start.segment_key
+    return segment_key(start, end)
+
+
 # --- outputs -------------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -504,6 +581,11 @@ class Leg:
     # used as a top of climb still prints the name on the sectional.
     start_role: str | None = None
     end_role: str | None = None
+
+    # The leg the pilot drew this row on, as `profile.segment_key` names it.
+    # What an edit typed on the row is filed under. None where the route's
+    # points carry no ids, and on the ground rows.
+    segment_key: str | None = None
 
     # Chart cells this row was costed from that are not where the query asked
     # -- a cruise reading taken at an equal density on a hot day, a level
@@ -600,6 +682,7 @@ def build_navlog(
     overrides: dict[int, LegOverride] | None = None,
     margins: preflight.Margins | None = None,
     planning_mode: str = "manual",
+    segment_overrides: SegmentOverrides | None = None,
 ) -> Navlog:
     """Compute a full navigation log for a route.
 
@@ -613,25 +696,32 @@ def build_navlog(
       and the altitudes follow from performance. `cruise_altitude_ft` is then
       only a sanity bound, not a target. This is the mode a pilot plans in:
       the profile is the one they chose, not one inferred from an altitude.
-    * `"auto"` -- the pilot names a `cruise_altitude_ft` and the planner works
-      out where the climb tops out and the descent begins, inserting TOC and
-      TOD into the route.
+    * `"hybrid"` (formerly, and still accepted as, `"auto"`) -- the pilot names
+      a `cruise_altitude_ft` and the planner works out where the climb tops
+      out and the descent begins, inserting TOC and TOD into the route. Events
+      on a leg pin a climb or descent to a place and the planner fills in the
+      other end (BOC/TOC/BOD/TOD).
 
     Either way the route is *resolved* into one segment per leg before any row
     is built, so `overrides` -- which map a row index to manual values -- line
     up 1:1 with legs.
+
+    `segment_overrides` are the same values filed under the leg the pilot drew
+    (and optionally one phase of it) instead of under a row. They reach every
+    row cut from that leg however many there are this time, and a wind among
+    them moves the tops of climb before the rows exist. A row's own override
+    beats its leg's.
     """
     aircraft = aircraft or Aircraft()
     conditions = conditions or Conditions()
     margins = margins or preflight.Margins()
     overrides = {i: o for i, o in (overrides or {}).items() if not o.is_empty}
+    edits = _SegmentEdits(
+        {k: o for k, o in (segment_overrides or {}).items() if not o.is_empty}
+    )
     warnings: list[str] = []
 
-    if planning_mode not in PLANNING_MODES:
-        raise RouteError(
-            f"unknown planning mode {planning_mode!r}; "
-            f"expected one of {', '.join(PLANNING_MODES)}"
-        )
+    planning_mode = normalise_planning_mode(planning_mode)
     if len(waypoints) < 2:
         raise RouteError("a route needs at least a departure and a destination")
 
@@ -729,6 +819,7 @@ def build_navlog(
             cruise_point=cruise_point,
             names=names,
             overrides=overrides,
+            edits=edits,
             row_offset=len(legs),
             decimal_year=decimal_year,
             travelled=travelled,
@@ -745,16 +836,16 @@ def build_navlog(
         # Every arrival flies a pattern, including the ones at intermediate
         # stops, so the reserve check below sees the fuel it costs.
         if aircraft.pattern_time_min > 0:
-            pattern_altitude = (
-                flight[-1].elevation_ft or 0.0
-            ) + aircraft.pattern_height_agl_ft
+            # Flown at the field's pattern altitude, which is where the
+            # descent into it ends unless the pilot set another.
+            circuit_ft = pattern_altitude(flight[-1], aircraft.pattern_height_agl_ft)
             # Charged where the pattern is actually flown, not at the altitude
             # the flight cruised at. A circuit at 1,100 ft costs what a circuit
             # at 1,100 ft costs, whether the trip there was at 3,500 or 9,500 --
             # and it costs *more*, because the engine makes more power low down.
             pattern_fuel = _fuel_written_on_the_log(
                 _cruise_point_at(
-                    pattern_altitude,
+                    circuit_ft,
                     aircraft=aircraft,
                     conditions=conditions,
                     default=cruise_point,
@@ -768,7 +859,7 @@ def build_navlog(
                 _ground_leg(
                     phase="pattern",
                     waypoint=flight[-1],
-                    altitude_ft=pattern_altitude,
+                    altitude_ft=circuit_ft,
                     ete_min=aircraft.pattern_time_min,
                     fuel_gal=pattern_fuel,
                     aircraft=aircraft,
@@ -801,6 +892,7 @@ def build_navlog(
     return _finish_navlog(
         legs=legs,
         overrides=overrides,
+        edited_segments=bool(edits),
         aircraft=aircraft,
         conditions=conditions,
         cruise_point=cruise_point,
@@ -1067,7 +1159,7 @@ def _require_flyable_altitudes(
             f"{departure.name} and {destination.name} need elevation_ft to "
             f"compute climb and descent"
         )
-    if planning_mode == "auto" and cruise_altitude_ft <= max(
+    if planning_mode == "hybrid" and cruise_altitude_ft <= max(
         departure_elevation, destination_elevation
     ):
         raise RouteError(
@@ -1090,6 +1182,7 @@ def _build_flight(
     overrides: dict[int, LegOverride],
     row_offset: int,
     decimal_year: float,
+    edits: _SegmentEdits | None = None,
     travelled: float,
     cumulative_time: float,
     cumulative_fuel: float,
@@ -1109,6 +1202,14 @@ def _build_flight(
     departure_elevation, destination_elevation = _require_flyable_altitudes(
         waypoints, cruise_altitude_ft, planning_mode
     )
+    # Where the descent ends: the pattern at the field it lands at.
+    arrival_ft = arrival_altitude(destination, aircraft.pattern_height_agl_ft)
+    edits = edits or _SegmentEdits({})
+    if edits.any_altitude and planning_mode == "hybrid":
+        warnings.append(
+            "an altitude typed on a leg is not used in hybrid planning; put an "
+            "event on the leg, or a crossing altitude on a waypoint, instead"
+        )
 
     if sum(_leg_distances(waypoints)) <= 0:
         raise RouteError(
@@ -1136,7 +1237,7 @@ def _build_flight(
             mode=planning_mode,
             cruise_altitude_ft=cruise_altitude_ft,
             departure_elevation=departure_elevation,
-            destination_elevation=destination_elevation,
+            destination_elevation=arrival_ft,
             aircraft=aircraft,
             conditions=conditions,
             names=names,
@@ -1149,10 +1250,16 @@ def _build_flight(
             aircraft=aircraft,
             conditions=conditions,
             cruise_point=cruise_point,
-            altitude_overrides=_altitude_overrides_by_leg(route, overrides, row_offset),
-            leg_winds=_leg_winds_by_leg(
-                route, row_winds, row_offset, conditions, columns
+            altitude_overrides=_altitude_overrides_by_leg(
+                route,
+                overrides,
+                row_offset,
+                edits if planning_mode == "manual" else None,
             ),
+            leg_winds=_leg_winds_by_leg(
+                route, row_winds, row_offset, conditions, columns, edits
+            ),
+            arrival_altitude_ft=arrival_ft,
         )
 
     # --- the airmass this flight is planned in ---------------------------
@@ -1189,14 +1296,28 @@ def _build_flight(
     # where it was forecast, so it can be handed to the planner before
     # anything has been laid out.
     columns = _RouteColumns.build(waypoints, conditions.wind_field)
-    drawn_leg_winds: dict[int, dict[str, object]] | None = (
-        _forecast_winds_by_drawn_leg(columns) or None
+    # A wind typed on a drawn leg needs no rehearsal either: it is already
+    # filed under the leg the planner walks.
+    forecast_and_typed = _with_segment_winds(
+        _forecast_winds_by_drawn_leg(columns), waypoints, edits, conditions, columns
     )
+    drawn_leg_winds: dict[int, dict[str, object]] | None = forecast_and_typed or None
     draft_segments: list[ProfileSegment] | None = None
-    if row_temperatures or (row_winds and planning_mode == "auto"):
+    if (
+        row_temperatures
+        or edits.any_temperature
+        or (row_winds and planning_mode == "hybrid")
+    ):
         # A throwaway namer and warning list: this pass is scaffolding, and its
         # TOC numbering and warnings would otherwise be emitted twice.
-        _, draft_segments = lay_out(conditions, PhaseNamer(), [])
+        _, draft_segments = lay_out(conditions, PhaseNamer(), [], drawn_leg_winds)
+        # A temperature typed on a leg is hung at the altitude of each row
+        # the draft cut from it, as if it had been typed on each; a row's own
+        # temperature wins.
+        row_temperatures = (
+            _segment_temperatures_by_row(draft_segments, edits, row_offset)
+            | row_temperatures
+        )
         if row_temperatures:
             conditions = _with_temperatures(
                 conditions,
@@ -1205,15 +1326,36 @@ def _build_flight(
                     draft_segments, row_temperatures, row_offset, conditions
                 ),
             )
-        if row_winds and planning_mode == "auto":
+        if row_winds and planning_mode == "hybrid":
             drawn_leg_winds = _leg_winds_by_drawn_leg(
-                waypoints, draft_segments, row_winds, row_offset, conditions, columns
+                waypoints,
+                draft_segments,
+                row_winds,
+                row_offset,
+                conditions,
+                columns,
+                base=forecast_and_typed,
             )
 
     if conditions.temperatures is not None:
         warnings.extend(conditions.temperatures.lapse_warnings())
 
     route, segments = lay_out(conditions, names, warnings, drawn_leg_winds)
+
+    # A cruise altitude the flight never gets to. Said once for the flight
+    # rather than per leg: on a short hop it is the whole story, and the legs
+    # themselves are flown as high as the aeroplane can honestly get.
+    if planning_mode == "hybrid" and segments and not any(
+        w.altitude_ft is not None or w.events for w in waypoints[1:]
+    ):
+        highest = max(s.exit_altitude_ft for s in segments)
+        if highest < cruise_altitude_ft - 100.0:
+            warnings.append(
+                f"{departure.name} to {destination.name} never reaches the "
+                f"{cruise_altitude_ft:,.0f} ft cruise altitude: it is too short "
+                f"to climb there and descend again. The highest it gets is "
+                f"{highest:,.0f} ft; choose a lower cruise altitude."
+            )
 
     if draft_segments is not None and _row_count(draft_segments) != _row_count(segments):
         # A leg crossed the tenth-of-a-mile threshold as the tops of climb
@@ -1250,7 +1392,8 @@ def _build_flight(
         # The index this row takes in the finished navlog: rows already
         # emitted by earlier flights, plus rows emitted by this one. Zero
         # length legs are skipped above, so it matches what the caller sees.
-        override = overrides.get(row_offset + len(legs))
+        leg_key = row_segment_key(start, end)
+        override = _merged(edits.on(leg_key, phase), overrides.get(row_offset + len(legs)))
         leg_name = f"{start.name} to {end.name}"
 
         # The air this row was flown through, settled before anything is read
@@ -1382,6 +1525,7 @@ def _build_flight(
                 density_altitude_ft=density_altitude(leg_pressure_alt, leg_oat),
                 start_role=segment.start_role,
                 end_role=segment.end_role,
+                segment_key=leg_key,
                 # Deduped: a row that reads the chart twice -- once for its own
                 # cruise, once for a level remainder -- hits the same
                 # substitution twice and it is one fact about the row.
@@ -1594,7 +1738,10 @@ def _reserve_gph(legs: list[Leg], default_gph: float) -> float:
 
 
 def _altitude_overrides_by_leg(
-    route: list[Waypoint], overrides: dict[int, LegOverride], row_offset: int
+    route: list[Waypoint],
+    overrides: dict[int, LegOverride],
+    row_offset: int,
+    edits: _SegmentEdits | None = None,
 ) -> dict[int, float]:
     """Re-key altitude overrides from navlog row to leg index.
 
@@ -1607,7 +1754,10 @@ def _altitude_overrides_by_leg(
     for index, (start, end) in enumerate(pairwise(route)):
         if inverse(start.position, end.position).distance_nm < _MIN_ROW_NM:
             continue
-        override = overrides.get(row)
+        override = _merged(
+            None if edits is None else edits.on(segment_key(start, end), end.segment_type),
+            overrides.get(row),
+        )
         if override is not None and override.altitude_ft is not None:
             by_leg[index] = override.altitude_ft
         row += 1
@@ -1740,6 +1890,7 @@ def _leg_winds_by_leg(
     row_offset: int,
     conditions: Conditions,
     columns: _RouteColumns | None,
+    edits: _SegmentEdits | None = None,
 ) -> dict[int, dict[str, object]]:
     """The wind each leg of a resolved route is flown in.
 
@@ -1762,6 +1913,15 @@ def _leg_winds_by_leg(
         entry: dict[str, object] = (
             columns.all_phases(column) if column is not None else {}
         )
+        on_leg = (
+            None
+            if edits is None
+            else edits.wind_on(
+                row_segment_key(start, end), end.segment_type, column or conditions.winds
+            )
+        )
+        if on_leg is not None:
+            entry[end.segment_type] = on_leg
         typed = row_winds.get(row)
         if typed is not None:
             entry[end.segment_type] = TypedWind(column or conditions.winds, *typed)
@@ -1795,6 +1955,7 @@ def _leg_winds_by_drawn_leg(
     row_offset: int,
     conditions: Conditions,
     columns: _RouteColumns | None,
+    base: dict[int, dict[str, object]] | None = None,
 ) -> dict[int, dict[str, object]]:
     """Re-key row winds onto the legs the *pilot* drew, for the planner.
 
@@ -1813,7 +1974,12 @@ def _leg_winds_by_drawn_leg(
     drawn = list(pairwise(strip_generated(waypoints)))
     spans = [inverse(start.position, end.position) for start, end in drawn]
 
-    by_leg = _forecast_winds_by_drawn_leg(columns)
+    by_leg = {
+        index: dict(entry)
+        for index, entry in (
+            base if base is not None else _forecast_winds_by_drawn_leg(columns)
+        ).items()
+    }
     row = row_offset
     for segment in draft_segments:
         geo = inverse(segment.start.position, segment.end.position)
@@ -1835,10 +2001,54 @@ def _leg_winds_by_drawn_leg(
     return by_leg
 
 
+def _with_segment_winds(
+    by_leg: dict[int, dict[str, object]],
+    waypoints: list[Waypoint],
+    edits: _SegmentEdits,
+    conditions: Conditions,
+    columns: _RouteColumns | None,
+) -> dict[int, dict[str, object]]:
+    """The forecast over each drawn leg, with the pilot's typed winds on top.
+
+    A wind typed on a leg beats the forecast for the phases it covers -- the
+    whole leg, or one phase of it -- and a half-typed one reads its other half
+    off that leg's own column.
+    """
+    if not edits:
+        return by_leg
+    merged = {index: dict(entry) for index, entry in by_leg.items()}
+    for index, (start, end) in enumerate(pairwise(strip_generated(waypoints))):
+        column = None if columns is None else columns.by_leg.get(index)
+        for phase in CONCRETE_SEGMENT_TYPES:
+            typed = edits.wind_on(
+                segment_key(start, end), phase, column or conditions.winds
+            )
+            if typed is not None:
+                merged.setdefault(index, {})[phase] = typed
+    return merged
+
+
+def _segment_temperatures_by_row(
+    draft_segments: list[ProfileSegment], edits: _SegmentEdits, row_offset: int
+) -> dict[int, float]:
+    """A temperature typed on a leg, as if typed on each row cut from it."""
+    by_row: dict[int, float] = {}
+    row = row_offset
+    for segment in draft_segments:
+        if inverse(segment.start.position, segment.end.position).distance_nm < _MIN_ROW_NM:
+            continue
+        edit = edits.on(row_segment_key(segment.start, segment.end), segment.phase)
+        if edit is not None and edit.oat_c is not None:
+            by_row[row] = edit.oat_c
+        row += 1
+    return by_row
+
+
 def _finish_navlog(
     *,
     legs: list[Leg],
     overrides: dict[int, LegOverride],
+    edited_segments: bool = False,
     aircraft: Aircraft,
     conditions: Conditions,
     cruise_point: perf.CruisePoint,
@@ -1853,7 +2063,7 @@ def _finish_navlog(
 ) -> Navlog:
     """Totals, the reserve check, and the notes about manual edits."""
     # --- manual overrides -------------------------------------------------
-    if overrides:
+    if overrides or edited_segments:
         edited = sum(1 for leg in legs if leg.overridden)
         if edited:
             warnings.append(
@@ -2293,14 +2503,20 @@ def _worst_level_gph(
         return default
 
 
+# What the planner calls the points it inserts; see `profile.PhaseNamer`.
+_PLANNER_NAME = re.compile(r"[TB]O[CD]\d*")
+
+
 def leg_label(name: str, role: str | None) -> str:
     """A waypoint name with its top-of-climb/descent role, if it has one.
 
     `TOC` on its own where the planner invented the point, `KWVI (TOC)` where
     the pilot nominated a charted one -- the name on the sectional is what they
-    will look for, so it is never replaced.
+    will look for, so it is never replaced. A planner point that is numbered
+    (`TOC2`) or is the other end of a pinned change (`BOC`) already says what
+    it is, and is not labelled twice.
     """
-    if role is None or name == role:
+    if role is None or name == role or _PLANNER_NAME.fullmatch(name):
         return name
     return f"{name} ({role})"
 

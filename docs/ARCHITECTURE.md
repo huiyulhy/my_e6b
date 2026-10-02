@@ -295,19 +295,37 @@ courses. Refresh from NOAA when it lapses.
 
 ## 4b. `engine/navlog.py` — [built]
 
-Where the other four modules meet. It owns no physics; it sequences theirs. Five modelling
+Where the other four modules meet. It owns no physics; it sequences theirs. The modelling
 decisions, all visible in the output:
 
 - **User-driven planning is the default.** The pilot declares what each leg does and the
   altitudes follow from performance; an undeclared leg is refused rather than guessed at, and
-  the cruise altitude is a bound rather than a target. `planning_mode="auto"` asks for the
-  other behaviour, where the planner picks the profile from a stated cruise altitude.
+  the cruise altitude is a bound rather than a target. `planning_mode="hybrid"` (the old
+  `"auto"` is still accepted) asks for the other behaviour, where the planner picks the profile
+  from a stated cruise altitude.
+- **Hybrid legs can pin one end of an altitude change to a place.** A drawn leg carries
+  `VerticalEvent`s on the waypoint it arrives at: `start` ("hold altitude until here, then
+  climb/descend to X") pins BOC or TOD and lets the other end float with the wind; `complete`
+  ("be at X by here") pins TOC or BOD and lets the beginning float upstream. Several on one leg
+  give step climbs. `profile._expand_leg` walks the leg's events in order and then lays out what
+  is left as the automatic planner always has, so a leg with no events is the old automatic leg
+  exactly. On the departure leg, a `complete` climbs straight away (there is no altitude to hold
+  on the runway). An event that cannot be met is flown as well as possible and warned about,
+  with the shortfall in nm. Events are stored as *places* (lat/lon) and projected onto the leg on
+  every solve, so an anchor on an airspace shelf stays there if a fix moves.
+- **Edits are filed under the leg the pilot drew, not a row.** `segment_overrides` are keyed
+  `(segment_key, phase)`, where `segment_key` is `"<from id>><to id>"` from the waypoints'
+  stable ids and a phase of `None` covers the whole leg. Every row finds its leg from its ends
+  (a generated point records the leg it was inserted into), so an edit reaches however many rows
+  the wind cuts the leg into this time. That removed the row-index pruning the UI used to do, and
+  the draft lay-out a typed wind used to need. The row-indexed `overrides` remain as an engine
+  API; a row's own value beats its leg's.
 - **A wind typed on a row is planned with, not just flown with.** It reaches the profile
   before the tops of climb and descent are placed, so a headwind on the climb row moves the
   TOC back down the route. It belongs to the leg, not to an altitude: it holds all the way up
   the climb, where a typed *temperature* is hung at one altitude and interpolated between.
-  Automatic mode needs one rehearsal lay-out to learn which drawn leg a row sits inside, the
-  same way row temperatures do.
+  A wind typed on a leg is handed to the planner directly; only a row-indexed one still
+  needs a rehearsal lay-out to find its drawn leg, the same way temperatures do.
 - **TOC and TOD are spliced in as real waypoints.** No leg spans a phase change, so every row
   has one altitude, one TAS and one fuel flow. This is why the arithmetic stays simple and
   still correct.
@@ -337,6 +355,19 @@ no forecast on it behaves exactly as described above.
 Fuel accounting includes the POH taxi allowance and checks the FAR 91.151 reserve (30 min day,
 45 min night at cruise burn). Warnings are data on the `Navlog`, not printed side effects, so
 the UI can surface them however it likes.
+
+### Missions — `engine/mission.py`
+
+The navlog is always derived; what is worth keeping is the intent it was derived from. A
+mission is the plan request with everything *observed* removed: forecasts, each field's reported
+weather, the planner's own points, and row-indexed overrides. That leaves the fixes with their
+ids, each leg's events and edits, and the flight's settings. The exported KML carries the mission
+as `e6b:mission` in the Document's `ExtendedData`, plus `e6b:snapshot`, a summary of the solve it
+was exported with. Loading the file restores the plan and solves it again, in whatever the
+weather is by then. The snapshot is never planned from: the UI uses it only to say what moved
+("TOC 1.2 nm later, ETE +4 min"). Both are versioned (`SCHEMA`). A mission this version cannot
+read leaves the placemarks importing as a plain route, with a warning. A plan that does not solve
+today is still exported, as the pilot's points and the mission without a snapshot.
 
 ---
 

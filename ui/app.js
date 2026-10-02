@@ -211,10 +211,63 @@ let route = [];
 let markers = [];
 let lastPlan = null;
 /** "manual" -- the default -- takes the profile from each waypoint's segment
- *  type; "auto" lets the planner place TOC/TOD instead. Kept in step with the
- *  toggle's pressed state and the altitude field's disabled state in the
- *  markup, which start on the same mode. */
+ *  type; "hybrid" lets the planner place TOC/TOD instead, around whatever
+ *  events the pilot pinned to each leg. Kept in step with the toggle's pressed
+ *  state and the altitude field's disabled state in the markup, which start on
+ *  the same mode. */
 let planningMode = 'manual';
+
+/** A stable identity for one of the pilot's waypoints.
+ *
+ *  What a leg is named by -- "<id>><id>" -- so that its events and the edits
+ *  typed on it survive the route being edited around it, and so that a saved
+ *  mission names the same legs when it is loaded again. */
+function newId() {
+  return (crypto.randomUUID?.() || `${Date.now().toString(36)}${Math.random().toString(36).slice(2)}`)
+    .slice(0, 12);
+}
+
+/** Give every pilot waypoint an id. Idempotent; generated points have none. */
+function ensureIds() {
+  for (const w of route) {
+    if (!w.generated && !w.id) w.id = newId();
+  }
+}
+
+/** The legs the pilot drew: consecutive pilot waypoints, TOC/TOD skipped. */
+function pilotLegs() {
+  const legs = [];
+  let from = null;
+  route.forEach((w, index) => {
+    if (w.generated) return;
+    if (from) legs.push({ from, to: w, index, key: `${from.id}>${w.id}` });
+    from = w;
+  });
+  return legs;
+}
+
+/** "SUNOL → VPCLB" for a leg key, or the key itself if the leg is gone. */
+function legName(key) {
+  const leg = pilotLegs().find((l) => l.key === key);
+  return leg ? `${leg.from.name} → ${leg.to.name}` : key;
+}
+
+/** Where along a leg a point falls, 0..1, and the point on the leg there.
+ *  Planar, like `distanceToSegment`: it only has to snap a click; the engine
+ *  projects the saved point onto the great circle itself. */
+function projectOntoLeg(lngLat, a, b) {
+  const k = Math.cos((a.lat * Math.PI) / 180);
+  const ax = a.lon * k, ay = a.lat;
+  const dx = b.lon * k - ax, dy = b.lat - ay;
+  const lengthSq = dx * dx + dy * dy;
+  const t = lengthSq === 0 ? 0
+    : Math.max(0, Math.min(1, ((lngLat.lng * k - ax) * dx + (lngLat.lat - ay) * dy) / lengthSq));
+  return {
+    t,
+    lat: +(a.lat + t * (b.lat - a.lat)).toFixed(5),
+    lon: +(a.lon + t * (b.lon - a.lon)).toFixed(5),
+  };
+}
 /** Findings from the last consistency check, or null if it has not been run
  *  or the route changed under it. */
 let consistencyReport = null;
@@ -578,10 +631,12 @@ function bindMapInteractions() {
 
   // Clicking an airport dot offers to add it to the route.
   map.on('click', 'airports-dot', (event) => {
+    if (eventPick) return;
     const f = event.features[0];
     showAirportPopup(f.geometry.coordinates, f.properties);
   });
   map.on('click', 'vfr-dot', (event) => {
+    if (eventPick) return;
     const f = event.features[0];
     showVfrWaypointPopup(f.geometry.coordinates, f.properties);
   });
@@ -604,6 +659,8 @@ function bindMapInteractions() {
 
   // Clicking empty map inserts a free waypoint into the nearest leg.
   map.on('click', (event) => {
+    // Placing a leg event takes the click wherever it lands, dots included.
+    if (eventPick) { placeEvent(event.lngLat); return; }
     const hits = map.queryRenderedFeatures(event.point, {
       layers: ['airports-dot', 'vfr-dot'],
     });
@@ -824,7 +881,7 @@ function addWaypoint(waypoint) {
   // A new point asks the planner what its leg should do. In user-driven mode
   // the pilot has to answer before the plan will build, which is the intended
   // prompt rather than an error to avoid.
-  route.push({ segment_type: 'automatic', generated: false, ...waypoint });
+  route.push({ segment_type: 'automatic', generated: false, id: newId(), ...waypoint });
   onRouteChanged();
   fitRoute();
 }
@@ -849,14 +906,35 @@ function insertWaypointAt(lngLat) {
     const d = distanceToSegment(lngLat, route[i], route[i + 1]);
     if (d < bestDistance) { bestDistance = d; bestLeg = i; }
   }
-  route.splice(bestLeg + 1, 0, {
+  const inserted = {
     name: nextWaypointName(),
     lat: +lngLat.lat.toFixed(5),
     lon: +lngLat.lng.toFixed(5),
     kind: 'waypoint',
     elevation_ft: null,
-  });
+    id: newId(),
+  };
+  splitLegAt(bestLeg + 1, inserted);
+  route.splice(bestLeg + 1, 0, inserted);
   onRouteChanged();
+}
+
+/** Carry what was said about a leg across a point dropped into it.
+ *
+ *  The leg the new point splits is named by the pilot waypoints either side
+ *  of it. Its events go to whichever half they lie on, and its edits are
+ *  copied to both halves: a wind typed on the whole leg is still the wind on
+ *  each part of it. */
+function splitLegAt(slot, inserted) {
+  const before = route.slice(0, slot).reverse().find((w) => !w.generated);
+  const after = route.slice(slot).find((w) => !w.generated);
+  if (!before || !after) return;
+  const at = projectOntoLeg({ lng: inserted.lon, lat: inserted.lat }, before, after).t;
+  const events = after.events || [];
+  inserted.events = events.filter(
+    (e) => projectOntoLeg({ lng: e.lon, lat: e.lat }, before, after).t < at);
+  after.events = events.filter((e) => !inserted.events.includes(e));
+  copyEdits(`${before.id}>${after.id}`, [`${before.id}>${inserted.id}`, `${inserted.id}>${after.id}`]);
 }
 
 /** The next free `WP<n>`. Searched, not counted: `WP${route.length}` handed
@@ -880,7 +958,7 @@ function nextWaypointName() {
  */
 function isNameAvailable(name, waypoint) {
   if (!name) return false;
-  if (/^TO[CD]\d*$/i.test(name)) return false;
+  if (/^[TB]O[CD]\d*$/i.test(name)) return false;
   const upper = name.toUpperCase();
   return !route.some((w) => w !== waypoint && w.name.toUpperCase() === upper);
 }
@@ -899,6 +977,19 @@ function distanceToSegment(point, a, b) {
 }
 
 function removeWaypoint(index) {
+  const gone = route[index];
+  if (!gone.generated) {
+    // The two legs either side become one. Its events are both sets, and its
+    // edits are the first leg's where both had one.
+    const before = route.slice(0, index).reverse().find((w) => !w.generated);
+    const after = route.slice(index + 1).find((w) => !w.generated);
+    if (before && after) {
+      after.events = [...(gone.events || []), ...(after.events || [])];
+      const merged = `${before.id}>${after.id}`;
+      copyEdits(`${gone.id}>${after.id}`, [merged]);
+      copyEdits(`${before.id}>${gone.id}`, [merged]);
+    }
+  }
   route.splice(index, 1);
   onRouteChanged();
   fitRoute();
@@ -911,11 +1002,10 @@ function moveWaypoint(from, to) {
 }
 
 function onRouteChanged() {
-  // Row edits are keyed by row index and a route change can renumber the rows,
-  // but which ones it renumbered is only knowable once the next plan comes
-  // back -- `pruneOverrides` does it there, per row, against the leg each edit
-  // was typed on.
-  //
+  // Edits are filed under the leg they were typed on, not a row, so nothing
+  // here has to chase them: a leg that still exists keeps its edits, and one
+  // that is gone simply stops being sent. See `segmentEdits`.
+  ensureIds();
   // The derived pressure and density altitudes are
   // indexed by route position, and the next plan is what re-earns them.
   if (fieldAir.length !== route.length) fieldAir = [];
@@ -931,6 +1021,15 @@ function onRouteChanged() {
   renderWaypointList();
   renderMarkers();
   renderRouteLine();
+  requestPlan();
+}
+
+/** A leg's vertical profile changed, not where it goes: an event was added,
+ *  moved or retargeted. The forecasts and the NOTAM corridor still stand. */
+function onProfileChanged() {
+  clearConsistency();
+  renderWaypointList();
+  renderEventMarkers();
   requestPlan();
 }
 
@@ -1103,6 +1202,152 @@ function renderFieldAir() {
   }
 }
 
+// --- leg events ---------------------------------------------------------
+//
+// "Start the climb here" and "be level by here", pinned to a place on the leg
+// arriving at a waypoint. Hybrid mode only: the planner pins one end of the
+// altitude change there and lets the wind decide where the other end falls.
+
+// [button, chip text before the altitude, tooltip, short map label]
+const EVENT_LABELS = {
+  start: ['Start climb/descent here', 'from here climb/descend to',
+    'Hold altitude until here, then climb or descend to the altitude in the box. '
+    + 'BOC (or TOD) is pinned here; where you level off floats with the wind.', 'start →'],
+  complete: ['Level by here', 'be at',
+    'Be at the altitude in the box by here. TOC (or BOD) is pinned here; '
+    + 'where the climb begins floats with the wind.', 'by'],
+};
+
+/** The leg a waypoint's events are on starts at the pilot waypoint before it. */
+function legStartFor(waypoint) {
+  const index = route.indexOf(waypoint);
+  return route.slice(0, index).reverse().find((w) => !w.generated) || null;
+}
+
+/** Events in the order they are flown along their leg. */
+function orderedEvents(waypoint) {
+  const from = legStartFor(waypoint);
+  const events = waypoint.events || [];
+  if (!from) return events;
+  return [...events].sort((a, b) =>
+    projectOntoLeg({ lng: a.lon, lat: a.lat }, from, waypoint).t
+    - projectOntoLeg({ lng: b.lon, lat: b.lat }, from, waypoint).t);
+}
+
+function eventBlock(waypoint, index) {
+  if (planningMode !== 'hybrid' || waypoint.generated || index === 0) return '';
+  const from = legStartFor(waypoint);
+  if (!from) return '';
+  const picking = eventPick?.waypoint === waypoint;
+  const rows = orderedEvents(waypoint).map((e) => {
+    const [, short, title] = EVENT_LABELS[e.kind];
+    const i = waypoint.events.indexOf(e);
+    return `<span class="event ev-${e.kind}" title="${title}">${short}` +
+      `<input class="ev-alt" data-i="${i}" type="number" step="500" min="0" max="17999" ` +
+      `aria-label="Altitude to ${e.kind === 'start' ? 'climb or descend to' : 'be at'}" ` +
+      `value="${Math.round(e.target_altitude_ft)}"> ft` +
+      (e.kind === 'complete' ? ' by here' : '') +
+      `<button class="ev-del" data-i="${i}" type="button" title="Remove this event">×</button></span>`;
+  }).join('');
+  const add = Object.entries(EVENT_LABELS).map(([kind, [label, , title]]) =>
+    `<button class="ev-add${picking && eventPick.kind === kind ? ' picking' : ''}" ` +
+    `data-kind="${kind}" type="button" title="Click the map on this leg: ${title}">+ ${label}</button>`).join('');
+  return `<div class="events"><span class="events-title">` +
+    `Leg from ${escapeHtml(from.name)}</span>${rows}<span class="ev-adds">${add}</span></div>`;
+}
+
+function bindEventBlock(li, waypoint) {
+  li.querySelectorAll('.ev-add').forEach((button) => button.addEventListener('click', () => {
+    const kind = button.dataset.kind;
+    const again = eventPick?.waypoint === waypoint && eventPick.kind === kind;
+    setEventPick(again ? null : { waypoint, kind });
+  }));
+  li.querySelectorAll('.ev-del').forEach((button) => button.addEventListener('click', () => {
+    waypoint.events.splice(+button.dataset.i, 1);
+    onProfileChanged();
+  }));
+  li.querySelectorAll('.ev-alt').forEach((input) => input.addEventListener('change', () => {
+    const value = Number(input.value);
+    if (input.value.trim() === '' || !Number.isFinite(value) || value < 0 || value > 17999) {
+      input.value = Math.round(waypoint.events[+input.dataset.i].target_altitude_ft);
+      return;
+    }
+    waypoint.events[+input.dataset.i].target_altitude_ft = value;
+    onProfileChanged();
+  }));
+}
+
+/** Waiting for a click on the map to place an event, or null. */
+let eventPick = null;
+
+function setEventPick(pick) {
+  eventPick = pick;
+  document.body.classList.toggle('picking-event', !!pick);
+  if (pick) {
+    const from = legStartFor(pick.waypoint);
+    setStatus(`Click the leg ${from?.name} → ${pick.waypoint.name} where to `
+      + `${pick.kind === 'start' ? 'start the climb or descent' : 'be level'}. Esc cancels.`);
+  } else {
+    setStatus('Ready — offline');
+  }
+  renderWaypointList();
+}
+
+/** Put the pending event where the pilot clicked, snapped onto its leg. */
+function placeEvent(lngLat) {
+  const { waypoint, kind } = eventPick;
+  const from = legStartFor(waypoint);
+  setEventPick(null);
+  if (!from) return;
+  const at = projectOntoLeg(lngLat, from, waypoint);
+  // The altitude the leg is headed for: its end's crossing altitude where it
+  // has one, the cruise altitude otherwise. The box beside it is for changing.
+  waypoint.events = [...(waypoint.events || []), {
+    kind, lat: at.lat, lon: at.lon,
+    target_altitude_ft: waypoint.altitude_ft ?? +$('altitude').value,
+  }];
+  onProfileChanged();
+}
+
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && eventPick) setEventPick(null);
+});
+
+let eventMarkers = [];
+
+/** The pilot's events on the map. Draggable along their leg. */
+function renderEventMarkers() {
+  eventMarkers.forEach((m) => m.remove());
+  eventMarkers = [];
+  if (planningMode !== 'hybrid') return;
+  for (const waypoint of route) {
+    const from = legStartFor(waypoint);
+    if (waypoint.generated || !from) continue;
+    for (const e of waypoint.events || []) {
+      const element = document.createElement('div');
+      element.className = `marker event ev-${e.kind}`;
+      const label = document.createElement('div');
+      label.className = 'marker-label dim';
+      label.textContent = `${EVENT_LABELS[e.kind][3]} ${Math.round(e.target_altitude_ft)}`;
+      element.appendChild(label);
+      const marker = new maplibregl.Marker({ element, draggable: true })
+        .setLngLat([e.lon, e.lat]).addTo(map);
+      marker.on('dragend', () => {
+        const at = projectOntoLeg(marker.getLngLat(), from, waypoint);
+        e.lat = at.lat;
+        e.lon = at.lon;
+        onProfileChanged();
+      });
+      eventMarkers.push(marker);
+    }
+  }
+}
+
+/** Whether the flight lands at this point: the destination, or a stop. */
+function landsHere(waypoint, index) {
+  return index === route.length - 1 || (isAirport(waypoint) && !!waypoint.is_landing);
+}
+
 function renderWaypointList() {
   const list = $('waypoints');
   list.innerHTML = '';
@@ -1132,7 +1377,7 @@ function renderWaypointList() {
       ? ''
       : `<select class="segment seg-${type}" ` +
         `title="What the leg arriving here does about altitude">` +
-        (planningMode === 'auto'
+        (planningMode === 'hybrid'
           ? `<option value="automatic" ${type === 'automatic' ? 'selected' : ''}>auto</option>`
           : (type === 'automatic'
             ? `<option value="automatic" selected disabled>choose…</option>`
@@ -1156,7 +1401,19 @@ function renderWaypointList() {
             `placeholder="cruise" value="${waypoint.altitude_ft ?? ''}"></label>` +
         `</div>`
       : `<div class="coords readonly">` +
-          `${waypoint.lat.toFixed(4)}, ${waypoint.lon.toFixed(4)}</div>`;
+          `<span>${waypoint.lat.toFixed(4)}, ${waypoint.lon.toFixed(4)}</span>` +
+          // An airport can be crossed at an altitude too. On the field the
+          // flight lands at -- the last one, or a stop -- it is where the
+          // descent ends; blank ends it at the field's pattern altitude.
+          (index > 0
+            ? `<label title="${landsHere(waypoint, index)
+              ? 'Where the descent into this field ends. Blank: the pattern altitude (field + 1,000 ft, or its published TPA).'
+              : 'Cross this field at this altitude'}">Cross` +
+              `<input class="alt" type="number" step="100" min="0" max="17999" ` +
+              `placeholder="${landsHere(waypoint, index) ? 'TPA' : 'cruise'}" ` +
+              `value="${waypoint.altitude_ft ?? ''}"></label>`
+            : '') +
+        `</div>`;
     // A dropped point's name is the pilot's to change -- it is what the navlog
     // and the map label print. An airport's is its identifier: the server
     // looks its runways up by it (`WaypointIn.ident`), so it stays as it is.
@@ -1172,8 +1429,9 @@ function renderWaypointList() {
         segment +
         landing +
         `<button class="remove" type="button" title="Remove">×</button>` +
-      `</div>` + coords + fieldBlock(waypoint, index);
+      `</div>` + coords + eventBlock(waypoint, index) + fieldBlock(waypoint, index);
     li.querySelector('.remove').addEventListener('click', () => removeWaypoint(index));
+    bindEventBlock(li, waypoint);
 
     const nameBox = li.querySelector('input.wp-name');
     if (nameBox) {
@@ -1394,6 +1652,7 @@ function renderMarkers() {
     });
     return marker;
   });
+  renderEventMarkers();
 }
 
 function renderRouteLine() {
@@ -1457,48 +1716,92 @@ function renderPhaseMarkers() {
   }
 }
 
-// --- manual row edits ---------------------------------------------------
+// --- manual edits, filed under the leg they were typed on ---------------
 //
-// Keyed by row index, which is what the engine's `overrides` map wants -- but
-// a row index is only a position, and positions move. Each entry therefore
-// also remembers the leg it was typed on (the two points and the phase), and
-// every plan checks that the row at that index is still that leg. An edit
-// survives anything that leaves its leg alone -- a field temperature, an
-// altimeter setting, a waypoint dragged somewhere else -- and is dropped, with
-// a notice, only when the leg it belonged to is gone. Wind is entered here and
-// nowhere else, so silently reapplying one to a different leg would be worse
-// than losing it, and silently losing it is what made the table unusable.
+// An edit belongs to the leg the pilot drew -- "<from id>><to id>" -- and
+// optionally to one phase of it, never to a row. The rows a leg is cut into
+// move every time the wind moves a top of climb; the leg does not. So a wind
+// typed on SUNOL → VPCLB is still on that leg however many rows the next plan
+// cuts it into, and still there when the mission is saved and loaded again
+// tomorrow. Which is the point: the log is something to keep editing, not
+// something to rebuild whenever the weather changes.
 //
-// Each value is `{ leg, fields }`: `leg` the signature below, `fields` the
-// numbers the pilot typed.
+// Keyed `${segment_key}|${phase}`, with an empty phase for the whole leg.
 
-let overrides = new Map();
+let segmentEdits = new Map();
 
-/** What makes a navlog row itself: where it goes, and what it is doing. */
-function legSignature(leg) {
-  return leg ? `${leg.from}>${leg.to}|${leg.phase}` : null;
+const editKey = (segment, phase) => `${segment}|${phase || ''}`;
+
+/** What a typed wind covers: the whole leg, or only the row's phase of it.
+ *  Temperature, pressure altitude and airspeed are always the phase's own --
+ *  the climb and the cruise are flown in different air at different speeds. */
+let windScope = 'leg';
+
+function scopeOf(field) {
+  if (field === 'wind_from_deg' || field === 'wind_speed_kt') return windScope;
+  return field === 'altitude_ft' ? 'leg' : 'phase';
 }
 
-/** Rows dropped by the last prune, for the notice under the table. */
-let droppedRows = [];
+function updateEdit(key, change) {
+  const entry = { ...(segmentEdits.get(key) || {}) };
+  change(entry);
+  if (Object.keys(entry).length) segmentEdits.set(key, entry);
+  else segmentEdits.delete(key);
+}
 
-/** Drop every edit whose leg is no longer at the index it was typed at.
- *
- *  Returns true if anything went, in which case the plan on screen was built
- *  with an edit that has since been withdrawn and has to be built again.
- */
-function pruneOverrides(plan) {
-  if (!overrides.size) return false;
-  const legs = plan?.ok ? plan.legs : null;
-  if (!legs) return false;
-  const gone = [...overrides.entries()].filter(
-    ([row, entry]) => entry.leg !== null && legSignature(legs[row]) !== entry.leg,
-  );
-  if (!gone.length) return false;
-  gone.forEach(([row]) => overrides.delete(row));
-  droppedRows = gone.map(([row]) => row + 1);
-  $('reset-edits').hidden = overrides.size === 0;
-  return true;
+/** Copy one leg's edits onto others, where they have none of their own. Used
+ *  when a waypoint splits a leg in two or its removal joins two into one. */
+function copyEdits(fromLeg, toLegs) {
+  for (const [key, fields] of [...segmentEdits.entries()]) {
+    const [leg, phase] = key.split('|');
+    if (leg !== fromLeg) continue;
+    for (const target of toLegs) {
+      updateEdit(editKey(target, phase), (entry) => {
+        for (const [field, value] of Object.entries(fields)) entry[field] ??= value;
+      });
+    }
+  }
+}
+
+function setSegmentEdit(leg, field, value) {
+  const phaseKey = editKey(leg.segment_key, leg.phase);
+  const legKey = editKey(leg.segment_key, null);
+  if (value === null) {
+    // Blank clears whichever entry is supplying the number: the phase's own
+    // first, since that is the one on show.
+    const key = segmentEdits.get(phaseKey)?.[field] != null ? phaseKey : legKey;
+    updateEdit(key, (entry) => { delete entry[field]; });
+  } else if (scopeOf(field) === 'leg') {
+    updateEdit(legKey, (entry) => { entry[field] = value; });
+    // A leg-wide value typed over a phase's own replaces it; otherwise the
+    // phase's would go on hiding the number just typed.
+    updateEdit(phaseKey, (entry) => { delete entry[field]; });
+  } else {
+    updateEdit(phaseKey, (entry) => { entry[field] = value; });
+  }
+  $('reset-edits').hidden = segmentEdits.size === 0;
+  requestPlan();
+}
+
+/** Every edit on a leg of the current route. Edits on legs that no longer
+ *  exist -- the route was reordered -- are kept but not sent: put the points
+ *  back and they apply again. */
+function segmentOverridesPayload() {
+  const live = new Set(pilotLegs().map((leg) => leg.key));
+  return [...segmentEdits.entries()]
+    .filter(([key]) => live.has(key.split('|')[0]))
+    .map(([key, fields]) => {
+      const [segment_key, phase] = key.split('|');
+      return { segment_key, phase: phase || null, ...fields };
+    });
+}
+
+function clearLegEdits(segment) {
+  for (const key of [...segmentEdits.keys()]) {
+    if (key.split('|')[0] === segment) segmentEdits.delete(key);
+  }
+  $('reset-edits').hidden = segmentEdits.size === 0;
+  requestPlan();
 }
 
 // Committing an edit replans, which rebuilds the whole table and destroys the
@@ -1522,13 +1825,14 @@ const FIELD_CLASS = {
  *  will be looking for, so it is never replaced.
  */
 function legLabel(name, role) {
-  return !role || name === role ? name : `${name} (${role})`;
+  // A planner point -- TOC2, BOC -- already says what it is.
+  return !role || name === role || /^[TB]O[CD]\d*$/.test(name) ? name : `${name} (${role})`;
 }
 
 function restoreFocus() {
   if (!focusedCell) return;
   const { row, field, start, end } = focusedCell;
-  const tr = document.querySelectorAll('#navlog tbody tr')[row];
+  const tr = document.querySelector(`#navlog tbody tr[data-row="${row}"]`);
   const input = tr && tr.querySelector(`td.${FIELD_CLASS[field]} input`);
   if (!input) { focusedCell = null; return; }
   input.focus();
@@ -1536,9 +1840,8 @@ function restoreFocus() {
 }
 
 function clearOverrides() {
-  droppedRows = [];
-  if (overrides.size === 0) return;
-  overrides = new Map();
+  if (segmentEdits.size === 0) return;
+  segmentEdits = new Map();
   const reset = $('reset-edits');
   if (reset) reset.hidden = true;
 }
@@ -1551,37 +1854,15 @@ function clearConsistency() {
   renderConsistency(null);
 }
 
-function setOverride(row, field, value) {
-  const entry = overrides.get(row) || {
-    // The leg this number is about, taken from the plan the pilot is looking
-    // at as they type it.
-    leg: legSignature(lastPlan?.ok ? lastPlan.legs[row] : null),
-    fields: {},
-  };
-  if (value === null) {
-    delete entry.fields[field];
-  } else {
-    entry.fields[field] = value;
-  }
-  if (Object.keys(entry.fields).length === 0) {
-    overrides.delete(row);
-  } else {
-    overrides.set(row, entry);
-  }
-  $('reset-edits').hidden = overrides.size === 0;
-  requestPlan();
-}
-
-function overridesPayload() {
-  return [...overrides.entries()].map(([row, entry]) => ({ row, ...entry.fields }));
-}
-
-/** Turn a table cell into a number the pilot can type over. */
-function makeEditable(cell, { row, field, value, format, title }) {
+/** Turn a table cell into a number the pilot can type over.
+ *
+ *  What is typed is filed under the row's leg (and phase), so the title says
+ *  which leg -- the pilot is editing that stretch of route, not this row. */
+function makeEditable(cell, { leg, row, field, value, format, title }) {
   cell.classList.add('editable');
-  cell.title = title;
-  const edited = overrides.get(row)?.fields[field] != null;
-  if (edited) cell.classList.add('edited');
+  const scope = scopeOf(field) === 'leg' ? 'the whole leg' : `the ${leg.phase} on it`;
+  cell.title = `${title}\nApplies to ${legName(leg.segment_key)}, ${scope}.`;
+  if (leg.overridden.includes(field)) cell.classList.add('edited');
 
   const input = document.createElement('input');
   input.type = 'number';
@@ -1594,7 +1875,7 @@ function makeEditable(cell, { row, field, value, format, title }) {
     const raw = input.value.trim();
     const next = raw === '' ? null : Number(raw);
     if (next !== null && !Number.isFinite(next)) return;
-    setOverride(row, field, next);
+    setSegmentEdit(leg, field, next);
   };
   input.addEventListener('focus', () => {
     focusedCell = { row, field, start: 0, end: input.value.length };
@@ -1608,7 +1889,7 @@ function makeEditable(cell, { row, field, value, format, title }) {
   input.addEventListener('change', commit);
   input.addEventListener('keydown', (event) => {
     if (event.key === 'Enter') { focusedCell = null; input.blur(); }
-    if (event.key === 'Escape') { focusedCell = null; setOverride(row, field, null); }
+    if (event.key === 'Escape') { focusedCell = null; setSegmentEdit(leg, field, null); }
   });
 }
 
@@ -1632,6 +1913,8 @@ function planBody() {
       altitude_ft: w.altitude_ft ?? null,
       segment_type: w.segment_type || 'automatic',
       generated: !!w.generated,
+      id: w.generated ? null : (w.id ?? null),
+      events: w.generated ? [] : (w.events || []),
       altimeter_inhg: w.altimeter_inhg ?? null,
       oat_c: w.oat_c ?? null,
       wind_from_deg: w.wind_from_deg ?? null,
@@ -1647,7 +1930,7 @@ function planBody() {
       weather_reported: !!w.weather_reported,
     })),
     planning_mode: planningMode,
-    overrides: overridesPayload(),
+    segment_overrides: segmentOverridesPayload(),
     forecasts,
     // What turns a cumulative ETE into a clock time, and so what decides
     // which forecast hour each leg is read at.
@@ -1661,8 +1944,8 @@ function planBody() {
     altimeter_inhg: +$('altimeter').value,
     isa_deviation_c: +$('isadev').value,
     night: $('night').checked,
-    // No route-wide wind: it is typed on the navlog row it applies to, and
-    // travels to the engine in `overrides`.
+    // No route-wide wind: it is typed on the leg it applies to, and travels
+    // to the engine in `segment_overrides`.
   };
 }
 
@@ -1674,17 +1957,8 @@ async function runPlan() {
     return;
   }
   setStatus('Planning…');
-  // The notice below the table belongs to the plan that dropped the edits and
-  // to no later one, so it starts every plan empty.
-  droppedRows = [];
+  ensureIds();
   lastPlan = await api.plan(planBody());
-  // An edit whose leg is gone was still sent, so this plan was built with a
-  // number that no longer applies to the row it landed on. Drop it and plan
-  // again rather than show it: one extra round trip against a wind on the
-  // wrong leg is not a trade.
-  if (pruneOverrides(lastPlan)) {
-    lastPlan = await api.plan(planBody());
-  }
   // Before adopting: adoption may re-render the sidebar, and the derived
   // lines should already be right when it does.
   adoptFieldAir(lastPlan?.ok ? lastPlan.resolved_waypoints : null);
@@ -1692,6 +1966,7 @@ async function runPlan() {
   renderFieldAir();
   renderNavlog(lastPlan);
   renderRouteLine();
+  refreshCsvDrawer();
   // renderNavlog owns the status when it refuses, so it can say why.
   if (lastPlan?.ok) setStatus('Ready — offline');
 }
@@ -1745,6 +2020,9 @@ function adoptResolvedRoute(resolved) {
     // Keep anything of the pilot's the engine does not round-trip. Matched by
     // name, which `isNameAvailable` keeps unique across the route.
     ...(w.generated ? {} : route.find((r) => r.name === w.name) || {}),
+    // The id the pilot's point was sent with, which is what its leg's events
+    // and edits are filed under. A planner point has none.
+    ...(w.generated ? {} : { id: w.id }),
     name: w.name, lat: w.lat, lon: w.lon, kind: w.kind,
     elevation_ft: w.elevation_ft,
     is_landing: !!w.is_landing,
@@ -1759,6 +2037,45 @@ function adoptResolvedRoute(resolved) {
   }));
   renderWaypointList();
   renderMarkers();
+}
+
+/** The row that heads one drawn leg's rows: its name, its events, its edits. */
+function legHeading(segment) {
+  const tr = document.createElement('tr');
+  tr.className = 'leg-head';
+  const edits = [...segmentEdits.entries()]
+    .filter(([key]) => key.split('|')[0] === segment)
+    .map(([key, fields]) => {
+      const phase = key.split('|')[1] || 'whole leg';
+      const parts = [];
+      if (fields.wind_from_deg != null || fields.wind_speed_kt != null) {
+        parts.push(`wind ${fields.wind_from_deg ?? '—'}/${fields.wind_speed_kt ?? '—'}`);
+      }
+      for (const [field, label] of [['tas_kt', 'TAS'], ['oat_c', 'OAT'],
+        ['pressure_altitude_ft', 'PA'], ['altitude_ft', 'alt']]) {
+        if (fields[field] != null) parts.push(`${label} ${fields[field]}`);
+      }
+      return `${phase}: ${parts.join(', ')}`;
+    });
+  const leg = pilotLegs().find((l) => l.key === segment);
+  const events = leg ? (leg.to.events || []).length : 0;
+  tr.innerHTML = `<td colspan="24"><span class="leg-name">${escapeHtml(legName(segment))}</span>` +
+    (events ? `<span class="leg-meta">${events} event${events === 1 ? '' : 's'}</span>` : '') +
+    (edits.length
+      ? `<span class="leg-meta edited">${escapeHtml(edits.join(' · '))}</span>` +
+        `<button type="button" class="leg-reset" title="Clear the edits on this leg and go back to the forecast">Reset leg</button>`
+      : '') +
+    `</td>`;
+  tr.querySelector('.leg-reset')?.addEventListener('click', () => clearLegEdits(segment));
+  return tr;
+}
+
+/** Minutes left after a row, to the end of the flight, pattern included:
+ *  it counts down to 0 the way the fuel Rem column does. */
+function timeRemText(leg) {
+  const total = lastPlan?.ok ? lastPlan.totals.time_min : null;
+  if (total == null || leg.cumulative_ete_min == null) return '';
+  return Math.max(0, total - leg.cumulative_ete_min).toFixed(1);
 }
 
 function renderNavlog(plan) {
@@ -1796,8 +2113,17 @@ function renderNavlog(plan) {
   empty.hidden = true;
 
   const round = (v, d = 0) => v.toFixed(d);
+  let heading = null;
   plan.legs.forEach((leg, row) => {
+    // Rows are grouped under the leg the pilot drew them on: that is what an
+    // edit is typed against, and what its events belong to.
+    if (leg.covers_ground && leg.segment_key && leg.segment_key !== heading) {
+      heading = leg.segment_key;
+      body.appendChild(legHeading(leg.segment_key));
+    }
     const tr = document.createElement('tr');
+    tr.dataset.row = row;
+    if (leg.covers_ground && leg.segment_key) tr.classList.add('in-leg');
     if (leg.overridden.length) tr.classList.add('row-edited');
     // A row whose performance was extrapolated. Marked on the row so the log
     // itself shows where the totals stop being the book's, not only the
@@ -1822,9 +2148,10 @@ function renderNavlog(plan) {
         `<td class="num">${round(leg.oat_c)}</td>` +
         `<td class="num">${round(leg.pressure_altitude_ft)}</td>` +
         `<td class="num">${round(leg.density_altitude_ft)}</td>` +
-        // Course through ground speed, plus distance: ten columns of nothing.
-        '<td class="num">—</td>'.repeat(10) +
+        // Course through ground speed, plus distance: eleven columns of nothing.
+        '<td class="num">—</td>'.repeat(11) +
         `<td class="num">${round(leg.ete_min, 1)}</td>` +
+        `<td class="num">${timeRemText(leg)}</td>` +
         `<td class="num">${round(leg.fuel_gal, 1)}</td>` +
         `<td class="num">${round(leg.fuel_remaining_gal, 1)}</td>`;
       body.appendChild(tr);
@@ -1856,38 +2183,49 @@ function renderNavlog(plan) {
       `<td class="num">${round(leg.magnetic_heading_deg).padStart(3, '0')}</td>` +
       `<td class="num wind-dir"></td>` +
       `<td class="num wind-speed"></td>` +
+      `<td class="num">${leg.cas_kt == null ? '—' : round(leg.cas_kt)}</td>` +
       `<td class="num tas"></td>` +
       `<td class="num">${round(leg.ground_speed_kt)}</td>` +
       `<td class="num">${round(leg.distance_nm, 1)}</td>` +
       `<td class="num">${round(leg.ete_min, 1)}</td>` +
+      `<td class="num">${timeRemText(leg)}</td>` +
       `<td class="num">${round(leg.fuel_gal, 1)}</td>` +
       `<td class="num">${round(leg.fuel_remaining_gal, 1)}</td>`;
 
     // The cells the pilot can overwrite. Everything else on the row is
     // derived from them and recomputes on the next plan.
     makeEditable(tr.querySelector('.wind-dir'), {
-      row, field: 'wind_from_deg', value: leg.wind_from_deg,
+      leg, row, field: 'wind_from_deg', value: leg.wind_from_deg,
       format: (v) => Math.round(v),
       title: 'Wind direction on this leg, degrees true. Blank for calm.',
     });
     makeEditable(tr.querySelector('.wind-speed'), {
-      row, field: 'wind_speed_kt', value: leg.wind_speed_kt,
+      leg, row, field: 'wind_speed_kt', value: leg.wind_speed_kt,
       format: (v) => Math.round(v),
       title: 'Wind speed on this leg, knots. Blank for calm.',
     });
     // The altitude this leg *ends* at, which carries forward to every row
     // after it -- editing the top of a climb re-flies the rest of the plan.
-    makeEditable(tr.querySelector('.alt'), {
-      row, field: 'altitude_ft',
-      value: leg.exit_altitude_ft ?? leg.altitude_ft,
-      format: (v) => Math.round(v),
-      title: 'Altitude at the end of this leg. Blank to compute it again.',
-    });
+    // User-driven only: in hybrid the planner places the altitudes, and the
+    // pilot pins them with events on the leg instead.
+    if (planningMode === 'manual') {
+      makeEditable(tr.querySelector('.alt'), {
+        leg, row, field: 'altitude_ft',
+        value: leg.exit_altitude_ft ?? leg.altitude_ft,
+        format: (v) => Math.round(v),
+        title: 'Altitude at the end of this leg. Blank to compute it again.',
+      });
+    } else {
+      const cell = tr.querySelector('.alt');
+      cell.textContent = round(leg.exit_altitude_ft ?? leg.altitude_ft);
+      cell.title = 'Placed by the planner. Pin a climb or descent with an event '
+        + 'on the leg in the route list, or a crossing altitude on a waypoint.';
+    }
     // Temperature is the odd one out: it describes the air, not the row, so
     // it joins the field temperatures in the flight's profile and lapses into
     // the legs above and below rather than stopping at this one.
     makeEditable(tr.querySelector('.oat'), {
-      row, field: 'oat_c', value: leg.oat_c,
+      leg, row, field: 'oat_c', value: leg.oat_c,
       format: (v) => Math.round(v),
       title: 'Outside air temperature at this altitude, °C — the FD forecast '
         + 'figure for this part of the route. It lapses into the rows above '
@@ -1897,7 +2235,7 @@ function renderNavlog(plan) {
     // Typing one says the air over this leg does not match that setting; the
     // density altitude beside it and the charts this row reads follow.
     makeEditable(tr.querySelector('.pa'), {
-      row, field: 'pressure_altitude_ft', value: leg.pressure_altitude_ft,
+      leg, row, field: 'pressure_altitude_ft', value: leg.pressure_altitude_ft,
       format: (v) => Math.round(v),
       title: 'Pressure altitude of this row\'s air, ft — what the altimeter '
         + 'reads with 29.92 set. Density altitude and this row\'s chart '
@@ -1905,7 +2243,7 @@ function renderNavlog(plan) {
         + 'setting again.',
     });
     makeEditable(tr.querySelector('.tas'), {
-      row, field: 'tas_kt', value: leg.tas_kt,
+      leg, row, field: 'tas_kt', value: leg.tas_kt,
       format: (v) => Math.round(v),
       title: 'True airspeed, knots. Blank to go back to the POH figure.',
     });
@@ -1915,9 +2253,10 @@ function renderNavlog(plan) {
   const t = plan.totals;
   const tr = document.createElement('tr');
   tr.innerHTML =
-    `<td colspan="18">Total</td>` +
+    `<td colspan="19">Total</td>` +
     `<td class="num">${round(t.distance_nm, 1)}</td>` +
     `<td class="num">${round(t.time_min, 1)}</td>` +
+    `<td class="num"></td>` +
     `<td class="num">${round(t.fuel_gal, 1)}</td>` +
     `<td class="num">${round(t.fuel_remaining_gal, 1)}</td>`;
   foot.appendChild(tr);
@@ -2159,14 +2498,13 @@ function renderSummary(plan) {
       + '. A forecast, not an observation — and no substitute for a briefing.';
     warnings.appendChild(div);
   }
-  // Edits this browser dropped, said in the same place as the engine's own
-  // warnings: a number the pilot typed disappearing without a word is what
-  // makes a navlog untrustworthy.
-  if (droppedRows.length) {
+  // What the day's weather changed, against the plan the mission was saved
+  // with. Said first: it is why the pilot loaded the mission.
+  const changed = sinceSaved(plan);
+  if (changed) {
     const div = document.createElement('div');
-    div.className = 'alert';
-    div.textContent = `manual edits on row(s) ${droppedRows.join(', ')} were `
-      + 'dropped: the route no longer has those legs';
+    div.className = 'hint since-saved';
+    div.textContent = changed;
     warnings.appendChild(div);
   }
   for (const message of plan.warnings) {
@@ -2677,24 +3015,172 @@ $('get-weather').addEventListener('click', getWeather);
 $('get-notams').dataset.label = 'Get NOTAMs';
 $('get-notams').addEventListener('click', getNotams);
 
-$('download-csv').addEventListener('click', async () => {
-  if (!lastPlan?.ok) return;
-  const button = $('download-csv');
-  const { blob, filename, error } = await api.navlogCsv(planBody());
-  if (error) {
-    button.textContent = 'Export failed';
-    setTimeout(() => { button.textContent = 'Download CSV'; }, 1600);
+// --- the navlog as CSV, pulled down over the map ------------------------
+//
+// The same file "Download CSV" saves, shown before it is saved: the navlog's
+// own columns, with the legs named by where they start and end. Fetched from
+// the server rather than rebuilt here, so the drawer and the file can never
+// disagree.
+
+/** RFC 4180, which is what Python's csv module writes. */
+function parseCsv(text) {
+  const rows = [];
+  let row = [];
+  let cell = '';
+  let quoted = false;
+  for (let i = 0; i < text.length; i += 1) {
+    const c = text[i];
+    if (quoted) {
+      if (c === '"' && text[i + 1] === '"') { cell += '"'; i += 1; }
+      else if (c === '"') quoted = false;
+      else cell += c;
+    } else if (c === '"') quoted = true;
+    else if (c === ',') { row.push(cell); cell = ''; }
+    else if (c === '\n' || c === '\r') {
+      if (c === '\r' && text[i + 1] === '\n') i += 1;
+      row.push(cell); rows.push(row); row = []; cell = '';
+    } else cell += c;
+  }
+  if (cell || row.length) { row.push(cell); rows.push(row); }
+  return rows;
+}
+
+let csvText = null;
+let csvFilename = 'navlog.csv';
+let csvRequest = 0;
+
+function csvDrawerOpen() {
+  return $('csv-handle').getAttribute('aria-expanded') === 'true';
+}
+
+async function refreshCsvDrawer() {
+  if (!csvDrawerOpen()) return;
+  const table = $('csv-table');
+  const empty = $('csv-empty');
+  const ticket = ++csvRequest;
+  if (!lastPlan?.ok) {
+    csvText = null;
+    table.hidden = true;
+    empty.hidden = false;
+    empty.textContent = route.length < 2
+      ? 'Add a departure and a destination to build a navlog.'
+      : (lastPlan?.error || 'This route does not plan yet.');
+    $('csv-note').textContent = '';
     return;
   }
-  // Handed to the browser as a blob URL and revoked straight after: the file
-  // is built per click from the plan on screen, so keeping the URL alive would
-  // only pin a stale copy in memory.
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement('a');
-  link.href = url;
-  link.download = filename;
-  link.click();
-  URL.revokeObjectURL(url);
+  const { blob, filename, error } = await api.navlogCsv(planBody());
+  // A newer plan asked while this one was on the wire; it will draw.
+  if (ticket !== csvRequest) return;
+  if (error) {
+    csvText = null;
+    table.hidden = true;
+    empty.hidden = false;
+    empty.textContent = error;
+    return;
+  }
+  csvText = await blob.text();
+  csvFilename = filename;
+  const [head, ...rows] = parseCsv(csvText);
+  // A column empty on every row -- ETA before an off-blocks time is set --
+  // is left out of the view by default. The file keeps it.
+  const shown = head.map((_, i) => $('csv-blank').checked || rows.some((r) => r[i]));
+  const pick = (cells) => cells.filter((_, i) => shown[i]);
+  const names = pick(head);
+  table.querySelector('thead').innerHTML =
+    `<tr>${names.map((h) => `<th>${escapeHtml(h)}</th>`).join('')}</tr>`;
+  table.querySelector('tbody').innerHTML = rows.map((cells) => {
+    const phase = cells[head.indexOf('Phase')] || '';
+    const cls = cells[0] === 'Total' ? 'totals' : `phase-row-${phase}`;
+    const text = new Set(['Leg Start', 'Leg End', 'Phase']);
+    return `<tr class="${cls}">${pick(cells).map((c, i) =>
+      `<td class="${text.has(names[i]) ? '' : 'num'}">${escapeHtml(c)}</td>`).join('')}</tr>`;
+  }).join('');
+  table.hidden = false;
+  empty.hidden = true;
+  const drawn = pilotLegs();
+  $('csv-title').textContent = drawn.length
+    ? `Navlog ${drawn[0].from.name} → ${drawn[drawn.length - 1].to.name}` : 'Navlog';
+  $('csv-note').textContent = 'Time Rem: minutes left after each row, pattern included';
+}
+
+/** Open or close the drawer, dropping any height left over from a drag. */
+function setCsvDrawer(open) {
+  const drawer = $('csv-drawer');
+  $('csv-handle').setAttribute('aria-expanded', String(open));
+  $('csv-handle').textContent = open ? 'Navlog ▴' : 'Navlog ▾';
+  drawer.style.height = '';
+  $('map-wrap').style.removeProperty('--csv-drawer-h');
+  drawer.classList.toggle('open', open);
+  if (open) {
+    drawer.hidden = false;
+    refreshCsvDrawer();
+  } else {
+    // Hidden after the slide up, so it takes no clicks meant for the map.
+    setTimeout(() => { if (!csvDrawerOpen()) drawer.hidden = true; }, 200);
+  }
+}
+
+// Pulled down like a blind: the drawer follows the finger, and on release
+// it opens if it was pulled a quarter of the way, closes otherwise. A plain
+// click toggles it.
+{
+  const handle = $('csv-handle');
+  let drag = null;
+  handle.addEventListener('pointerdown', (event) => {
+    drag = { y: event.clientY, moved: false, open: csvDrawerOpen() };
+    handle.setPointerCapture(event.pointerId);
+  });
+  handle.addEventListener('pointermove', (event) => {
+    if (!drag) return;
+    const dy = event.clientY - drag.y;
+    if (!drag.moved && Math.abs(dy) < 6) return;
+    const drawer = $('csv-drawer');
+    const max = window.innerHeight / 2;
+    if (!drag.moved) {
+      drag.moved = true;
+      drawer.hidden = false;
+      drawer.classList.add('dragging');
+      if (!drag.open) {
+        // Filled while it is still being pulled, so there is a log to see.
+        $('csv-handle').setAttribute('aria-expanded', 'true');
+        refreshCsvDrawer();
+      }
+    }
+    const start = drag.open ? drawer.getBoundingClientRect().height || max : 0;
+    drag.start ??= start;
+    const height = Math.max(0, Math.min(max, drag.start + dy));
+    drawer.style.height = `${height}px`;
+    $('map-wrap').style.setProperty('--csv-drawer-h', `${height}px`);
+  });
+  const release = () => {
+    if (!drag) return;
+    const drawer = $('csv-drawer');
+    drawer.classList.remove('dragging');
+    if (!drag.moved) setCsvDrawer(!drag.open);
+    else setCsvDrawer(drawer.getBoundingClientRect().height > window.innerHeight / 8);
+    drag = null;
+  };
+  handle.addEventListener('pointerup', release);
+  handle.addEventListener('pointercancel', release);
+  handle.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && csvDrawerOpen()) setCsvDrawer(false);
+  });
+}
+
+
+$('csv-blank').addEventListener('change', () => refreshCsvDrawer());
+
+$('csv-copy').addEventListener('click', async () => {
+  if (!csvText) return;
+  await navigator.clipboard.writeText(csvText);
+  flashButton($('csv-copy'), 'Copied');
+});
+$('csv-copy').dataset.label = 'Copy CSV';
+
+$('download-csv').addEventListener('click', () => {
+  // The file is what the drawer shows, saved as it stands.
+  if (!csvText) return;
+  saveBlob(new Blob([csvText], { type: 'text/csv;charset=utf-8' }), csvFilename);
 });
 
 $('copy').addEventListener('click', async () => {
@@ -2729,8 +3215,10 @@ function saveBlob(blob, filename) {
 
 $('download-kml').addEventListener('click', async () => {
   const button = $('download-kml');
-  if (!lastPlan?.ok) {
-    button.textContent = route.length < 2 ? 'Nothing to export yet' : 'Plan the route first';
+  // A plan that does not solve today is still a mission worth keeping; the
+  // server saves it without a profile.
+  if (route.length < 2) {
+    button.textContent = 'Nothing to export yet';
     setTimeout(() => { button.textContent = button.dataset.label; }, 1600);
     return;
   }
@@ -2762,7 +3250,20 @@ function renderImportPreview(result) {
     error.hidden = false;
     return;
   }
-  pendingImport = result.waypoints;
+  pendingImport = result;
+  if (result.mission) {
+    const m = result.mission;
+    const pilot = m.waypoints.filter((w) => !w.generated);
+    const events = pilot.reduce((n, w) => n + (w.events?.length || 0), 0);
+    const li = document.createElement('li');
+    li.className = 'mission';
+    li.textContent = `Saved mission: ${m.planning_mode === 'manual' ? 'user-driven' : 'hybrid'}, `
+      + `${m.cruise_altitude_ft} ft, ${events} leg event${events === 1 ? '' : 's'}, `
+      + `${m.segment_overrides.length} leg edit${m.segment_overrides.length === 1 ? '' : 's'}`
+      + (result.snapshot?.solved_at ? `, last solved ${zuluDate(result.snapshot.solved_at)}` : '')
+      + '. Loading restores it and re-plans it in today\'s weather.';
+    preview.appendChild(li);
+  }
   for (const w of result.waypoints) {
     const li = document.createElement('li');
     const alt = w.altitude_ft != null ? `cross ${w.altitude_ft} ft` : '';
@@ -2794,12 +3295,21 @@ $('kml-file').addEventListener('change', async () => {
 });
 
 $('kml-load').addEventListener('click', () => {
-  if (!pendingImport?.length) return;
+  if (!pendingImport?.waypoints?.length) return;
   const mode = document.querySelector('input[name="kml-mode"]:checked')?.value || 'replace';
+  // A mission of ours replaces the plan outright: appending a whole plan's
+  // settings to another route has no meaning.
+  if (pendingImport.mission && mode === 'replace') {
+    restoreMission(pendingImport.mission, pendingImport.snapshot);
+    renderImportPreview(null);
+    $('kml-file').value = '';
+    setTab('navlog');
+    return;
+  }
   // Same defaults a point added from the search box gets; the file's own
   // segment type and crossing altitude win where it had them.
-  let points = pendingImport.map(({ label, ...w }) => ({
-    segment_type: 'automatic', generated: false, ...w,
+  let points = pendingImport.waypoints.map(({ label, ...w }) => ({
+    segment_type: 'automatic', generated: false, id: newId(), ...w,
   }));
   route = mode === 'append' ? route : [];
   const last = route[route.length - 1];
@@ -2826,10 +3336,12 @@ $('kml-load').addEventListener('click', () => {
 // --- planning mode ------------------------------------------------------
 
 function setPlanningMode(mode) {
+  if (mode === 'auto') mode = 'hybrid';
   if (mode === planningMode) return;
   planningMode = mode;
-  $('mode-auto').setAttribute('aria-pressed', String(mode === 'auto'));
+  $('mode-hybrid').setAttribute('aria-pressed', String(mode === 'hybrid'));
   $('mode-manual').setAttribute('aria-pressed', String(mode === 'manual'));
+  if (eventPick) setEventPick(null);
 
   // Taking over from an automatic pass means taking over its points too.
   // Resolution discards planner-owned points before re-deriving, so a TOC left
@@ -2837,9 +3349,18 @@ function setPlanningMode(mode) {
   // with nothing between departure and destination. Adopting them is the whole
   // reason the planner writes them into the list in the first place.
   if (mode === 'manual') {
+    const drawn = pilotLegs();
     route = route.map((w) => (w.generated
-      ? { ...w, generated: false, kind: 'waypoint' }
+      ? { ...w, generated: false, kind: 'waypoint', id: newId() }
       : w));
+    // Each drawn leg is now several; what was typed on it holds on each part.
+    for (const leg of drawn) {
+      const first = route.indexOf(leg.from);
+      const last = route.indexOf(leg.to);
+      const parts = route.slice(first, last + 1);
+      const keys = parts.slice(1).map((w, i) => `${parts[i].id}>${w.id}`);
+      if (keys.length > 1) copyEdits(leg.key, keys);
+    }
   }
   // In user-driven mode the profile comes from the declared segments, so the
   // cruise altitude is no longer what the aeroplane aims for.
@@ -2851,7 +3372,109 @@ function setPlanningMode(mode) {
   onRouteChanged();
 }
 
-$('mode-auto').addEventListener('click', () => setPlanningMode('auto'));
+$('mode-hybrid').addEventListener('click', () => setPlanningMode('hybrid'));
+
+// --- saved missions -----------------------------------------------------
+//
+// A mission is what the pilot decided -- the fixes, each leg's events and
+// edits, the flight's settings -- and never what was worked out from it. It
+// travels in the exported KML (see `engine/mission.py`). Loading one puts the
+// plan back exactly and plans it again; "Get weather" then re-solves it in
+// the day's forecast, and the tops and bottoms of climb move to wherever the
+// new wind puts them.
+
+/** The solve the loaded mission was saved with, for `sinceSaved`. */
+let savedSolve = null;
+
+const MISSION_FIELDS = [
+  ['cruise_altitude_ft', 'altitude'], ['cruise_rpm', 'rpm'], ['weight_lb', 'weight'],
+  ['fuel_on_board_gal', 'fuel'], ['altimeter_inhg', 'altimeter'], ['isa_deviation_c', 'isadev'],
+];
+
+function restoreMission(mission, snapshot) {
+  setEventPick(null);
+  for (const [key, id] of MISSION_FIELDS) {
+    if (mission[key] != null) $(id).value = mission[key];
+  }
+  $('night').checked = !!mission.night;
+  if (mission.runway_margin != null) $('runway-margin').value = Math.round(mission.runway_margin * 100);
+  if (mission.fuel_margin != null) $('fuel-margin').value = Math.round(mission.fuel_margin * 100);
+  // The departure time is left as the pilot has it now: the saved one is
+  // usually yesterday's guess, and the point of loading is to plan today.
+  route = mission.waypoints
+    .filter((w) => !w.generated)
+    .map((w) => ({ ...w, events: (w.events || []).map((e) => ({ ...e })) }));
+  segmentEdits = new Map();
+  for (const { segment_key, phase, ...fields } of mission.segment_overrides || []) {
+    const typed = Object.fromEntries(Object.entries(fields).filter(([, v]) => v != null));
+    if (Object.keys(typed).length) segmentEdits.set(editKey(segment_key, phase), typed);
+  }
+  $('reset-edits').hidden = segmentEdits.size === 0;
+  savedSolve = snapshot || null;
+  // Set the mode without its side effects: the route is already the saved one.
+  planningMode = mission.planning_mode === 'manual' ? 'manual' : 'hybrid';
+  $('mode-hybrid').setAttribute('aria-pressed', String(planningMode === 'hybrid'));
+  $('mode-manual').setAttribute('aria-pressed', String(planningMode === 'manual'));
+  $('altitude-label').firstChild.textContent =
+    planningMode === 'manual' ? 'Target cruise altitude ' : 'Cruise altitude ';
+  $('altitude').disabled = planningMode === 'manual';
+  // The field reports were not saved -- they are fetched again -- so the
+  // provenance lines for the old ones go too.
+  fieldWx = new Map();
+  onRouteChanged();
+  fitRoute();
+  flashButton($('get-weather'), 'Get weather for today');
+}
+
+/** One line on what the day's plan changed against the saved one, or null.
+ *
+ *  Totals, and each top or bottom of climb and descent by how far it moved
+ *  along the route -- matched by the leg it is on and its place among that
+ *  leg's points of the same kind, since its name can change as others come
+ *  and go. */
+function sinceSaved(plan) {
+  if (!savedSolve || !plan?.ok) return null;
+  const t = plan.totals;
+  const parts = [];
+  const dt = t.time_min - savedSolve.total_time_min;
+  const df = t.fuel_gal - savedSolve.total_fuel_gal;
+  if (Math.abs(dt) >= 0.5) parts.push(`ETE ${dt > 0 ? '+' : ''}${dt.toFixed(0)} min`);
+  if (Math.abs(df) >= 0.1) parts.push(`fuel ${df > 0 ? '+' : ''}${df.toFixed(1)} gal`);
+  // Every top and bottom on the route, where it falls: a row's end role is
+  // at its end, and a top of descent -- carried as the descent's start role --
+  // at the end of the row before it.
+  const points = (rows) => {
+    const seen = new Map();
+    const out = new Map();
+    let before = 0;
+    for (const row of rows) {
+      for (const [role, name, at] of [
+        [row.start_role, row.from, before], [row.end_role, row.to, row.cumulative_distance_nm]]) {
+        if (!role || !row.segment_key) continue;
+        const tag = `${row.segment_key}|${role}`;
+        const n = (seen.get(tag) || 0) + 1;
+        seen.set(tag, n);
+        out.set(`${tag}|${n}`, { label: legLabel(name, role), at });
+      }
+      before = row.cumulative_distance_nm;
+    }
+    return out;
+  };
+  const was = points(savedSolve.rows);
+  const now = points(plan.legs.filter((l) => l.covers_ground));
+  for (const [key, point] of now) {
+    const then = was.get(key);
+    if (!then) continue;
+    const moved = point.at - then.at;
+    if (Math.abs(moved) >= 0.3) {
+      parts.push(`${point.label} ${Math.abs(moved).toFixed(1)} nm ${moved > 0 ? 'later' : 'earlier'}`);
+    }
+  }
+  const when = savedSolve.solved_at ? ` (saved ${zuluDate(savedSolve.solved_at)})` : '';
+  return parts.length
+    ? `Since the saved plan${when}: ${parts.join(', ')}.`
+    : `Same as the saved plan${when}.`;
+}
 $('mode-manual').addEventListener('click', () => setPlanningMode('manual'));
 
 // --- navlog consistency -------------------------------------------------
@@ -3211,3 +3834,96 @@ function setE6bHidden(hidden) {
 $('e6b-toggle').addEventListener('click', () => {
   setE6bHidden(!document.getElementById('app').classList.contains('e6b-hidden'));
 });
+
+$('wind-scope').addEventListener('change', () => { windScope = $('wind-scope').value; });
+
+// --- the navigation log's height ----------------------------------------
+//
+// The log and the map share the middle column, and which needs the room
+// changes through planning: the map while the route is drawn, the log once
+// it is being read. So the split is the pilot's to drag. The height is kept
+// between visits; the map is told whenever its container changes size, or its
+// canvas stays the old one.
+
+const NAVLOG_HEIGHT_KEY = 'e6b.navlogHeight';
+const NAVLOG_DEFAULT_PX = 260;
+const NAVLOG_MIN_PX = 120;
+// The map is never squeezed below this: enough to see where the route goes.
+const MAP_MIN_PX = 90;
+
+function navlogMaxPx() {
+  return Math.max(NAVLOG_MIN_PX, $('app').getBoundingClientRect().height - MAP_MIN_PX);
+}
+
+function navlogHeightPx() {
+  return $('navlog-wrap').getBoundingClientRect().height;
+}
+
+let mapResizeFrame = 0;
+function setNavlogHeight(px, { save = true } = {}) {
+  const height = Math.round(Math.min(navlogMaxPx(), Math.max(NAVLOG_MIN_PX, px)));
+  $('app').style.setProperty('--navlog-h', `${height}px`);
+  const expanded = height >= navlogMaxPx() - 4;
+  const button = $('navlog-size');
+  button.textContent = expanded ? '▼ Restore' : '▲ Expand';
+  button.title = expanded
+    ? 'Give the map its space back'
+    : 'Give the navigation log most of the screen';
+  $('navlog-resize').setAttribute('aria-valuenow', String(height));
+  if (save) {
+    try { localStorage.setItem(NAVLOG_HEIGHT_KEY, String(height)); } catch { /* private mode */ }
+  }
+  cancelAnimationFrame(mapResizeFrame);
+  mapResizeFrame = requestAnimationFrame(() => map.resize());
+}
+
+/** Tallest if it is not already, the default if it is. */
+function toggleNavlogExpanded() {
+  const expanded = navlogHeightPx() >= navlogMaxPx() - 4;
+  setNavlogHeight(expanded ? NAVLOG_DEFAULT_PX : navlogMaxPx());
+}
+
+{
+  const grip = $('navlog-resize');
+  let drag = null;
+  grip.addEventListener('pointerdown', (event) => {
+    drag = { y: event.clientY, start: navlogHeightPx() };
+    grip.setPointerCapture(event.pointerId);
+    document.body.classList.add('resizing-navlog');
+    event.preventDefault();
+  });
+  grip.addEventListener('pointermove', (event) => {
+    if (!drag) return;
+    // Up is taller: the log grows into the map.
+    setNavlogHeight(drag.start + (drag.y - event.clientY), { save: false });
+  });
+  const release = () => {
+    if (!drag) return;
+    drag = null;
+    document.body.classList.remove('resizing-navlog');
+    setNavlogHeight(navlogHeightPx());
+  };
+  grip.addEventListener('pointerup', release);
+  grip.addEventListener('pointercancel', release);
+  grip.addEventListener('dblclick', toggleNavlogExpanded);
+  grip.addEventListener('keydown', (event) => {
+    const step = event.shiftKey ? 120 : 40;
+    if (event.key === 'ArrowUp') setNavlogHeight(navlogHeightPx() + step);
+    else if (event.key === 'ArrowDown') setNavlogHeight(navlogHeightPx() - step);
+    else if (event.key === 'Home') setNavlogHeight(navlogMaxPx());
+    else if (event.key === 'End') setNavlogHeight(NAVLOG_MIN_PX);
+    else return;
+    event.preventDefault();
+  });
+  $('navlog-size').addEventListener('click', toggleNavlogExpanded);
+
+  let saved = NaN;
+  try { saved = Number(localStorage.getItem(NAVLOG_HEIGHT_KEY)); } catch { /* private mode */ }
+  if (Number.isFinite(saved) && saved > 0) setNavlogHeight(saved, { save: false });
+
+  // A smaller window must not leave the map with nothing: re-clamp.
+  window.addEventListener('resize', () => {
+    const style = $('app').style.getPropertyValue('--navlog-h');
+    if (style) setNavlogHeight(parseFloat(style), { save: false });
+  });
+}

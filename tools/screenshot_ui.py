@@ -5,7 +5,7 @@
 Exists because the map is the one part of this project that unit tests cannot
 reach: MapLibre needs WebGL, and a broken layer style or a typo'd colour fails
 silently at runtime rather than at import. This adds a route, declares its
-leg in the default user-driven mode, hands it back to the planner, and saves
+leg in the default user-driven mode, hands it back to the hybrid planner, and saves
 images plus any console errors.
 
 Uses the system Chrome via Playwright's `channel="chrome"` so no extra browser
@@ -87,7 +87,7 @@ def main() -> int:
         # The rest exercises the planner. Handing the leg back to it needs both
         # the mode switch and the leg's own type cleared -- a declared leg stays
         # declared in either mode.
-        page.click("#mode-auto")
+        page.click("#mode-hybrid")
         page.wait_for_timeout(400)
         page.locator("#waypoints select.segment").last.select_option("automatic")
 

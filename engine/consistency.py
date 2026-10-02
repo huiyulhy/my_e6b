@@ -210,10 +210,12 @@ def _check_declared_vs_actual(ctx: _Context) -> list[Finding]:
 
 
 def _check_arrival_altitude(ctx: _Context) -> list[Finding]:
-    """The last leg of each flight must arrive at the field.
+    """The last leg of each flight must arrive at the field's pattern.
 
     Checked per flight, not just once, because every intermediate landing on a
-    multi-stop day has to arrive somewhere too.
+    multi-stop day has to arrive somewhere too. The descent ends at traffic
+    pattern altitude, and the pattern row after it is flown there -- so that
+    row is the witness to what "arrived" means for this field.
     """
     findings: list[Finding] = []
     flying = ctx.flying
@@ -224,14 +226,21 @@ def _check_arrival_altitude(ctx: _Context) -> list[Finding]:
     for index, leg in flying:
         last_of_flight[leg.flight_index] = (index, leg)
 
+    legs = ctx.navlog.legs
     for index, leg in last_of_flight.values():
         if leg.exit_altitude_ft is None:
             continue
-        # The elevation is not on the row, so the pattern row that follows is
-        # the only local witness to the field. Compare against sea level only
-        # when there is nothing better -- an arrival still at cruise is worth
-        # flagging regardless.
-        if leg.exit_altitude_ft > 1.0 and leg.segment_type != "descent":
+        pattern = next(
+            (
+                row
+                for row in legs[index + 1 :]
+                if row.phase == "pattern" and row.flight_index == leg.flight_index
+            ),
+            None,
+        )
+        arrival = pattern.altitude_ft if pattern is not None else 0.0
+        # Within a couple of hundred feet of the pattern is arriving in it.
+        if leg.exit_altitude_ft > arrival + 200.0:
             findings.append(
                 Finding(
                     severity="warning",
@@ -239,7 +248,8 @@ def _check_arrival_altitude(ctx: _Context) -> list[Finding]:
                     message=(
                         f"the last leg into {leg.to_name} is a "
                         f"{leg.segment_type} ending at {leg.exit_altitude_ft:.0f} ft; "
-                        f"an arrival is normally a descent to field elevation"
+                        f"an arrival is a descent to pattern altitude "
+                        f"({arrival:.0f} ft)"
                     ),
                     row=index,
                 )

@@ -697,3 +697,287 @@ class TestRowWindReachesTheProfile:
         typed = nl.TypedWind(nl.WindsAloft.calm(), from_deg=270.0, speed_kt=20.0)
         for altitude in (0.0, 3000.0, 9500.0, 14000.0):
             assert typed.at(altitude) == nl.Wind(270.0, 20.0)
+
+
+# --- hybrid: events pin one end of a change, the wind moves the other ------
+
+
+def point_along(start, end, nm):
+    return pr.inverse(start.position, end.position).point_at_nm(nm)
+
+
+def along(start, point):
+    return pr.inverse(start.position, point.position).distance_nm
+
+
+def with_events(end, start, *events):
+    """`end` carrying `(kind, nm along the leg from start, target)` events."""
+    return replace(
+        end,
+        events=tuple(
+            pr.VerticalEvent(kind, point_along(start, end, nm), target)
+            for kind, nm, target in events
+        ),
+    )
+
+
+def course_wind(start, end, *, head):
+    course = pr.inverse(start.position, end.position).true_course_deg
+    from_deg = course if head else (course + 180.0) % 360.0
+    return replace(CALM, winds=nl.WindsAloft.uniform(from_deg, 25.0))
+
+
+def generated(route):
+    return {w.name: w for w in route if w.generated}
+
+
+class TestVerticalEvents:
+    def test_hybrid_is_the_mode_and_auto_still_means_it(self):
+        assert pr.normalise_planning_mode("auto") == "hybrid"
+        assert pr.normalise_planning_mode("hybrid") == "hybrid"
+        assert resolve([KSQL, KMRY], mode="hybrid") == resolve([KSQL, KMRY], mode="auto")
+
+    def test_a_start_event_pins_the_bottom_of_climb(self):
+        """Under a shelf: up to 2500 at once, then climb only after 25 nm."""
+        end = with_events(KMRY, KSQL, ("complete", 10, 2500), ("start", 25, 6500))
+        points = generated(resolve([KSQL, end]))
+        assert list(points) == ["TOC", "BOC", "TOC2", "TOD"]
+        assert along(KSQL, points["BOC"]) == pytest.approx(25.0, abs=0.05)
+        assert points["BOC"].altitude_ft == pytest.approx(2500)
+        assert along(KSQL, points["TOC2"]) > 25.0
+        assert points["TOC2"].altitude_ft == pytest.approx(6500)
+
+    def test_off_the_runway_a_level_off_is_climbed_to_at_once(self):
+        end = with_events(KMRY, KSQL, ("complete", 10, 2500))
+        toc = generated(resolve([KSQL, end]))["TOC"]
+        assert along(KSQL, toc) < 10.0
+
+    def test_a_complete_event_pins_the_top_of_climb(self):
+        end = with_events(KMRY, KSQL, ("complete", 8, 2500), ("complete", 35, 6500))
+        points = generated(resolve([KSQL, end]))
+        assert along(KSQL, points["TOC2"]) == pytest.approx(35.0, abs=0.05)
+        assert along(KSQL, points["BOC"]) < 35.0
+
+    def test_a_headwind_lets_the_climb_start_later(self):
+        """Fewer ground miles per minute of climb: the floating BOC moves
+        toward the point it is pinned to."""
+        end = with_events(KMRY, KSQL, ("complete", 8, 2500), ("complete", 35, 6500))
+        head = generated(resolve([KSQL, end], conditions=course_wind(KSQL, KMRY, head=True)))
+        tail = generated(resolve([KSQL, end], conditions=course_wind(KSQL, KMRY, head=False)))
+        assert along(KSQL, head["BOC"]) > along(KSQL, tail["BOC"])
+        assert along(KSQL, head["TOC2"]) == pytest.approx(along(KSQL, tail["TOC2"]), abs=0.05)
+
+    def test_a_headwind_brings_a_floating_top_of_climb_closer(self):
+        end = with_events(KMRY, KSQL, ("complete", 8, 2500), ("start", 20, 6500))
+        head = generated(resolve([KSQL, end], conditions=course_wind(KSQL, KMRY, head=True)))
+        tail = generated(resolve([KSQL, end], conditions=course_wind(KSQL, KMRY, head=False)))
+        assert along(KSQL, head["TOC2"]) < along(KSQL, tail["TOC2"])
+        assert along(KSQL, head["BOC"]) == pytest.approx(20.0, abs=0.05)
+
+    def test_an_impossible_level_off_says_how_short_it_is(self):
+        end = with_events(KMRY, KSQL, ("complete", 3, 2000), ("complete", 8, 9500))
+        warnings: list[str] = []
+        route = pr.resolve_route(
+            [KSQL, end], mode="hybrid", cruise_altitude_ft=7500,
+            departure_elevation=5.0, destination_elevation=257.0,
+            aircraft=nl.Aircraft(), conditions=CALM, names=pr.PhaseNamer(),
+            warnings=warnings,
+        )
+        assert any("cannot climb to 9,500 ft" in w and "short" in w for w in warnings)
+        # Short of it at the point: the climb stops where the book says it
+        # gets to by then, pinned at the point, well below what was asked.
+        top = generated(route)["TOC"]
+        assert along(KSQL, top) == pytest.approx(8.0, abs=0.05)
+        assert top.altitude_ft < 9500
+
+    def test_step_climbs_on_one_leg(self):
+        end = with_events(
+            KMRY, KSQL, ("complete", 5, 2000), ("start", 15, 4500), ("start", 30, 6500)
+        )
+        names = list(generated(resolve([KSQL, end])))
+        assert names == ["TOC", "BOC", "TOC2", "BOC2", "TOC3", "TOD"]
+
+    def test_an_event_target_holds_down_route(self):
+        """The last target on a leg is the plateau after it, as a crossing
+        altitude is: the next leg does not climb back to the cruise altitude."""
+        mid = with_events(VPWDM, KSQL, ("complete", 5, 4500))
+        route = resolve([KSQL, mid, KMRY], altitude=7500)
+        assert max(w.altitude_ft or 0 for w in route if w.generated) == pytest.approx(4500)
+
+    def test_the_resolved_route_builds_one_segment_per_leg(self):
+        end = with_events(KMRY, KSQL, ("complete", 10, 2500), ("start", 25, 6500))
+        resolved = resolve([KSQL, end])
+        built = segments(resolved)
+        assert len(built) == len(resolved) - 1
+        roles = [s.end_role for s in built]
+        assert roles[:3] == ["TOC", "BOC", "TOC"]
+        for a, b in pairwise(built):
+            assert a.exit_altitude_ft == pytest.approx(b.entry_altitude_ft)
+
+    def test_generated_points_know_their_drawn_leg(self):
+        start = replace(KSQL, id="a")
+        end = replace(with_events(KMRY, KSQL, ("complete", 10, 2500)), id="b")
+        assert {w.segment_key for w in resolve([start, end]) if w.generated} == {"a>b"}
+
+    def test_an_event_off_the_end_of_the_leg_is_said_out_loud(self):
+        beyond = pr.inverse(KSQL.position, KMRY.position).point_at_nm(80)
+        end = replace(KMRY, events=(pr.VerticalEvent("complete", beyond, 3000),))
+        warnings: list[str] = []
+        pr.resolve_route(
+            [KSQL, end], mode="hybrid", cruise_altitude_ft=7500,
+            departure_elevation=5.0, destination_elevation=257.0,
+            aircraft=nl.Aircraft(), conditions=CALM, names=pr.PhaseNamer(),
+            warnings=warnings,
+        )
+        assert any("beyond the end" in w for w in warnings)
+
+    def test_a_start_event_on_the_runway_asks_for_a_level_off(self):
+        end = with_events(KMRY, KSQL, ("start", 10, 4500))
+        warnings: list[str] = []
+        pr.resolve_route(
+            [KSQL, end], mode="hybrid", cruise_altitude_ft=7500,
+            departure_elevation=5.0, destination_elevation=257.0,
+            aircraft=nl.Aircraft(), conditions=CALM, names=pr.PhaseNamer(),
+            warnings=warnings,
+        )
+        assert any("field elevation" in w for w in warnings)
+
+    def test_user_driven_mode_ignores_events(self):
+        end = declare(with_events(KMRY, KSQL, ("start", 10, 4500)), "cruise")
+        assert not any(w.generated for w in resolve([KSQL, end], mode="manual"))
+
+    def test_events_survive_a_replan(self):
+        end = with_events(KMRY, KSQL, ("complete", 10, 2500), ("start", 25, 6500))
+        once = resolve([KSQL, end])
+        assert [w.name for w in resolve(once)] == [w.name for w in once]
+
+
+class TestBookClimbInTheProfile:
+    def test_the_bands_inside_a_climb_are_not_each_rounded(self):
+        """The climb is integrated in 1000 ft bands of *indicated* altitude,
+        whose edges fall off the table's pressure-altitude rows under any
+        altimeter setting. Rounding each band out to the rows doubled the
+        climb: 27 min to 7500 ft where the book says 14."""
+        for altimeter in (29.92, 30.12, 29.70):
+            conditions = replace(CALM, altimeter_inhg=altimeter)
+            log = nl.build_navlog([KSQL, KMRY], 7500, conditions=conditions, planning_mode="hybrid")
+            climb = next(leg for leg in log.legs if leg.phase == "climb")
+            book = nl.perf.climb_from_to(
+                conditions.pressure_altitude_ft(climb.entry_altitude_ft),
+                conditions.pressure_altitude_ft(climb.exit_altitude_ft),
+            )
+            assert climb.ete_min == pytest.approx(book.time_min, rel=0.02), altimeter
+
+
+class TestALevelOffTheWindPushesPast:
+    def test_a_tailwind_that_carries_the_climb_past_the_point_is_said_out_loud(self):
+        """Start at 10 nm, be level by 20 nm. In a strong tailwind the climb
+        from the first event is still going at the second's point."""
+        end = with_events(KMRY, KSQL, ("complete", 5, 2500), ("start", 10, 7500), ("complete", 20, 7500))
+        warnings: list[str] = []
+        pr.resolve_route(
+            [KSQL, end], mode="hybrid", cruise_altitude_ft=7500,
+            departure_elevation=5.0, destination_elevation=257.0, aircraft=nl.Aircraft(),
+            conditions=course_wind(KSQL, KMRY, head=False), names=pr.PhaseNamer(),
+            warnings=warnings,
+        )
+        assert any("not at 7,500 ft by the point 20.0 nm" in w for w in warnings)
+
+    def test_in_calm_air_it_is_met_and_nothing_is_said(self):
+        end = with_events(KMRY, KSQL, ("complete", 5, 2500), ("start", 10, 7500), ("complete", 30, 7500))
+        warnings: list[str] = []
+        pr.resolve_route(
+            [KSQL, end], mode="hybrid", cruise_altitude_ft=7500,
+            departure_elevation=5.0, destination_elevation=257.0, aircraft=nl.Aircraft(),
+            conditions=CALM, names=pr.PhaseNamer(), warnings=warnings,
+        )
+        assert not any("not at" in w for w in warnings)
+
+
+class TestOneDescentNotTwo:
+    """jcn99 to KMOD once flew descent, 0.3 nm level, descent: the backward
+    pass estimated the descent from the airspeed and wind at its bottom only,
+    the forward pass integrated it band by band, and the gap between the two
+    became a step in the descent."""
+
+    VPALT = nl.Waypoint("VPALT", LatLon(37.73916666, -121.59027777), "vfr_waypoint", altitude_ft=5500)
+    JCN = nl.Waypoint("jcn99", LatLon(37.8121, -121.1821), "waypoint")
+    KMOD = nl.Waypoint("KMOD", LatLon(37.6511, -120.9776), "airport", elevation_ft=99.2)
+    SHEAR = replace(CALM, winds=nl.WindsAloft(((0.0, nl.Wind(250, 10)), (6000.0, nl.Wind(300, 35)))))
+
+    def rows(self, route, conditions):
+        log = nl.build_navlog(route, 5500, conditions=conditions, planning_mode="hybrid")
+        return log, [leg for leg in log.legs if leg.covers_ground]
+
+    def test_no_level_step_inside_the_descent(self):
+        for conditions in (CALM, self.SHEAR):
+            _, rows = self.rows([KSQL, self.VPALT, self.JCN, self.KMOD], conditions)
+            phases = [leg.phase for leg in rows]
+            first = phases.index("descent")
+            assert all(p == "descent" for p in phases[first:]), phases
+
+    def test_the_descent_arrives_at_pattern_altitude(self):
+        for conditions in (CALM, self.SHEAR):
+            _, rows = self.rows([KSQL, self.VPALT, self.JCN, self.KMOD], conditions)
+            assert rows[-1].exit_altitude_ft == pytest.approx(1100, abs=5)
+
+    def test_a_crossing_altitude_that_forces_a_late_descent_says_so(self):
+        log, rows = self.rows([KSQL, self.VPALT, replace(self.JCN, altitude_ft=5500), self.KMOD], CALM)
+        last = [leg for leg in rows if leg.from_name == "jcn99"]
+        assert [leg.phase for leg in last] == ["descent"]
+        assert any("the descent to 1,100 ft needs" in w for w in log.warnings)
+
+
+class TestWhatThePlannerAddsToALeg:
+    """On its own the planner cuts a leg into at most three pieces -- a change,
+    level, a change -- and never two changes the same way with level between
+    them. A step like that is the pilot's to ask for, with events."""
+
+    VPALT = nl.Waypoint("VPALT", LatLon(37.73916666, -121.59027777), "vfr_waypoint", id="alt")
+    JCN = nl.Waypoint("jcn99", LatLon(37.8121, -121.1821), "waypoint", id="jcn")
+    KMOD = nl.Waypoint("KMOD", LatLon(37.6511, -120.9776), "airport", elevation_ft=99.2, id="kmod")
+    ROUTES = (
+        [replace(KSQL, id="sql"), replace(KMRY, id="mry")],
+        [replace(KSQL, id="sql"), replace(KSBP, id="sbp")],
+        [replace(KSQL, id="sql"), replace(VPWDM, id="wdm"), replace(KMRY, id="mry")],
+        [replace(KSQL, id="sql"), VPALT, JCN, KMOD],
+    )
+    WINDS = (
+        CALM,
+        replace(CALM, winds=nl.WindsAloft(((0.0, nl.Wind(250, 10)), (6000.0, nl.Wind(300, 35))))),
+        replace(CALM, winds=nl.WindsAloft.uniform(150, 30)),
+        replace(CALM, winds=nl.WindsAloft.uniform(330, 30)),
+    )
+
+    def by_leg(self, route, conditions, altitude):
+        log = nl.build_navlog(route, altitude, conditions=conditions, planning_mode="hybrid")
+        legs: dict[str, list[str]] = {}
+        for leg in log.legs:
+            if leg.covers_ground:
+                legs.setdefault(leg.segment_key, []).append(leg.phase)
+        return legs
+
+    def test_at_most_three_pieces_and_no_step(self):
+        for route in self.ROUTES:
+            for conditions in self.WINDS:
+                for altitude in (4500, 5500, 7500):
+                    for key, phases in self.by_leg(route, conditions, altitude).items():
+                        where = (key, altitude, phases)
+                        assert len(phases) <= 3, where
+                        for a, b, c in zip(phases, phases[1:], phases[2:]):
+                            assert not (a == c != "cruise" and b == "cruise"), where
+
+    def test_a_step_descent_the_pilot_asks_for_is_kept(self):
+        """Up to 5500 by 12 nm, down to 3500 from 30 nm and level there, then
+        the descent in: descent, level, descent, because the pilot said so."""
+        start = replace(KSQL, id="sql")
+        end = replace(
+            KMRY, id="mry",
+            events=(
+                pr.VerticalEvent("complete", point_along(KSQL, KMRY, 12), 5500),
+                pr.VerticalEvent("start", point_along(KSQL, KMRY, 30), 3500),
+            ),
+        )
+        phases = self.by_leg([start, end], CALM, 5500)["sql>mry"]
+        # climb out, level at 5500, the step down, level at 3500, the descent in
+        assert phases == ["climb", "cruise", "descent", "cruise", "descent"]

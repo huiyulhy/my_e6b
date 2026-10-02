@@ -1,43 +1,9 @@
 """The route as a KML file, and a KML file back into a route.
 
-KML is what Google Earth, ForeFlight, SkyVector and most everything else with
-a map will open, so it is the format a plan leaves this program in to be
-looked at somewhere else -- and the format a set of waypoints drawn somewhere
-else arrives in. The same file serves both directions: a route exported here
-imports back as the same route, so a cross-country flown every month need only
-be drawn once.
-
-Three decisions about the format, each of which the reader on the other side
-depends on:
-
-* **The coordinates carry the planned altitude, not the constraint.** A KML
-  point is `lon,lat,alt`, and a viewer draws it there. The altitude written is
-  the one the navlog says the aeroplane is at over that point -- the top of
-  climb at cruise, the destination at field elevation -- so that Google Earth
-  shows the vertical profile actually planned. The pilot's own "cross here at"
-  constraint is a different thing, usually absent, and goes in `ExtendedData`
-  below. KML altitudes are metres above sea level (`altitudeMode absolute`);
-  the planner's are feet MSL, and the conversion is the atmosphere module's.
-* **What the planner needs to rebuild the route rides in `ExtendedData`.** The
-  kind of point, what the leg arriving at it does, whether the flight lands
-  there, and that crossing constraint: none of it is geometry, and a viewer
-  ignores it. On import it is what separates "this file came from here, restore
-  it exactly" from "these are somebody's placemarks, take the positions and ask
-  about the rest". Without it, importing our own export would freeze every
-  planned altitude into a hard constraint and a re-plan would no longer be
-  free to move the top of climb.
-* **The planner's own points are exported and not imported.** A TOC or TOD is
-  in the file because the profile in a viewer is wrong without it, and is
-  marked as generated so that import drops it: the planner re-derives them from
-  the pilot's points and would otherwise be handed two of each.
-
-The parser is deliberately loose about whose KML it is reading. Namespaces are
-ignored, a `Placemark` with a `Point` is a waypoint, and a file with only a
-`LineString` (a path drawn in Google Earth) is a waypoint per vertex. It is
-deliberately strict about one thing: the file is untrusted input, and an XML
-parser given a document type declaration will expand whatever entities it
-declares. There is no legitimate KML with a DTD, so any is refused before the
-parser sees it.
+Stores the mission as a KML format to be reloaded
+constraints:
+- LLA (BOC or BOD or TOC or TOD)
+- What the planner needs to rebuild: weather per segment
 """
 
 from __future__ import annotations
@@ -47,13 +13,24 @@ import math
 import re
 import xml.etree.ElementTree as ET
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
+from engine import mission as ms
 from engine.atmosphere import FT_PER_M, M_PER_FT
 from engine.geo import MAX_LATITUDE_DEG
 from engine.navlog import Navlog, Waypoint
 
-__all__ = ["ImportedWaypoint", "KmlError", "kml_filename", "parse_kml", "route_kml"]
+__all__ = [
+    "ImportedWaypoint",
+    "KmlError",
+    "KmlFile",
+    "kml_filename",
+    "mission_kml",
+    "parse_kml",
+    "read_kml",
+    "route_kml",
+]
 
 KML_NS = "http://www.opengis.net/kml/2.2"
 
@@ -94,21 +71,72 @@ class ImportedWaypoint:
     from_extended_data: bool = False
 
 
+@dataclass(frozen=True)
+class KmlFile:
+    """Everything read out of a file: the route, and our mission if it has one.
+
+    `mission` is the plan request the file was exported from, and `snapshot`
+    the solve it was exported with. A mission this version cannot read is not
+    fatal -- the placemarks are still a route -- so it comes back as
+    `mission_error` beside the waypoints rather than as a refusal.
+    """
+
+    waypoints: list[ImportedWaypoint]
+    mission: dict[str, Any] | None = None
+    snapshot: dict[str, Any] | None = None
+    warnings: list[str] = field(default_factory=list)
+
+
 # --- export ----------------------------------------------------------------
 
 
-def route_kml(navlog: Navlog) -> str:
+def route_kml(
+    navlog: Navlog, *, mission: str | None = None, snapshot: str | None = None
+) -> str:
     """The resolved route as a KML document: a placemark per waypoint at its
-    planned altitude, and the route as a line through them."""
-    points = navlog.resolved_waypoints
+    planned altitude, and the route as a line through them.
+
+    `mission` and `snapshot` are `engine.mission` JSON, carried in the
+    document's own `ExtendedData` when given."""
+    points = list(navlog.resolved_waypoints)
     if not points:
         raise KmlError("the plan has no waypoints to export")
-    altitudes = _planned_altitudes(navlog)
+    return _document(points, _planned_altitudes(navlog), mission=mission, snapshot=snapshot)
 
+
+def mission_kml(waypoints: list[Waypoint], *, mission: str) -> str:
+    """The pilot's own points and the mission, for a plan that does not solve.
+
+    A mission that cannot be planned today -- a leg too short for its climb,
+    a wind too strong -- is still worth saving: tomorrow's weather may fly it.
+    With no profile the points sit at their crossing altitude where they have
+    one and on the ground where they do not.
+    """
+    points = [w for w in waypoints if not w.generated]
+    if not points:
+        raise KmlError("the mission has no waypoints to export")
+    altitudes = [
+        w.altitude_ft if w.altitude_ft is not None else (w.elevation_ft or 0.0) for w in points
+    ]
+    return _document(points, altitudes, mission=mission, snapshot=None)
+
+
+def _document(
+    points: list[Waypoint],
+    altitudes: list[float],
+    *,
+    mission: str | None,
+    snapshot: str | None,
+) -> str:
     ET.register_namespace("", KML_NS)
     root = ET.Element(_tag("kml"))
     document = _child(root, "Document")
     _child(document, "name", f"{points[0].name} to {points[-1].name}")
+    if mission is not None or snapshot is not None:
+        data = _child(document, "ExtendedData")
+        for key, value in (("mission", mission), ("snapshot", snapshot)):
+            if value is not None:
+                _child(_child(data, "Data", name=DATA_PREFIX + key), "value", value)
     for style, colour in (("airport", "ff2ad4ff"), ("waypoint", "ffffffff"), ("phase", "ff9a9a9a")):
         node = _child(document, "Style", id=style)
         icon = _child(node, "IconStyle")
@@ -234,6 +262,38 @@ def parse_kml(data: bytes) -> list[ImportedWaypoint]:
     line is a waypoint per vertex of the first line, named `WP1`, `WP2`...
     Points the planner itself inserted are dropped: it will insert them again.
     """
+    return read_kml(data).waypoints
+
+
+def read_kml(data: bytes) -> KmlFile:
+    """`parse_kml`, plus the mission and snapshot if the file carries them."""
+    root = _parse(data)
+    waypoints = [w for w in _placemark_points(root) if w is not None]
+    if not waypoints:
+        waypoints = _line_points(root)
+    if not waypoints:
+        raise KmlError("no placemarks or paths found in the file")
+    for waypoint in waypoints:
+        _check(waypoint)
+
+    stored = _document_data(root)
+    mission = snapshot = None
+    warnings: list[str] = []
+    if "mission" in stored:
+        try:
+            mission = ms.parse_mission(stored["mission"])
+        except ms.MissionError as exc:
+            warnings.append(f"{exc}; only the route was imported.")
+    if mission is not None and "snapshot" in stored:
+        try:
+            snapshot = ms.parse_snapshot(stored["snapshot"])
+        except ms.MissionError:
+            # Only ever used to say what changed; without it nothing is lost.
+            snapshot = None
+    return KmlFile(waypoints=waypoints, mission=mission, snapshot=snapshot, warnings=warnings)
+
+
+def _parse(data: bytes) -> ET.Element:
     text = _unwrap(data)
     if len(text) > MAX_BYTES:
         raise KmlError(f"file is larger than {MAX_BYTES // (1024 * 1024)} MB")
@@ -243,18 +303,15 @@ def parse_kml(data: bytes) -> list[ImportedWaypoint]:
     if re.search(rb"<!\s*DOCTYPE", text, re.IGNORECASE):
         raise KmlError("file declares a document type, which KML never does")
     try:
-        root = ET.fromstring(text)
+        return ET.fromstring(text)
     except ET.ParseError as exc:
         raise KmlError(f"not well-formed XML: {exc}") from None
 
-    waypoints = [w for w in _placemark_points(root) if w is not None]
-    if not waypoints:
-        waypoints = _line_points(root)
-    if not waypoints:
-        raise KmlError("no placemarks or paths found in the file")
-    for waypoint in waypoints:
-        _check(waypoint)
-    return waypoints
+
+def _document_data(root: ET.Element) -> dict[str, str]:
+    """Our fields on the `Document` itself, as opposed to on a placemark."""
+    document = next((n for n in root.iter() if _local(n) == "Document"), None)
+    return {} if document is None else _extended_data(document)
 
 
 def _unwrap(data: bytes) -> bytes:

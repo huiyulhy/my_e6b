@@ -38,9 +38,9 @@
     <section class="block">
       <h2>Flight</h2>
       <div class="mode-toggle" role="group" aria-label="Planning mode">
-        <button id="mode-auto" type="button" aria-pressed="false"
-                title="The planner places top of climb and top of descent for you">
-          Automatic
+        <button id="mode-hybrid" type="button" aria-pressed="false"
+                title="The planner places the tops and bottoms of climb and descent for you, around any events you pin to a leg — “start climb here”, “level by here”. They move with the wind; your fixes and edits stay put.">
+          Hybrid
         </button>
         <button id="mode-manual" type="button" aria-pressed="true"
                 title="You declare what each leg does; altitudes follow from performance">
@@ -134,6 +134,27 @@
   <main id="map-wrap">
     <div id="map"></div>
     <div id="status" class="status">Loading…</div>
+    <!-- The navlog as the CSV export holds it, pulled down over the map.
+         Half the screen tall at most: the whole log fits, and the route
+         stays in view beneath it. -->
+    <section id="csv-drawer" class="csv-drawer" aria-label="Navlog (CSV)" hidden>
+      <div class="csv-drawer-bar">
+        <span id="csv-title" class="csv-title">Navlog</span>
+        <span id="csv-note" class="hint"></span>
+        <label class="inline" title="Show columns that are empty on every row. Always in the downloaded file.">
+          <input id="csv-blank" type="checkbox"> Empty columns
+        </label>
+        <button id="csv-copy" type="button" title="Copy the CSV, to paste into a spreadsheet">Copy CSV</button>
+        <button id="download-csv" type="button"
+                title="Save the log as CSV in the column order of a paper nav log">Download CSV</button>
+      </div>
+      <div class="csv-scroll">
+        <table id="csv-table"><thead></thead><tbody></tbody></table>
+      </div>
+      <p id="csv-empty" class="hint" hidden></p>
+    </section>
+    <button id="csv-handle" type="button" aria-controls="csv-drawer" aria-expanded="false"
+            title="Pull down the navlog as it is exported to CSV. Click, or drag down.">Navlog ▾</button>
     <!-- Chart layers. The list is built from whatever GeoTIFFs are under
          data/charts/, so it is empty until a chart has been downloaded. -->
     <button id="layers-toggle" type="button" aria-controls="layers" aria-expanded="false"
@@ -234,6 +255,11 @@
   </aside>
 
   <section id="navlog-wrap">
+    <!-- Drag to give the log more of the screen, or the map more back.
+         Double-click flips between the tallest it goes and the default. -->
+    <div id="navlog-resize" class="navlog-resize" role="separator" tabindex="0"
+         aria-orientation="horizontal" aria-controls="navlog-wrap"
+         title="Drag up for more navigation log, down for more map. Double-click to maximise or restore."></div>
     <!-- The panel's two faces: the log itself, and the route as a file. The
          tab is the heading -- the log's own <h2> went with it. -->
     <div class="tabs" role="tablist">
@@ -241,12 +267,21 @@
               aria-controls="tab-navlog" data-tab="navlog">Navigation log</button>
       <button type="button" role="tab" id="tab-btn-route-file" aria-selected="false"
               aria-controls="tab-route-file" data-tab="route-file">Route file</button>
+      <button type="button" id="navlog-size" class="navlog-size"
+              title="Give the navigation log most of the screen">▲ Expand</button>
     </div>
 
     <div id="tab-navlog" role="tabpanel" aria-labelledby="tab-btn-navlog">
     <div class="navlog-head">
       <div class="navlog-actions">
         <button id="reset-edits" type="button" hidden>Reset manual edits</button>
+        <label title="A wind typed on a navlog row is the wind on the whole leg you drew, or only on that row's climb, cruise or descent part of it.">
+          Wind edits cover
+          <select id="wind-scope">
+            <option value="leg" selected>whole leg</option>
+            <option value="phase">that phase</option>
+          </select>
+        </label>
         <!-- Beside the button that uses it, not in the sidebar with the other
              conditions: it is an argument to "Get weather" and means nothing
              on its own. Blank fetches the current weather, which is the
@@ -266,10 +301,6 @@
           Get NOTAMs
         </button>
         <button id="copy" type="button">Copy as text</button>
-        <button id="download-csv" type="button"
-                title="Save the log as CSV in the column order of a paper nav log">
-          Download CSV
-        </button>
       </div>
     </div>
     <!-- Above the table, not below it: this is where a refusal to plan is
@@ -298,9 +329,11 @@
             <th class="num" title="Magnetic heading — what you fly on the DG">MH</th>
             <th class="num" title="Wind direction, true — editable">Wind °</th>
             <th class="num" title="Wind speed, knots — editable">Wind kt</th>
+            <th class="num" title="Calibrated airspeed — what the airspeed indicator reads for this row's true airspeed, in this row's air">CAS</th>
             <th class="num" title="True airspeed — editable">TAS</th>
             <th class="num">GS</th>
             <th class="num">Dist</th><th class="num">ETE</th>
+            <th class="num" title="Minutes left after this row, to the end of the flight, the pattern included">Time Rem</th>
             <th class="num">Fuel</th><th class="num">Rem</th>
           </tr>
         </thead>
@@ -328,10 +361,15 @@
           <p class="hint">
             Every waypoint of the plan, TOC and TOD included, at its planned
             altitude, plus the route as a line. Opens in Google Earth, ForeFlight
-            or anything else that reads KML, and imports back here as the same
-            route.
+            or anything else that reads KML.
           </p>
-          <button id="download-kml" type="button" data-label="Download KML">Download KML</button>
+          <p class="hint">
+            The file is also the mission: your fixes, each leg's events and
+            edits, and the flight's settings. Load it back here — tomorrow, or
+            in the cockpit — and it is planned again in the current weather,
+            with a note of what moved since it was saved.
+          </p>
+          <button id="download-kml" type="button" data-label="Download mission (KML)">Download mission (KML)</button>
         </section>
         <section class="block">
           <h2>Import</h2>

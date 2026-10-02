@@ -67,9 +67,10 @@ class TestExport:
         # The departure is at the field, not at cruise.
         _lon, _lat, ksql_alt = coordinate(by_name["KSQL"])
         assert ksql_alt == pytest.approx(5 * M_PER_FT, abs=0.1)
-        # And the destination is at its field, which is where the descent ends.
+        # And the destination at its pattern altitude, which is where the
+        # descent ends: 212 ft + 1,000, to the nearest hundred.
         _lon, _lat, ksbp_alt = coordinate(by_name["KSBP"])
-        assert ksbp_alt == pytest.approx(212 * M_PER_FT, abs=0.5)
+        assert ksbp_alt == pytest.approx(1200 * M_PER_FT, abs=0.5)
 
     def test_altitudes_are_absolute(self):
         text = kml.route_kml(log())
