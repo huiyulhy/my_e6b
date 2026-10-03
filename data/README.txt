@@ -1,13 +1,13 @@
-AIS subscriber files effective date September 03, 2026.
+AIS subscriber files effective date October 01, 2026.
 
 Dear Subscribers,
 
-For the September 03, 2026 subscriber files, the files incorporate data 
+For the October 01, 2026 subscriber files, the files incorporate data 
 published in the daily National Flight Data Digest (NFDD) through
  
-    NFDD 147 dated 08/03/2026.  
+    NFDD 167 dated 08/31/2026.  
 
-The September 03, 2026 cycle is a 28 Day Change Notice Cycle subscriber set. 
+The October 01, 2026 cycle is a 28 Day Change Notice Cycle subscriber set. 
 
 By FAA policy and order, some NASR resources, generally categorized as 
 "Enroute", are only updated on a 56 day charting basis. The following legacy 
