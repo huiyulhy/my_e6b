@@ -329,10 +329,6 @@ class _Tables:
     climb_cum_time: _Grid
     climb_cum_fuel: _Grid
     climb_table_kias: _Grid
-    # The time-to-climb table's printed rows and their cumulative minutes,
-    # read row by row rather than interpolated; see `_book_climb_minutes`.
-    climb_table_palts: np.ndarray
-    climb_table_minutes: np.ndarray
     cruise: _CruiseTable
 
 @lru_cache(maxsize=4)
@@ -422,8 +418,6 @@ def _build_tables(data_dir: Path | None = None) -> _Tables:
         climb_cum_time=_regular((d_palts,), cum_time),
         climb_cum_fuel=_regular((d_palts,), cum_fuel),
         climb_table_kias=_regular((d_palts,), table_kias),
-        climb_table_palts=d_palts.astype(float),
-        climb_table_minutes=cum_time.astype(float),
         cruise=_CruiseTable(
             altitudes=cr_alts,
             isa_devs=cr_devs,
@@ -604,28 +598,20 @@ def climb_from_to(
     *,
     oat_c: float | None = None,
     data_dir: Path | None = None,
-    round_from: bool = True,
-    round_to: bool = True,
 ) -> ClimbSegment:
     """Time, fuel and climb speed between two pressure altitudes.
 
-    Time is read the way the POH is read by hand: the cumulative time at the
-    printed row at or *below* where the climb starts, subtracted from the one
-    at or *above* where it ends. Nearest row, rounded outward, so a climb is
-    never credited with being quicker than the book says -- 5,500 ft is
-    planned as the time to 6,000.
-
-    Only at the ends of a climb. `round_from=False` / `round_to=False` say an
-    end is a place the climb passes through -- a waypoint mid-climb, the edge
-    of one integration band and the start of the next -- where the time is
-    interpolated in the same column instead. Rounding there would charge the
-    part-row twice, once on each side, and stop the climb dead at every row. 
-    Fuel is the difference of the cumulative fuel column interpolated at the two altitudes
+    Time and fuel are the differences of the cumulative columns, each
+    interpolated at the two altitudes: a climb to 6,500 ft is charged half way
+    between the 6,000 and 7,000 ft rows, not rounded out to 7,000. Rounding
+    out was tried and dropped -- on top of a table already printed at max
+    gross and full throttle, it planned climbs minutes longer than they flew,
+    and pushed the top of climb, and so the whole cruise, down the route.
 
     The climb speed is the average of the table's speed column at the two ends,
     which is the speed that represents the segment as a whol
 
-    POH: 
+    POH:
     1. Published table is at standard temperature
     2. Increase climb time, fuel and distance by 10% for each 10 degC
     """
@@ -640,7 +626,9 @@ def climb_from_to(
         _call(t.climb_table_kias, (bottom,), "climb speed")
         + _call(t.climb_table_kias, (top,), "climb speed")
     )
-    time_min = _book_climb_minutes(t, bottom, top, round_from, round_to)
+    time_min = _call(t.climb_cum_time, (top,), "climb time") - _call(
+        t.climb_cum_time, (bottom,), "climb time"
+    )
     fuel_gal = _call(t.climb_cum_fuel, (top,), "climb fuel") - _call(
         t.climb_cum_fuel, (bottom,), "climb fuel"
     )
@@ -655,40 +643,6 @@ def climb_from_to(
         time_min *= factor
         fuel_gal *= factor
     return ClimbSegment(time_min=time_min, fuel_gal=fuel_gal, kias=kias)
-
-
-def _book_climb_minutes(
-    t: _Tables,
-    bottom_ft: float,
-    top_ft: float,
-    round_from: bool = True,
-    round_to: bool = True,
-) -> float:
-    """Minutes to climb, from the table's printed rows, rounded outward.
-
-    The start snaps down to the row at or below it and the end up to the row
-    at or above it -- each only if it is asked to; an end that is not is read
-    by linear interpolation in the same cumulative column. Within a hundredth of a foot of a row counts as on it, so
-    a climb that ends at 3000 is not charged for 4000 over floating-point
-    noise.
-    """
-    palts, minutes = t.climb_table_palts, t.climb_table_minutes
-    if top_ft > palts[-1] + _ON_ROW_FT:
-        raise OutsidePOHEnvelope(
-            f"climb time query ({top_ft},) is outside the published POH range "
-            f"[{palts[0]:.0f}, {palts[-1]:.0f}]"
-        )
-    below = int(np.searchsorted(palts, bottom_ft + _ON_ROW_FT, side="right")) - 1
-    above = int(np.searchsorted(palts, top_ft - _ON_ROW_FT, side="left"))
-    below = max(0, below)
-    above = min(len(palts) - 1, max(above, below))
-    start = minutes[below] if round_from else float(np.interp(bottom_ft, palts, minutes))
-    end = minutes[above] if round_to else float(np.interp(top_ft, palts, minutes))
-    return float(max(0.0, end - start))
-
-
-# How close to a printed row an altitude has to be to be read as on it.
-_ON_ROW_FT = 0.01
 
 
 def cruise(

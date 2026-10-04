@@ -948,12 +948,14 @@ class TestTemperaturesAloft:
         assert cruise.ground_speed_kt != pytest.approx(plain.ground_speed_kt)
 
     def test_a_field_report_and_an_fd_level_share_one_curve(self):
-        """Two coordinates, one profile.
+        """Two coordinates, one profile, one deviation per leg.
 
         The field is a true elevation under its own station setting; the FD
-        level is already a pressure altitude. Both have to land on the same
-        deviation curve, so a hot field warms the low legs without touching
-        the forecast aloft.
+        level is already a pressure altitude. Both land on the same deviation
+        curve, which each leg then reads at its own rows and settles into the
+        one deviation it is flown in. So a hot departure field warms the whole
+        leg off it -- climb and cruise alike, by the same amount -- and the
+        forecast aloft tempers how much.
         """
         aloft = self._fd((9000, 6.0))
         hot_field = replace(KSQL, oat_c=34.0, altimeter_inhg=29.80)
@@ -970,8 +972,14 @@ class TestTemperaturesAloft:
         climb_base = next(leg for leg in base.legs if leg.phase == "climb")
         climb_hot = next(leg for leg in hot.legs if leg.phase == "climb")
         assert climb_hot.oat_c > climb_base.oat_c
-        # The forecast aloft is untouched by what the field reported.
-        assert self._cruise(hot).oat_c == pytest.approx(self._cruise(base).oat_c)
+        assert self._cruise(hot).oat_c > self._cruise(base).oat_c
+        deviation = lambda leg: leg.oat_c - nl.isa_temperature_c(leg.pressure_altitude_ft)
+        # One leg, one air: the climb row and the cruise row read the same
+        # offset from standard, at their own altitudes.
+        assert deviation(climb_hot) == pytest.approx(deviation(self._cruise(hot)))
+        # Less than the field's own excess (ISA+19): the FD level's ISA+6 is
+        # in the average too, weighed by the miles flown at it.
+        assert 6.0 < deviation(self._cruise(hot)) < 19.0
 
 
 class TestClimbLegLongerThanItsClimb:
@@ -1551,7 +1559,7 @@ class TestWindsAloftByLeg:
         assert first_row.wind_speed_kt == pytest.approx(30.0)  # off the column
 
     def test_the_columns_temperatures_reach_the_density_altitudes(self):
-        """Winds by position, temperature into the one route-wide curve."""
+        """A warm level entered route-wide still warms a leg with a column."""
         first = inverse(KSQL.position, KMRY.position).point_at_fraction(0.5)
         warm = nl.build_navlog(
             [KSQL, KMRY],
@@ -1565,6 +1573,90 @@ class TestWindsAloftByLeg:
         )
         cruise = next(r for r in self.rows(warm) if r.phase == "cruise")
         assert cruise.density_altitude_ft > cruise.pressure_altitude_ft + 1500
+
+    # --- one air per leg the pilot drew ----------------------------------
+
+    SHEARED = nl.WindsAloft(((0.0, nl.Wind(270.0, 10.0)), (6500.0, nl.Wind(270.0, 40.0))))
+    WARMING = (nl.TemperatureSample(2000.0, 0.0), nl.TemperatureSample(6500.0, 15.0))
+
+    @staticmethod
+    def deviation(row):
+        return row.oat_c - nl.isa_temperature_c(row.pressure_altitude_ft)
+
+    def test_every_row_of_a_leg_is_flown_in_the_same_wind(self):
+        """A column answers by altitude; a leg is flown in one wind.
+
+        The climb row, the cruise and the descent off KSQL to KMRY would each
+        read the sheared column at a different height. They are all flown in
+        the leg's one settled wind instead -- the column averaged over those
+        rows, each weighing the ground it covers -- so it is neither the
+        bottom's 10 kt nor the top's 40.
+        """
+        first = inverse(KSQL.position, KMRY.position).point_at_fraction(0.5)
+        log = nl.build_navlog(
+            [KSQL, KMRY],
+            6500,
+            conditions=nl.Conditions(
+                flight_date=date(2026, 9, 2),
+                wind_field=nl.WindField((nl.WindColumn(first, self.SHEARED, self.WARMING),)),
+            ),
+            planning_mode="auto",
+        )
+        rows = self.rows(log)
+        assert {r.phase for r in rows} == {"climb", "cruise", "descent"}
+        speeds = {round(r.wind_speed_kt, 6) for r in rows}
+        assert len(speeds) == 1
+        assert 10.0 < speeds.pop() < 40.0
+        assert all(r.wind_from_deg == pytest.approx(270.0) for r in rows)
+
+    def test_every_row_of_a_leg_is_flown_at_the_same_isa_deviation(self):
+        """And the same offset from standard, read off the same column."""
+        first = inverse(KSQL.position, KMRY.position).point_at_fraction(0.5)
+        log = nl.build_navlog(
+            [KSQL, KMRY],
+            6500,
+            conditions=nl.Conditions(
+                flight_date=date(2026, 9, 2),
+                wind_field=nl.WindField((nl.WindColumn(first, self.SHEARED, self.WARMING),)),
+            ),
+            planning_mode="auto",
+        )
+        rows = self.rows(log)
+        deviations = [self.deviation(r) for r in rows]
+        assert all(d == pytest.approx(deviations[0], abs=0.01) for d in deviations)
+        assert 0.0 < deviations[0] < 15.0
+        # OAT itself still falls with altitude: the deviation is the constant.
+        cruise = next(r for r in rows if r.phase == "cruise")
+        climb = next(r for r in rows if r.phase == "climb")
+        assert cruise.oat_c < climb.oat_c
+
+    def test_a_route_wide_profile_is_settled_per_leg_the_same_way(self):
+        """No column at all, only a layered wind typed for the route: a leg
+        is still never flown in two winds."""
+        log = nl.build_navlog(
+            [KSQL, KMRY],
+            6500,
+            conditions=nl.Conditions(flight_date=date(2026, 9, 2), winds=self.SHEARED),
+            planning_mode="auto",
+        )
+        speeds = {round(r.wind_speed_kt, 6) for r in self.rows(log)}
+        assert len(speeds) == 1
+
+    def test_two_legs_settle_to_two_different_airs(self):
+        """The averaging is per leg: a stop leg under a different column keeps
+        its own wind, and the leg boundary -- not the top of climb -- is where
+        the wind changes."""
+        first = inverse(KSQL.position, KMRY.position).point_at_fraction(0.5)
+        second = inverse(KMRY.position, KSBP.position).point_at_fraction(0.5)
+        log = self.two_legs(
+            wind_field=self.field((first, self.SHEARED), (second, self.EAST))
+        )
+        rows = self.rows(log)
+        stop = next(i for i, r in enumerate(rows) if r.to_name == "KMRY")
+        before = {round(r.wind_speed_kt, 6) for r in rows[: stop + 1]}
+        assert len(before) == 1 and 10.0 < before.pop() < 40.0
+        assert all(r.wind_from_deg == pytest.approx(90.0) for r in rows[stop + 1 :])
+        assert all(r.wind_speed_kt == pytest.approx(30.0) for r in rows[stop + 1 :])
 
 
 # --- edits filed under the leg the pilot drew ------------------------------
@@ -1652,7 +1744,8 @@ class TestSegmentOverrides:
             conditions=windy,
         )
         for leg in flown(log):
-            assert (leg.wind_from_deg, leg.wind_speed_kt) == (200.0, 25)
+            # Approximate: the leg's wind is a vector average, even of one wind.
+            assert (leg.wind_from_deg, leg.wind_speed_kt) == (pytest.approx(200.0), 25)
 
     def test_a_row_edit_beats_its_legs(self):
         log = segment_log(
@@ -1710,16 +1803,23 @@ class TestClimbIsWhatThePOHAllows:
         assert 1000 < arriving.exit_altitude_ft < 2000
 
     def test_the_climb_carries_on_through_vpbdx(self):
-        """No level stretch before VPKGO: nothing restricts the altitude there."""
+        """Nothing restricts the altitude at VPBDX, so the climb does not stop
+        there: the aeroplane levels off only once it has 2500 for VPKGO."""
         flown = [leg for leg in self.log().legs if leg.covers_ground]
         to_vpkgo = flown[: next(i for i, leg in enumerate(flown) if leg.to_name == "VPKGO") + 1]
-        assert all(leg.phase == "climb" for leg in to_vpkgo)
+        leaving_vpbdx = next(leg for leg in to_vpkgo if leg.from_name == "VPBDX")
+        assert leaving_vpbdx.phase == "climb"
+        assert all(
+            leg.exit_altitude_ft == pytest.approx(2500)
+            for leg in to_vpkgo
+            if leg.phase != "climb"
+        )
 
     def test_the_climb_takes_the_books_time(self):
         """Mid-climb, the book's own time column, read between its rows."""
         arriving = next(leg for leg in self.log().legs if leg.to_name == "VPBDX")
         book = nl.perf.climb_from_to(
-            arriving.entry_altitude_ft, arriving.exit_altitude_ft, round_to=False
+            arriving.entry_altitude_ft, arriving.exit_altitude_ft
         )
         assert arriving.ete_min >= book.time_min * 0.99
 

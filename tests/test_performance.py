@@ -722,31 +722,21 @@ class TestBelowSeaLevel:
             perf.climb_rate(-500.0, 60.0)
 
 
-class TestBookClimbRounding:
-    """The book's time, read the way a pilot reads it: out to the printed rows
-    at the climb's real start and top, and between them nowhere else."""
+class TestBookClimbInterpolation:
+    """The book's time, interpolated between the printed rows rather than
+    rounded out to them."""
 
-    def test_the_top_rounds_up_to_the_next_row(self):
-        assert perf.climb_from_to(5000, 5500).time_min == pytest.approx(
-            perf.climb_from_to(5000, 6000).time_min
-        )
-
-    def test_the_start_rounds_down_to_the_row_below(self):
-        assert perf.climb_from_to(1500, 3000).time_min == pytest.approx(
-            perf.climb_from_to(1000, 3000).time_min
-        )
+    def test_a_part_row_is_charged_part_of_the_row(self):
+        # 5000 -> 6000 is 2 minutes in the book; half of it is half of that.
+        assert perf.climb_from_to(5000, 5500).time_min == pytest.approx(1.0)
+        assert perf.climb_from_to(1500, 3000).time_min == pytest.approx(2.0)
 
     def test_a_row_is_read_as_printed(self):
         assert perf.climb_from_to(0, 1000).time_min == pytest.approx(1.0)
         assert perf.climb_from_to(0, 12000).time_min == pytest.approx(28.0)
 
-    def test_mid_climb_ends_are_interpolated(self):
-        """A waypoint the climb passes through is not a row to round to."""
-        assert perf.climb_from_to(0, 1500, round_to=False).time_min == pytest.approx(2.0)
-        assert perf.climb_from_to(1500, 3000, round_from=False).time_min == pytest.approx(2.0)
-
     def test_a_climb_split_mid_row_adds_back_to_the_whole(self):
         whole = perf.climb_from_to(0, 2500).time_min
-        first = perf.climb_from_to(0, 1500, round_to=False).time_min
-        second = perf.climb_from_to(1500, 2500, round_from=False).time_min
+        first = perf.climb_from_to(0, 1500).time_min
+        second = perf.climb_from_to(1500, 2500).time_min
         assert first + second == pytest.approx(whole)

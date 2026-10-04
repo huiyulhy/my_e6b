@@ -716,9 +716,27 @@ along-track and cross-track distances `geo.Segment` already computes. Nearest-co
 tempting shortcut and is wrong at exactly one place: the first ten miles of a 130 nm leg are sixty
 miles nearer the *previous* leg's column. The row is still unambiguously on the second leg.
 
-Temperature goes in route-wide as `temperatures_aloft`, merging with the fields' own METARs into
-the single curve `build_navlog` builds — a pressure altitude is the coordinate every station
-shares, and `TemperatureProfile.from_observations` averages samples that land on the same level.
+**One air per leg the pilot drew.** A column answers by altitude, and the rows cut from one leg
+fly at different altitudes — the climb at its midpoint, the cruise, the descent off it. Read
+literally, the leg would be flown in three winds and three temperatures from one forecast, and
+the join between two rows would be a wind shift that nobody forecast. So `navlog._segment_air`
+settles each leg's column into **one wind and one ISA deviation**: the column read at each of
+the leg's rows and averaged, each row weighing the ground it covers (the wind as a vector, so two
+winds either side of north average to a northerly). Every row of the leg, and every climb or
+descent the planner fits into it, is then flown in that air; OAT still falls with altitude under
+the constant deviation, so density altitude stays honest on a climb. The rows' altitudes are
+needed before the average can be taken, which is why `_build_flight` always lays the flight out
+twice: a rehearsal on the forecast as it stands, then the plan in the settled air. Twice and no
+more — chasing the small movement of the tops of climb converges nowhere better. The leg boundary,
+not the top of climb, is where the wind changes. A leg with no column of its own averages the
+route-wide profile the same way, so a layered wind typed for the route is never two winds on one
+leg either.
+
+The column carries its temperatures (`WindColumn.temperatures`), which is where a leg's deviation
+is read from. They also go in route-wide as `temperatures_aloft`, merging with the fields' own
+METARs into the curve `build_navlog` builds — a pressure altitude is the coordinate every station
+shares, and `TemperatureProfile.from_observations` averages samples that land on the same level —
+which the rows on the ground, the reserve and any leg without a column still read.
 
 Where an end has no forecast the other is used; where neither does, the leg falls back to the wind
 typed on its row and to calm under that, which is what a plan with nothing entered has always
@@ -730,8 +748,8 @@ the other end is used and the leg says so.
 
 This settles §4b's open question about whether a wind should move the top of climb. It does: the
 reason it did not was that an FD level is too coarse to trust that far, and a point-resolved model
-column is not. The planner gets the forecast on its first pass, since a column belongs to a leg by
-where it was forecast and needs no draft lay-out to find its home.
+column is not. A column belongs to a leg by where it was forecast, so the
+planner has it from the rehearsal onward; the plan itself is laid out in the leg's settled air.
 
 The UI shows the second list under the navlog — both ends' costs, not just the winner's, so a
 pilot can see whether the choice was close or obvious.

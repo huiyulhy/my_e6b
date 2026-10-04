@@ -478,18 +478,22 @@ def _with_weather(
 ) -> nl.Conditions:
     """The conditions a pass is planned in, given the weather chosen for it.
 
-    Wind goes in as a column placed at each leg's midpoint, which is how
-    `navlog._RouteColumns` finds it again -- by where it is, so that the tops
-    of climb can move under it without it moving with them. Temperature goes
-    in route-wide, merging with the fields' own reports into the single curve
-    the whole plan is flown on, which is what keying it by pressure altitude
-    is for.
+    The column goes in whole -- wind and temperature together -- placed at
+    each leg's midpoint, which is how `navlog._RouteColumns` finds it again:
+    by where it is, so that the tops of climb can move under it without it
+    moving with them. The navlog settles each leg's column into the one wind
+    and one ISA deviation the leg is flown in (`navlog._segment_air`). The
+    temperatures also go in route-wide, merging with the fields' own reports
+    into the curve that legs with no column of their own, and the rows on the
+    ground, still read.
     """
     if not weather:
         return conditions
     spans = nl.drawn_spans(drawn)
     columns = tuple(
-        nl.WindColumn(spans[entry.leg].point_at_fraction(0.5), entry.winds)
+        nl.WindColumn(
+            spans[entry.leg].point_at_fraction(0.5), entry.winds, entry.temperatures
+        )
         for entry in weather
         if entry.has_forecast and entry.leg < len(spans)
     )

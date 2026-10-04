@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, replace
+from dataclasses import field as dataclass_field
 from itertools import pairwise
 from typing import TYPE_CHECKING, Literal
 
@@ -44,7 +45,22 @@ SegmentType = Literal["climb", "cruise", "descent", "automatic"]
 
 # A wind the pilot typed against one leg, keyed by leg index and then by the
 # phase it was typed on. 
-LegWinds = dict[int, dict[str, "object"]]
+@dataclass(frozen=True)
+class LegAir:
+    """The air one leg the pilot drew is planned in.
+
+    One wind per phase -- something answering `at(altitude_ft)` -- and one ISA
+    deviation for the whole leg. Both are the leg's, not an altitude's: every
+    row cut from the leg, and every climb or descent the planner fits into it,
+    is flown in this same air. `None` for the deviation leaves the route-wide
+    temperature profile in charge.
+    """
+
+    winds_by_phase: dict[str, "object"] = dataclass_field(default_factory=dict)
+    isa_deviation_c: float | None = None
+
+
+LegWinds = dict[int, LegAir]
 
 CONCRETE_SEGMENT_TYPES: tuple[str, ...] = ("climb", "cruise", "descent")
 PLANNING_MODES: tuple[str, ...] = ("manual", "hybrid")
@@ -404,7 +420,6 @@ def _expand_automatic(
 
     resolved: list[Waypoint] = [waypoints[0]]
     entry = departure_elevation
-    arriving = "cruise"
     for index, (start, end) in enumerate(pairwise(waypoints)):
         # Never aim higher than the point from which the rest of the route can
         # still be flown down.
@@ -419,14 +434,11 @@ def _expand_automatic(
             exit_altitude_ft=exit_,
             aircraft=aircraft,
             conditions=conditions,
-            winds_by_phase=(leg_winds or {}).get(index),
+            air=(leg_winds or {}).get(index),
             names=names,
             warnings=warnings,
             from_the_ground=index == 0,
-            # A climb still going at the last waypoint carries on through it.
-            climbing_in=arriving == "climb",
         )
-        arriving = end_type
         resolved.extend(inserted)
         # A crossing altitude the aeroplane cannot make is the pilot's to hear
         # about, not the planner's to quietly lower. The rows are built to the
@@ -460,11 +472,10 @@ def _expand_leg(
     exit_altitude_ft: float,
     aircraft: Aircraft,
     conditions: Conditions,
-    winds_by_phase: dict[str, object] | None = None,
+    air: LegAir | None = None,
     names: PhaseNamer,
     warnings: list[str],
     from_the_ground: bool = False,
-    climbing_in: bool = False,
 ) -> tuple[list[Waypoint], str, float]:
     """Split one leg, returning the points to insert before `end`.
 
@@ -497,10 +508,9 @@ def _expand_leg(
         altitude_ft=entry_altitude_ft,
         aircraft=aircraft,
         conditions=conditions,
-        winds_by_phase=winds_by_phase,
+        air=air,
         warnings=warnings,
         on_the_ground=from_the_ground,
-        climbing_in=climbing_in,
     )
     for along_nm, event in _events_along(start, end, geo, warnings):
         if not walk.fly_event(along_nm, event):
@@ -544,22 +554,18 @@ class _LegWalk:
         altitude_ft: float,
         aircraft: Aircraft,
         conditions: Conditions,
-        winds_by_phase: dict[str, object] | None,
+        air: LegAir | None,
         warnings: list[str],
         on_the_ground: bool = False,
-        climbing_in: bool = False,
     ) -> None:
         self.start, self.end, self.geo = start, end, geo
         self.aircraft, self.conditions = aircraft, conditions
-        self.winds_by_phase, self.warnings = winds_by_phase, warnings
+        self.air, self.warnings = air, warnings
         self.cursor_nm = 0.0
         self.altitude_ft = altitude_ft
         self.pieces: list[tuple[str, float, float]] = []
         # Still on the runway: nothing has been flown yet on a departure leg.
         self._on_the_ground = on_the_ground
-        # The leg starts part way up a climb carried in from the last one, so
-        # that climb's first stretch here is not a bottom of climb.
-        self._climbing_in = climbing_in
         # "Start here" events that asked for the altitude already held:
         # (distance along, altitude). Checked once the leg is laid out.
         self._holds: list[tuple[float, float]] = []
@@ -568,12 +574,11 @@ class _LegWalk:
 
     def _change(self, to_altitude_ft: float) -> tuple[dict | None, Conditions]:
         conditions = _in_phase_wind(
-            self.conditions, self.winds_by_phase, self.altitude_ft, to_altitude_ft
+            self.conditions, self.air, self.altitude_ft, to_altitude_ft
         )
         return (
             _solve_change(
-                self.altitude_ft, to_altitude_ft, self.geo, self.aircraft, conditions,
-                open_start=self._climbing_in,
+                self.altitude_ft, to_altitude_ft, self.geo, self.aircraft, conditions
             ),
             conditions,
         )
@@ -585,7 +590,7 @@ class _LegWalk:
         if toward_ft > self.altitude_ft:
             return reachable_altitude(
                 self.altitude_ft, toward_ft, available_nm, self.geo, self.aircraft,
-                conditions, open_start=self._climbing_in,
+                conditions,
             )
         return _descent_reachable(
             self.altitude_ft, toward_ft, available_nm, self.geo, self.aircraft, conditions
@@ -594,14 +599,12 @@ class _LegWalk:
     def _level_until(self, along_nm: float) -> None:
         if along_nm - self.cursor_nm > _BOUNDARY_EPSILON_NM:
             self.pieces.append(("cruise", along_nm, self.altitude_ft))
-            self._climbing_in = False
         self.cursor_nm = max(self.cursor_nm, along_nm)
 
     def _changed(self, phase: str, along_nm: float, altitude_ft: float) -> None:
         self.pieces.append((phase, along_nm, altitude_ft))
         self.cursor_nm, self.altitude_ft = along_nm, altitude_ft
         self._on_the_ground = False
-        self._climbing_in = False
 
     # --- the pilot's events ----------------------------------------------
 
@@ -905,22 +908,38 @@ def _in_leg_wind(
     interpolated between -- which is what `Conditions.temperatures` does, and is
     right for temperature and wrong for this.
     """
-    winds = (leg_winds or {}).get(index, {}).get(phase)
-    return conditions if winds is None else replace(conditions, winds=winds)
+    return _in_air(conditions, (leg_winds or {}).get(index), phase)
 
 
 def _in_phase_wind(
     conditions: Conditions,
-    winds_by_phase: dict[str, object] | None,
+    air: LegAir | None,
     from_altitude_ft: float,
     to_altitude_ft: float,
 ) -> Conditions:
     """`_in_leg_wind` for one piece of a leg, named by which way it goes."""
-    if not winds_by_phase:
-        return conditions
     phase = "climb" if to_altitude_ft > from_altitude_ft else "descent"
-    winds = winds_by_phase.get(phase)
-    return conditions if winds is None else replace(conditions, winds=winds)
+    return _in_air(conditions, air, phase)
+
+
+def _in_air(conditions: Conditions, air: LegAir | None, phase: str) -> Conditions:
+    """`conditions` with one leg's wind and temperature swapped in.
+
+    The ISA deviation replaces the route-wide temperature profile outright for
+    the same reason the wind does: it is a statement about the leg, held at
+    every altitude the leg is flown through, not a sample to interpolate
+    between.
+    """
+    if air is None:
+        return conditions
+    changes: dict[str, object] = {}
+    winds = air.winds_by_phase.get(phase)
+    if winds is not None:
+        changes["winds"] = winds
+    if air.isa_deviation_c is not None:
+        changes["temperatures"] = None
+        changes["isa_deviation_c"] = air.isa_deviation_c
+    return replace(conditions, **changes) if changes else conditions
 
 
 def build_segments(
@@ -967,14 +986,6 @@ def build_segments(
             )
 
         geo = inverse(start.position, end.position)
-        # A climb that carries on through either end of this leg is read
-        # mid-climb there, not rounded to the book's row.
-        open_start = phase == "climb" and bool(segments) and segments[-1].phase == "climb"
-        open_end = (
-            phase == "climb"
-            and index + 2 < len(waypoints)
-            and waypoints[index + 2].segment_type == "climb"
-        )
         # Every reading for this leg -- the top it reaches and the marching
         # that gets it there -- is taken in the leg's own wind.
         leg_conditions = _in_leg_wind(conditions, leg_winds, index, phase)
@@ -987,7 +998,6 @@ def build_segments(
                 geo=geo,
                 aircraft=aircraft,
                 conditions=leg_conditions,
-                open_start=open_start,
                 # The last leg descends to the arrival altitude, the pattern,
                 # rather than all the way to the runway.
                 floor_ft=(
@@ -1005,8 +1015,6 @@ def build_segments(
                 aircraft=aircraft,
                 conditions=leg_conditions,
                 cruise_point=cruise_point,
-                open_start=open_start,
-                open_end=open_end,
             )
         )
         entry = exit_altitude
@@ -1022,7 +1030,6 @@ def _exit_altitude(
     geo: Segment,
     aircraft: Aircraft,
     conditions: Conditions,
-    open_start: bool = False,
     floor_ft: float | None = None,
 ) -> float:
     """Where this leg leaves the aeroplane."""
@@ -1038,7 +1045,6 @@ def _exit_altitude(
             geo,
             aircraft,
             conditions,
-            open_start=open_start,
         )
     if floor_ft is None:
         floor_ft = end.elevation_ft if end.elevation_ft is not None else 0.0
@@ -1075,21 +1081,17 @@ def _segment_for(
     aircraft: Aircraft,
     conditions: Conditions,
     cruise_point: perf.CruisePoint,
-    open_start: bool = False,
-    open_end: bool = False,
 ) -> ProfileSegment:
     """Airspeed and POH climb figures for one declared leg."""
     mid = 0.5 * (entry_altitude_ft + exit_altitude_ft)
     change = _solve_change(
-        entry_altitude_ft, exit_altitude_ft, geo, aircraft, conditions,
-        open_start=open_start, open_end=open_end,
+        entry_altitude_ft, exit_altitude_ft, geo, aircraft, conditions
     )
     level_nm = level_minutes = 0.0
 
     if phase == "climb" and change is not None and change["phase"] == "climb":
         change = _fitted_to_the_leg(
-            change, entry_altitude_ft, exit_altitude_ft, geo, aircraft, conditions,
-            open_start=open_start,
+            change, entry_altitude_ft, exit_altitude_ft, geo, aircraft, conditions
         )
         tas_kt, climb = change["tas_kt"], change["climb"]
         tas_kt, level_nm, level_minutes = _with_level_remainder(
@@ -1127,7 +1129,6 @@ def _fitted_to_the_leg(
     geo: Segment,
     aircraft: Aircraft,
     conditions: Conditions,
-    open_start: bool = False,
 ) -> dict:
     """Charge only the climb the leg has room for.
 
@@ -1150,12 +1151,8 @@ def _fitted_to_the_leg(
         geo,
         aircraft,
         conditions,
-        open_start=open_start,
     )
-    fitted = _solve_change(
-        entry_altitude_ft, reachable, geo, aircraft, conditions,
-        open_start=open_start, open_end=True,
-    )
+    fitted = _solve_change(entry_altitude_ft, reachable, geo, aircraft, conditions)
     return fitted if fitted is not None and fitted["climb"] is not None else change
 
 
@@ -1368,10 +1365,8 @@ def _descendable_ft(
 def _descendable_ft_at_the_bottom(
     geo: Segment, from_altitude_ft: float, aircraft: Aircraft, conditions: Conditions
 ) -> float:
-    """The quick estimate: airspeed and wind read at the bottom only."""
-    tas_kt = tas_from_cas(
-        aircraft.descent_speed_kias, conditions.density_altitude_ft(from_altitude_ft)
-    )
+    """The quick estimate: the wind read at the bottom only."""
+    tas_kt = aircraft.descent_tas_kt
     wind = conditions.winds.at(from_altitude_ft)
     try:
         ground_speed = solve_wind_triangle(
@@ -1392,8 +1387,6 @@ def reachable_altitude(
     geo: Segment,
     aircraft: Aircraft,
     conditions: Conditions,
-    *,
-    open_start: bool = False,
 ) -> float:
     """Calculate the maximum altitude the airplane can reach, given a ground speed
 
@@ -1401,29 +1394,21 @@ def reachable_altitude(
     and the relationship is not linear. Used both when a leg is too short to
     finish its climb, or when a "climb to" states no altitude at all and the
     answer is simply "as high as it gets".
-
-    Reaching the target is a top of climb, and costs the book's rounded time
-    to it. Falling short is not: the climb is still going where the distance
-    runs out, so that end is read mid-climb. `open_start` says the climb was
-    already under way where this distance begins.
     """
     if available_nm <= 0 or toward_altitude_ft <= from_altitude_ft:
         return from_altitude_ft
 
-    def distance_to(altitude: float, *, open_end: bool) -> float:
-        piece = _solve_change(
-            from_altitude_ft, altitude, geo, aircraft, conditions,
-            open_start=open_start, open_end=open_end,
-        )
+    def distance_to(altitude: float) -> float:
+        piece = _solve_change(from_altitude_ft, altitude, geo, aircraft, conditions)
         return piece["distance_nm"] if piece else 0.0
 
-    if distance_to(toward_altitude_ft, open_end=False) <= available_nm:
+    if distance_to(toward_altitude_ft) <= available_nm:
         return toward_altitude_ft
 
     low, high = from_altitude_ft, toward_altitude_ft
     for _ in range(48):
         middle = 0.5 * (low + high)
-        if distance_to(middle, open_end=True) <= available_nm:
+        if distance_to(middle) <= available_nm:
             low = middle
         else:
             high = middle
@@ -1534,17 +1519,11 @@ def _solve_change(
     geo: Segment,
     aircraft: Aircraft,
     conditions: Conditions,
-    *,
-    open_start: bool = False,
-    open_end: bool = False,
 ) -> dict | None:
     """Time, airspeed and ground distance for one altitude change.
 
-    A climb's time is the book's, rounded out to the printed rows at the
-    climb's real start and top only (see `perf.climb_from_to`). `open_start`
-    and `open_end` say this change begins or ends mid-climb -- at a waypoint
-    the climb carries on through -- where it is interpolated instead, as it
-    is at every band edge inside the change.
+    A climb's time is the book's, interpolated in its cumulative column (see
+    `perf.climb_from_to`).
 
     `None` when there is no change worth flying, which is what lets the caller
     treat "climb then level" and "level all the way" as one shape.
@@ -1578,7 +1557,7 @@ def _solve_change(
     climb_time = climb_fuel = climb_kias_minutes = 0.0
 
     bands = _altitude_bands(from_altitude_ft, to_altitude_ft)
-    for band_index, (band_low, band_high) in enumerate(bands):
+    for band_low, band_high in bands:
         band_mid = 0.5 * (band_low + band_high)
         if phase == "climb":
             # Time and fuel come from differencing the cumulative table at
@@ -1588,8 +1567,6 @@ def _solve_change(
                 conditions.pressure_altitude_ft(band_low),
                 conditions.pressure_altitude_ft(band_high),
                 oat_c=conditions.oat_c(band_mid),
-                round_from=band_index == 0 and not open_start,
-                round_to=band_index == len(bands) - 1 and not open_end,
             )
             minutes = piece.time_min
             climb_time += piece.time_min
@@ -1598,10 +1575,8 @@ def _solve_change(
             tas_kt = tas_from_cas(piece.kias, conditions.density_altitude_ft(band_mid))
         else:
             minutes = (band_high - band_low) / aircraft.descent_rate_fpm
-            tas_kt = tas_from_cas(
-                aircraft.descent_speed_kias,
-                conditions.density_altitude_ft(band_mid),
-            )
+            # A true airspeed already: only the wind changes band to band.
+            tas_kt = aircraft.descent_tas_kt
         total_minutes += minutes
         total_distance += (
             _ground_speed(geo, conditions.winds.at(band_mid), tas_kt) * minutes / 60.0

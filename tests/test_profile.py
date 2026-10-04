@@ -775,7 +775,9 @@ class TestVerticalEvents:
         assert along(KSQL, head["BOC"]) == pytest.approx(20.0, abs=0.05)
 
     def test_an_impossible_level_off_says_how_short_it_is(self):
-        end = with_events(KMRY, KSQL, ("complete", 3, 2000), ("complete", 8, 9500))
+        # High enough that no descent from it fits the rest of the leg either,
+        # so the remainder has nothing to climb on to and levels at the point.
+        end = with_events(KMRY, KSQL, ("complete", 3, 2000), ("complete", 8, 10500))
         warnings: list[str] = []
         route = pr.resolve_route(
             [KSQL, end], mode="hybrid", cruise_altitude_ft=7500,
@@ -783,12 +785,12 @@ class TestVerticalEvents:
             aircraft=nl.Aircraft(), conditions=CALM, names=pr.PhaseNamer(),
             warnings=warnings,
         )
-        assert any("cannot climb to 9,500 ft" in w and "short" in w for w in warnings)
+        assert any("cannot climb to 10,500 ft" in w and "short" in w for w in warnings)
         # Short of it at the point: the climb stops where the book says it
         # gets to by then, pinned at the point, well below what was asked.
         top = generated(route)["TOC"]
         assert along(KSQL, top) == pytest.approx(8.0, abs=0.05)
-        assert top.altitude_ft < 9500
+        assert top.altitude_ft < 10500
 
     def test_step_climbs_on_one_leg(self):
         end = with_events(
@@ -922,10 +924,23 @@ class TestOneDescentNotTwo:
             assert rows[-1].exit_altitude_ft == pytest.approx(1100, abs=5)
 
     def test_a_crossing_altitude_that_forces_a_late_descent_says_so(self):
-        log, rows = self.rows([KSQL, self.VPALT, replace(self.JCN, altitude_ft=5500), self.KMOD], CALM)
+        # 5,400 ft at 500 fpm and 90 KTAS needs 16.2 nm; the leg is 13.7.
+        log, rows = self.rows([KSQL, self.VPALT, replace(self.JCN, altitude_ft=6500), self.KMOD], CALM)
         last = [leg for leg in rows if leg.from_name == "jcn99"]
         assert [leg.phase for leg in last] == ["descent"]
         assert any("the descent to 1,100 ft needs" in w for w in log.warnings)
+
+
+    def test_the_descent_is_flown_at_90_ktas_and_500_fpm(self):
+        """A true airspeed, not an indicated one: no faster up high. In still
+        air the row's TAS is the setting and its time is height over rate."""
+        _, rows = self.rows([KSQL, self.VPALT, self.JCN, self.KMOD], CALM)
+        descents = [leg for leg in rows if leg.phase == "descent"]
+        assert descents
+        for leg in descents:
+            assert leg.tas_kt == pytest.approx(90.0, abs=0.01)
+        height = descents[0].entry_altitude_ft - descents[-1].exit_altitude_ft
+        assert sum(leg.ete_min for leg in descents) == pytest.approx(height / 500.0, abs=0.01)
 
 
 class TestWhatThePlannerAddsToALeg:

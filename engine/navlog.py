@@ -20,7 +20,9 @@ segment only has 1 flight phase
 2. Climb and descent distances come from flying the POH climb speed (or the
 descent speed) against the forecast wind, not from the published no-wind
 climb distance column. Time and fuel stay the published figures.
-3. Descent is taken at a constant % of the cruise
+3. Descent is flown at a constant true airspeed (`descent_tas_kt`) and rate
+(`descent_rate_fpm`), with fuel charged at the cruise RPM's flow read at the
+pressure altitude and temperature the descent begins from
 4. Assume 10 mins in traffic pattern
 """
 
@@ -59,6 +61,7 @@ from engine.magnetic import (
 )
 from engine.profile import (
     CONCRETE_SEGMENT_TYPES,
+    LegAir,
     PLANNING_MODES,
     PhaseNamer,
     ProfileSegment,
@@ -181,12 +184,39 @@ def _wind_components(wind: Wind) -> tuple[float, float]:
     return wind.speed_kt * math.sin(towards), wind.speed_kt * math.cos(towards)
 
 
+def _average_wind(weighted: list[tuple[Wind, float]]) -> Wind:
+    """The weighted mean of several winds, as a vector.
+
+    As a vector rather than a mean speed and a mean direction taken apart: two
+    winds from either side of north average to a northerly, not to a wind
+    from 180.
+    """
+    total = sum(weight for _, weight in weighted)
+    if total <= 0.0:
+        return Wind(0.0, 0.0)
+    u = v = 0.0
+    for wind, weight in weighted:
+        wu, wv = _wind_components(wind)
+        u += wu * weight / total
+        v += wv * weight / total
+    speed = math.hypot(u, v)
+    if speed < 1e-9:
+        return Wind(0.0, 0.0)
+    return Wind(math.degrees(math.atan2(-u, -v)) % 360.0, speed)
+
+
 @dataclass(frozen=True)
 class WindColumn:
-    """One forecast column of wind, and the point it was forecast over."""
+    """One forecast column of air, and the point it was forecast over.
+
+    Temperature travels with the wind because they were forecast together,
+    and because the leg under this column is flown in both: see
+    `_segment_air`, which reads each of them off the column for the leg.
+    """
 
     position: LatLon
     winds: WindsAloft
+    temperatures: tuple[TemperatureSample, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -364,7 +394,10 @@ class Aircraft:
     # departure rather than once per flight plan.
     taxi_fuel_gal: float = perf.START_TAXI_TAKEOFF_FUEL_GAL
     descent_rate_fpm: float = 500.0
-    descent_speed_kias: float = 90.0
+    # A true airspeed, held the whole way down: the descent is planned at
+    # 90 KTAS and 500 fpm regardless of altitude. Fuel is still the cruise
+    # RPM's flow, read at the altitude the descent begins from.
+    descent_tas_kt: float = 90.0
     # Time in the traffic pattern at each arrival, but assume cruise fuel flow
     pattern_time_min: float = 10.0
     # Pattern altitude above field elevation, for the row's altitude column.
@@ -1220,7 +1253,8 @@ def _build_flight(
         conditions: Conditions,
         names: PhaseNamer,
         warnings: list[str],
-        drawn_leg_winds: dict[int, dict[str, TypedWind]] | None = None,
+        drawn_leg_winds: dict[int, dict[str, TypedWind]] | None,
+        columns: _RouteColumns | None,
     ) -> tuple[list[Waypoint], list[ProfileSegment]]:
         """Resolve the route and cut it into one segment per leg.
 
@@ -1242,7 +1276,7 @@ def _build_flight(
             conditions=conditions,
             names=names,
             warnings=warnings,
-            leg_winds=drawn_leg_winds,
+            leg_winds=_leg_air(drawn_leg_winds, columns),
         )
         return route, build_segments(
             route,
@@ -1264,16 +1298,18 @@ def _build_flight(
 
     # --- the airmass this flight is planned in ---------------------------
     #
-    # Field weather is known before anything is laid out. A temperature typed
-    # against a navlog row is not: the altitude to hang it at is a segment
-    # midpoint, which only exists once the profile has been built. So when
-    # there are any, the flight is laid out twice -- once on the field
-    # observations alone to learn what altitude each row flies at, then again
-    # with the pilot's temperatures folded in at those altitudes.
+    # Field weather is known before anything is laid out. What each leg is
+    # flown in is not: a leg is planned in one wind and one temperature offset
+    # (see `_segment_air`), and which altitudes to read those off the forecast
+    # at -- a climb row's midpoint, the cruise -- only exist once the profile
+    # has been built. The same goes for a temperature typed against a navlog
+    # row. So the flight is laid out twice: once on the forecast as it stands
+    # to learn what altitude each row flies at, then again in each leg's own
+    # settled air, with the pilot's temperatures folded in at those altitudes.
     #
     # Twice, and no more. The second pass moves the tops of climb a little,
-    # which would move the altitudes, which would move the samples; there is no
-    # reason to think chasing that converges anywhere better than where it
+    # which would move the altitudes, which would move the averages; there is
+    # no reason to think chasing that converges anywhere better than where it
     # started. The observations stay anchored to the altitudes the pilot saw
     # when they typed them, which is also the only version they can check.
     field_samples = _observed_samples(waypoints, conditions)
@@ -1301,46 +1337,50 @@ def _build_flight(
     forecast_and_typed = _with_segment_winds(
         _forecast_winds_by_drawn_leg(columns), waypoints, edits, conditions, columns
     )
-    drawn_leg_winds: dict[int, dict[str, object]] | None = forecast_and_typed or None
-    draft_segments: list[ProfileSegment] | None = None
-    if (
-        row_temperatures
-        or edits.any_temperature
-        or (row_winds and planning_mode == "hybrid")
-    ):
-        # A throwaway namer and warning list: this pass is scaffolding, and its
-        # TOC numbering and warnings would otherwise be emitted twice.
-        _, draft_segments = lay_out(conditions, PhaseNamer(), [], drawn_leg_winds)
-        # A temperature typed on a leg is hung at the altitude of each row
-        # the draft cut from it, as if it had been typed on each; a row's own
-        # temperature wins.
-        row_temperatures = (
-            _segment_temperatures_by_row(draft_segments, edits, row_offset)
-            | row_temperatures
+    # A throwaway namer and warning list: this pass is scaffolding, and its
+    # TOC numbering and warnings would otherwise be emitted twice.
+    _, draft_segments = lay_out(
+        conditions, PhaseNamer(), [], forecast_and_typed or None, columns
+    )
+    # A temperature typed on a leg is hung at the altitude of each row the
+    # draft cut from it, as if it had been typed on each; a row's own
+    # temperature wins.
+    row_temperatures = (
+        _segment_temperatures_by_row(draft_segments, edits, row_offset)
+        | row_temperatures
+    )
+    if row_temperatures:
+        conditions = _with_temperatures(
+            conditions,
+            field_samples
+            + _row_temperature_samples(
+                draft_segments, row_temperatures, row_offset, conditions
+            ),
         )
-        if row_temperatures:
-            conditions = _with_temperatures(
-                conditions,
-                field_samples
-                + _row_temperature_samples(
-                    draft_segments, row_temperatures, row_offset, conditions
-                ),
-            )
-        if row_winds and planning_mode == "hybrid":
-            drawn_leg_winds = _leg_winds_by_drawn_leg(
-                waypoints,
-                draft_segments,
-                row_winds,
-                row_offset,
-                conditions,
-                columns,
-                base=forecast_and_typed,
-            )
+    # Each drawn leg's air, settled from the draft: from here on a column
+    # answers the same wind at every altitude, and carries one deviation.
+    columns = _segment_air(
+        waypoints, draft_segments, columns, conditions, row_temperatures, row_offset
+    )
+    forecast_and_typed = _with_segment_winds(
+        _forecast_winds_by_drawn_leg(columns), waypoints, edits, conditions, columns
+    )
+    drawn_leg_winds: dict[int, dict[str, object]] | None = forecast_and_typed or None
+    if row_winds and planning_mode == "hybrid":
+        drawn_leg_winds = _leg_winds_by_drawn_leg(
+            waypoints,
+            draft_segments,
+            row_winds,
+            row_offset,
+            conditions,
+            columns,
+            base=forecast_and_typed,
+        )
 
     if conditions.temperatures is not None:
         warnings.extend(conditions.temperatures.lapse_warnings())
 
-    route, segments = lay_out(conditions, names, warnings, drawn_leg_winds)
+    route, segments = lay_out(conditions, names, warnings, drawn_leg_winds, columns)
 
     # A cruise altitude the flight never gets to. Said once for the flight
     # rather than per leg: on a short hop it is the whole story, and the legs
@@ -1389,6 +1429,14 @@ def _build_flight(
         # where none was.
         column = None if columns is None else columns.over(start, end)
         wind = (column or conditions.winds).at(altitude)
+        # The leg's own air for everything read below: its settled ISA
+        # deviation stands in for the route-wide temperature profile.
+        isa = None if columns is None else columns.isa_over(start, end)
+        row_conditions = (
+            conditions
+            if isa is None
+            else replace(conditions, temperatures=None, isa_deviation_c=isa)
+        )
         # The index this row takes in the finished navlog: rows already
         # emitted by earlier flights, plus rows emitted by this one. Zero
         # length legs are skipped above, so it matches what the caller sees.
@@ -1402,13 +1450,13 @@ def _build_flight(
         # fraction of a degree, and a number the pilot typed should read back
         # as the number they typed -- and be the number the charts are read at.
         leg_pressure_alt, pressure_offset = _leg_pressure_altitude(
-            override, altitude, conditions, phase=phase,
+            override, altitude, row_conditions, phase=phase,
             leg_name=leg_name, warnings=warnings,
         )
         leg_oat = (
             override.oat_c
             if override is not None and override.oat_c is not None
-            else conditions.oat_c(altitude)
+            else row_conditions.oat_c(altitude)
         )
 
         # A level row reads the cruise chart at its own altitude; a climb or a
@@ -1424,7 +1472,7 @@ def _build_flight(
             oat_c=leg_oat,
             entry_altitude_ft=segment.entry_altitude_ft,
             pressure_offset_ft=pressure_offset,
-            conditions=conditions,
+            conditions=row_conditions,
             aircraft=aircraft,
             default=cruise_point,
             leg_name=leg_name,
@@ -1465,7 +1513,7 @@ def _build_flight(
         level_gph = (
             _worst_level_gph(
                 segment.exit_altitude_ft,
-                conditions=conditions,
+                conditions=row_conditions,
                 pressure_offset_ft=pressure_offset,
                 default=leg_cruise.gph,
                 off_chart=leg_off_chart,
@@ -1848,6 +1896,12 @@ class _RouteColumns:
 
     spans: tuple[Segment, ...]
     by_leg: dict[int, WindsAloft]
+    temperatures_by_leg: dict[int, tuple[TemperatureSample, ...]] = dataclass_field(
+        default_factory=dict
+    )
+    # One ISA deviation per drawn leg, once `_segment_air` has settled it.
+    # Empty on the raw forecast, where temperature still varies by altitude.
+    isa_by_leg: dict[int, float] = dataclass_field(default_factory=dict)
 
     @classmethod
     def build(
@@ -1862,17 +1916,29 @@ class _RouteColumns:
             return None
         spans = drawn_spans(waypoints)
         by_leg: dict[int, WindsAloft] = {}
+        temperatures: dict[int, tuple[TemperatureSample, ...]] = {}
         for column in field.columns:
             index = _drawn_leg_of(spans, column.position)
             if index is not None:
                 by_leg[index] = column.winds
-        return cls(spans, by_leg) if by_leg else None
+                if column.temperatures:
+                    temperatures[index] = column.temperatures
+        return cls(spans, by_leg, temperatures) if by_leg else None
+
+    def leg_of(self, start: Waypoint, end: Waypoint) -> int | None:
+        """Which drawn leg a stretch of route is on, found by where it is."""
+        midpoint = inverse(start.position, end.position).point_at_fraction(0.5)
+        return _drawn_leg_of(self.spans, midpoint)
 
     def over(self, start: Waypoint, end: Waypoint) -> WindsAloft | None:
-        """The column over a stretch of route, found by where that stretch is."""
-        midpoint = inverse(start.position, end.position).point_at_fraction(0.5)
-        index = _drawn_leg_of(self.spans, midpoint)
+        """The column over a stretch of route."""
+        index = self.leg_of(start, end)
         return None if index is None else self.by_leg.get(index)
+
+    def isa_over(self, start: Waypoint, end: Waypoint) -> float | None:
+        """The settled ISA deviation over a stretch of route, if there is one."""
+        index = self.leg_of(start, end)
+        return None if index is None else self.isa_by_leg.get(index)
 
     def all_phases(self, winds: WindsAloft) -> dict[str, object]:
         """One column, offered to every phase the leg might be flown in.
@@ -1884,6 +1950,91 @@ class _RouteColumns:
         return dict.fromkeys(CONCRETE_SEGMENT_TYPES, winds)
 
 
+def _segment_air(
+    waypoints: list[Waypoint],
+    draft_segments: list[ProfileSegment],
+    columns: _RouteColumns | None,
+    conditions: Conditions,
+    row_temperatures: dict[int, float],
+    row_offset: int,
+) -> _RouteColumns:
+    """One wind and one ISA deviation for each leg the pilot drew.
+
+    A leg is planned in a single air: the same wind and the same temperature
+    offset on every row cut from it, climb, cruise or descent, and inside the
+    climbs and descents the planner fits into it. A forecast column answers
+    by altitude, so the one figure is the column read at each of the leg's
+    draft rows and averaged, each row weighing what it covers over the ground.
+    The draft is what says which rows those are and what altitude each flies
+    at; the real lay-out moves them a little, and is not chased (see the
+    note on the rehearsal in `_build_flight`).
+
+    Where a leg has no column -- no forecast, or a route with none fetched --
+    the route-wide profile is averaged the same way, so a leg is never flown
+    in two winds whichever source they come from. A temperature the pilot
+    typed on a row counts for that row in the average, the way the column's
+    own reading would have.
+    """
+    spans = drawn_spans(waypoints)
+    winds: dict[int, list[tuple[Wind, float]]] = {}
+    deviations: dict[int, list[tuple[float, float]]] = {}
+    row = row_offset
+    for segment in draft_segments:
+        geo = inverse(segment.start.position, segment.end.position)
+        if geo.distance_nm < _MIN_ROW_NM:
+            continue
+        typed_oat = row_temperatures.get(row)
+        row += 1
+        index = _drawn_leg_of(spans, geo.point_at_fraction(0.5))
+        if index is None:
+            continue
+        altitude = segment.altitude_ft
+        column = None if columns is None else columns.by_leg.get(index)
+        aloft = () if columns is None else columns.temperatures_by_leg.get(index, ())
+        if typed_oat is not None:
+            deviation = TemperatureSample.observed(
+                altitude, typed_oat, conditions.altimeter_inhg
+            ).isa_deviation_c
+        elif aloft:
+            deviation = TemperatureProfile.from_observations(
+                aloft, default_deviation_c=conditions.isa_deviation_c
+            ).deviation_at(conditions.pressure_altitude_ft(altitude))
+        else:
+            deviation = _isa_deviation_at(conditions, altitude)
+        winds.setdefault(index, []).append(
+            ((column or conditions.winds).at(altitude), geo.distance_nm)
+        )
+        deviations.setdefault(index, []).append((deviation, geo.distance_nm))
+
+    by_leg = {
+        index: WindsAloft.uniform(*_as_pair(_average_wind(samples)))
+        for index, samples in winds.items()
+    }
+    isa_by_leg = {
+        index: sum(d * w for d, w in samples) / sum(w for _, w in samples)
+        for index, samples in deviations.items()
+    }
+    return _RouteColumns(spans, by_leg, {}, isa_by_leg)
+
+
+def _as_pair(wind: Wind) -> tuple[float, float]:
+    return wind.from_deg, wind.speed_kt
+
+
+def _leg_air(
+    by_leg: dict[int, dict[str, object]] | None, columns: _RouteColumns | None
+) -> dict[int, LegAir] | None:
+    """The planner's per-leg winds and the settled deviations, as one map."""
+    winds = by_leg or {}
+    isa = {} if columns is None else columns.isa_by_leg
+    if not winds and not isa:
+        return None
+    return {
+        index: LegAir(dict(winds.get(index, {})), isa.get(index))
+        for index in sorted(set(winds) | set(isa))
+    }
+
+
 def _leg_winds_by_leg(
     route: list[Waypoint],
     row_winds: dict[int, tuple],
@@ -1891,7 +2042,7 @@ def _leg_winds_by_leg(
     conditions: Conditions,
     columns: _RouteColumns | None,
     edits: _SegmentEdits | None = None,
-) -> dict[int, dict[str, object]]:
+) -> dict[int, LegAir]:
     """The wind each leg of a resolved route is flown in.
 
     Two things arrive here. The forecast column over the leg, which belongs to
@@ -1904,12 +2055,13 @@ def _leg_winds_by_leg(
     wind reads its other half off that leg's own column. Keyed by phase as
     well as leg because that is the shape `resolve_route` needs.
     """
-    by_leg: dict[int, dict[str, object]] = {}
+    by_leg: dict[int, LegAir] = {}
     row = row_offset
     for index, (start, end) in enumerate(pairwise(route)):
         if inverse(start.position, end.position).distance_nm < _MIN_ROW_NM:
             continue
         column = None if columns is None else columns.over(start, end)
+        isa = None if columns is None else columns.isa_over(start, end)
         entry: dict[str, object] = (
             columns.all_phases(column) if column is not None else {}
         )
@@ -1925,8 +2077,8 @@ def _leg_winds_by_leg(
         typed = row_winds.get(row)
         if typed is not None:
             entry[end.segment_type] = TypedWind(column or conditions.winds, *typed)
-        if entry:
-            by_leg[index] = entry
+        if entry or isa is not None:
+            by_leg[index] = LegAir(entry, isa)
         row += 1
     return by_leg
 
