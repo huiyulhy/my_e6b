@@ -40,7 +40,7 @@ converts internally at the queried pressure altitude.
 
 ## What is not here
 - **Descent performance — the POH publishes none.** `engine/navlog.py` models descent as a
-  pilot technique instead: a constant `descent_rate_fpm` (500) at `descent_speed_kias` (90),
+  pilot technique instead: a constant `descent_rate_fpm` (500) at `descent_tas_kt` (90 KTAS),
   with fuel charged at the cruise flow. That last part is deliberately conservative — a real
   172 descending at partial power burns less. These are assumptions, not book numbers.
 - Crosswind component chart (Section 5)
