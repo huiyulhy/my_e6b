@@ -1,32 +1,32 @@
 """The weather list beside the navigation log, and the loop that settles them.
 
-This part manages the weather list by iterating in a forward and backward pass
-1 list: the one drawn by the pilot
-2nd list: the weather list that the plane flies through, so we can get performance
 Two lists, one entry per leg the pilot drew: the navlog rows, and the weather
 each of them was planned in. `solve` produces both, and they agree -- which is
 the whole difficulty, because each is an input to the other.
 
-**Why the two ends, and why the worse of them.** A leg is not a point. The
-forecast over the airport it starts at and the forecast over the airport it
-ends at are two different columns of air, and the aeroplane flies through
-both. Planning on either alone is a guess about which half of the leg matters;
-planning on the average is a wind that was forecast nowhere. So each leg is
-costed under both and planned in whichever costs more fuel. A plan that comes
-in early on the day is a good day; a plan that comes in late is a diversion.
+**One forecast per leg, over its midpoint.** A leg is planned in a single
+column of air, read by altitude (see `navlog._RouteColumns`), and the column is
+fetched over the leg's midpoint -- the one point nearest, on average, to every
+part of the leg. The model is asked there directly rather than at the two ends
+and averaged, since an average of two columns is air that was forecast
+nowhere. Legs are short enough for one column to stand for the whole of one.
 
+It was once the other way: each leg costed under the forecasts at both of its
+ends and planned in whichever burned more fuel. That biased every plan late,
+and a flight that beats its plan on every leg is a plan that is not saying
+what the day will be.
 
-1. Plan with no forecast, to learn roughly when each waypoint is reached.
-2. Choose each leg's weather from the forecasts at its two ends, at those
-   times, taking whichever costs more.
+The column is read at the hour the aeroplane passes the leg's midpoint, which
+is not known until the plan is built -- and the plan is built in the weather:
+
+1. Plan with no forecast, to learn roughly when each leg is flown.
+2. Read each leg's forecast at the hour its midpoint is passed.
 3. Plan again on that weather, which moves the times -- and the tops of climb.
-4. Re-choose. If nothing changed, the two lists agree and it is done.
-
+4. Re-read. If no leg's hour changed, the two lists agree and it is done.
 """
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from datetime import UTC, datetime, timedelta
@@ -45,9 +45,8 @@ __all__ = [
     "solve",
 ]
 
-# Max allowable number of forward and backward passes
+# Max allowable number of passes before the loop gives up settling
 MAX_PASSES = 6
-_UNFLYABLE = math.inf
 
 
 @dataclass(frozen=True)
@@ -65,7 +64,7 @@ class ForecastHour:
 
 @dataclass(frozen=True)
 class PointForecast:
-    """Every hour that was fetched over one point of the route.
+    """Every hour that was fetched over one leg's midpoint.
 
     A whole series rather than the single hour the plan will use, because
     which hour it uses is not known until the plan is built, and the plan is
@@ -96,7 +95,7 @@ class PointForecast:
 
 @dataclass(frozen=True)
 class LegWeather:
-    """The weather one drawn leg was planned in, and why that one.
+    """The weather one drawn leg was planned in.
 
     The second of the two lists. One entry per leg the pilot drew, in route
     order, including legs no forecast was available for -- a gap in the list
@@ -107,43 +106,31 @@ class LegWeather:
     from_name: str
     to_name: str
 
-    # "start" | "end" | "" when there was no forecast to choose from.
-    chosen: str = ""
+    # The forecast hour read, or `None` where there was nothing to read.
     valid_time: datetime | None = None
     winds: nl.WindsAloft = dataclass_field(default_factory=nl.WindsAloft.calm)
     temperatures: tuple[TemperatureSample, ...] = ()
-
-    # What each end was worth over this leg, in gallons. `None` where that end
-    # had no forecast, or where there was no plan yet to cost it against.
-    start_fuel_gal: float | None = None
-    end_fuel_gal: float | None = None
-    # An end whose wind no heading can hold the course in. Not a cost -- there
-    # is no number for it -- and not something to plan on either, so it is
-    # recorded rather than chosen. See `_choose_one`.
-    start_unflyable: bool = False
-    end_unflyable: bool = False
-    # The wind each end offered at the leg's own altitude, for the panel.
-    start_wind: nl.Wind | None = None
-    end_wind: nl.Wind | None = None
+    # The forecast's wind at the altitude the leg is mostly flown at, for the
+    # panel -- reported even when it could not be planned on.
+    wind: nl.Wind | None = None
+    # A wind no heading can hold the course in. Recorded rather than planned
+    # on; see `_read_leg`.
+    unflyable: bool = False
     note: str = ""
 
     @property
     def has_forecast(self) -> bool:
-        return bool(self.chosen)
-
-    @property
-    def wind(self) -> nl.Wind | None:
-        """The wind that was chosen, at the altitude the leg is flown at."""
-        return self.start_wind if self.chosen == "start" else self.end_wind
+        """Whether the leg is planned on this forecast."""
+        return self.valid_time is not None and not self.unflyable
 
     @property
     def key(self) -> tuple:
         """What has to stop changing before the two lists have settled.
 
-        The choice, not the numbers. Which end won and which hour it was read
-        at are both discrete, so this either changes on a pass or it does not.
+        Which hour was read, and whether it could be planned on: both are
+        discrete, so this either changes on a pass or it does not.
         """
-        return (self.chosen, self.valid_time)
+        return (self.has_forecast, self.valid_time)
 
 
 @dataclass(frozen=True)
@@ -164,10 +151,10 @@ class SolvedPlan:
             return (
                 (
                     f"the weather and the navigation log did not settle in "
-                    f"{self.passes} passes: the chosen forecast keeps changing "
-                    f"as the times move. The plan shown is the last pass -- "
-                    f"check the wind on each row against the forecast you were "
-                    f"briefed on"
+                    f"{self.passes} passes: the forecast hour each leg is read "
+                    f"at keeps changing as the times move. The plan shown is "
+                    f"the last pass -- check the wind on each row against the "
+                    f"forecast you were briefed on"
                 ),
             )
         return ()
@@ -189,14 +176,15 @@ def solve(
 ) -> SolvedPlan:
     """Build a navlog and the weather list it agrees with.
 
-    `forecasts` is one series per waypoint the pilot drew, in route order --
-    the same order and length as the route with its generated points removed.
-    A short list, or one with empty series in it, is not an error: the legs it
-    cannot cover are planned on whatever was typed on their rows, and on calm
-    below that, which is what a plan with no weather on it has always meant.
+    `forecasts` is one series per leg the pilot drew, fetched over the leg's
+    midpoint, in route order -- one fewer than the route with its generated
+    points removed. A short list, or one with empty series in it, is not an
+    error: the legs it cannot cover are planned on whatever was typed on their
+    rows, and on calm below that, which is what a plan with no weather on it
+    has always meant.
 
-    With no forecasts at all this is `build_navlog` with one extra comparison
-    that finds nothing, and it returns on the first pass.
+    With no forecasts at all this is `build_navlog`, and it returns on the
+    first pass.
     """
     conditions = conditions or nl.Conditions()
     drawn = nl.strip_generated(waypoints)
@@ -213,21 +201,21 @@ def solve(
             segment_overrides=segment_overrides,
         )
 
-    # Pass zero: no forecast at all, purely to learn roughly when each
-    # waypoint is reached. Its own winds are whatever the pilot typed.
+    # Pass zero: no forecast at all, purely to learn roughly when each leg is
+    # flown. Its own winds are whatever the pilot typed.
     weather: tuple[LegWeather, ...] = ()
     navlog = plan(weather)
     if not forecasts or not any(series.hours for series in forecasts):
         return SolvedPlan(navlog=navlog, weather=(), passes=1, settled=True)
 
     for attempt in range(1, max_passes + 1):
-        chosen = _choose(drawn, navlog, forecasts, off_blocks)
-        if _same(chosen, weather):
-            # The choice survived the plan it produced. The two lists agree.
+        read = _read(drawn, navlog, forecasts, off_blocks)
+        if _same(read, weather):
+            # The hours survived the plan they produced. The two lists agree.
             return SolvedPlan(
-                navlog=navlog, weather=chosen, passes=attempt, settled=True
+                navlog=navlog, weather=read, passes=attempt, settled=True
             )
-        weather = chosen
+        weather = read
         navlog = plan(weather)
 
     # Out of passes. The last plan is returned rather than nothing -- it is a
@@ -238,10 +226,10 @@ def solve(
     )
 
 
-# --- choosing -------------------------------------------------------------
+# --- reading --------------------------------------------------------------
 
 
-def _choose(
+def _read(
     drawn: list[nl.Waypoint],
     navlog: nl.Navlog,
     forecasts: tuple[PointForecast, ...],
@@ -249,187 +237,122 @@ def _choose(
 ) -> tuple[LegWeather, ...]:
     """The weather list for one pass, read off the navlog of the pass before.
 
-    The navlog supplies two things: when each waypoint is reached, which picks
-    the forecast hour at each end, and what each leg costs, which is how the
-    two ends are compared.
+    The navlog supplies two things: when each leg's midpoint is passed, which
+    picks the forecast hour, and the leg's rows, which the forecast's wind is
+    checked against.
     """
-    times = _arrival_times(navlog, drawn, off_blocks)
+    times = _midpoint_times(navlog, drawn, off_blocks)
     rows = nl.rows_by_drawn_leg(navlog.legs, drawn)
-
-    chosen: list[LegWeather] = []
+    read: list[LegWeather] = []
     for index in range(len(drawn) - 1):
-        start = _series(forecasts, index)
-        end = _series(forecasts, index + 1)
-        chosen.append(
-            _choose_one(
+        series = _series(forecasts, index)
+        read.append(
+            _read_leg(
                 index=index,
                 from_name=drawn[index].name,
                 to_name=drawn[index + 1].name,
                 rows=rows.get(index, []),
-                start=None if start is None else start.at(times[index]),
-                end=None if end is None else end.at(times[index + 1]),
+                hour=None if series is None else series.at(times[index]),
             )
         )
-    return tuple(chosen)
+    return tuple(read)
 
 
-def _choose_one(
+def _read_leg(
     *,
     index: int,
     from_name: str,
     to_name: str,
     rows: list[nl.Leg],
-    start: ForecastHour | None,
-    end: ForecastHour | None,
+    hour: ForecastHour | None,
 ) -> LegWeather:
-    """One leg, costed at both ends, planned in the more expensive.
+    """One leg, in the forecast over its midpoint.
 
-    Fuel rather than time, because fuel is what a reserve is measured in and
-    the two can disagree: a leg flown higher is slower over the ground and
-    cheaper per hour. Where the two ends cost the same -- which they do
-    whenever the forecast is uniform, and on the first pass before there is
-    anything to cost against -- the leg is planned on the forecast for the end
-    it is *reached at*, since that is the later and less certain of the two.
-
-    An end whose wind no heading can hold the course in is not chosen, even
-    though it is the most expensive thing there is. Planning on it would make
-    the route unbuildable and leave the pilot looking at an error instead of
-    at a plan -- so the other end is used and the fact is written on the leg,
-    which says strictly more than the refusal would have.
+    A wind no heading can hold the course in is not planned on. Planning on it
+    would make the route unbuildable and leave the pilot looking at an error
+    instead of at a plan -- so the leg falls back to the wind typed on its
+    rows, and the fact is written on the leg, which says strictly more than
+    the refusal would have.
     """
     identity = {"leg": index, "from_name": from_name, "to_name": to_name}
-
-    if start is None and end is None:
+    if hour is None:
         return LegWeather(**identity, note="no forecast over this leg")
 
-    start_fuel = None if start is None else _fuel_gal(rows, start.winds)
-    end_fuel = None if end is None else _fuel_gal(rows, end.winds)
-    start_out = start_fuel == _UNFLYABLE
-    end_out = end_fuel == _UNFLYABLE
-    measured = {
-        "start_fuel_gal": None if start_out else start_fuel,
-        "end_fuel_gal": None if end_out else end_fuel,
-        "start_unflyable": start_out,
-        "end_unflyable": end_out,
-        "start_wind": None if start is None else _wind_over(rows, start.winds),
-        "end_wind": None if end is None else _wind_over(rows, end.winds),
+    found = {
+        "valid_time": hour.valid_time,
+        "wind": _wind_over(rows, hour.winds),
     }
-    cannot = _unflyable_note(from_name, to_name, start_out, end_out)
-
-    if start_out and end_out:
-        return LegWeather(**identity, **measured, note=cannot)
-    if start is None or start_out:
-        pick, why = "end", f"only {to_name} has a forecast to plan on"
-    elif end is None or end_out:
-        pick, why = "start", f"only {from_name} has a forecast to plan on"
-    elif start_fuel > end_fuel:
-        pick = "start"
-        why = (
-            f"{from_name}'s forecast costs {start_fuel:.1f} gal against "
-            f"{to_name}'s {end_fuel:.1f}"
+    if not _flyable(rows, hour.winds):
+        return LegWeather(
+            **identity,
+            **found,
+            unflyable=True,
+            note=(
+                f"the forecast between {from_name} and {to_name} cannot be "
+                f"flown at all -- the wind exceeds what the aeroplane can hold "
+                f"the course against; this leg falls back to the wind typed on "
+                f"its rows"
+            ),
         )
-    elif end_fuel > start_fuel:
-        pick = "end"
-        why = (
-            f"{to_name}'s forecast costs {end_fuel:.1f} gal against "
-            f"{from_name}'s {start_fuel:.1f}"
-        )
-    else:
-        pick = "end"
-        why = (
-            f"both ends cost the same; planned on {to_name}'s forecast, the "
-            f"later of the two"
-        )
-
-    hour = start if pick == "start" else end
     return LegWeather(
-        **identity,
-        **measured,
-        chosen=pick,
-        valid_time=hour.valid_time,
-        winds=hour.winds,
-        temperatures=hour.temperatures,
-        note="; ".join(part for part in (cannot, why) if part),
+        **identity, **found, winds=hour.winds, temperatures=hour.temperatures
     )
 
 
-def _unflyable_note(
-    from_name: str, to_name: str, start_out: bool, end_out: bool
-) -> str:
-    """Said plainly, because it is the most important thing on the leg."""
-    out = [name for name, gone in ((from_name, start_out), (to_name, end_out)) if gone]
-    if not out:
-        return ""
-    which = " and ".join(out)
-    tail = (
-        "neither end can be planned on, so this leg falls back to the wind "
-        "typed on its rows"
-        if start_out and end_out
-        else "planned on the other end instead"
-    )
-    return (
-        f"the forecast at {which} cannot be flown at all -- the wind exceeds "
-        f"what the aeroplane can hold the course against; {tail}"
-    )
+def _flyable(rows: list[nl.Leg], winds: nl.WindsAloft) -> bool:
+    """Whether every row of the leg can hold its course in this wind.
 
-
-def _fuel_gal(rows: list[nl.Leg], winds: nl.WindsAloft) -> float | None:
-    """What this leg's rows would burn in a given wind.
-
-    Read off the rows as they already stand: their distance, their altitude,
-    their true airspeed and the fuel flow the POH gave them. Only the ground
-    speed is recomputed, because only the wind is being varied -- the power
-    setting is the same under either forecast, so the chart does not need
-    reading again to compare them.
-
-    `None` with no rows to cost, which is every leg on the first pass.
+    Read off the rows as they already stand -- their course, altitude and true
+    airspeed -- with only the wind varied. No rows, which is every leg on the
+    first pass, has nothing to fail.
     """
-    if not rows:
-        return None
-    total = 0.0
     for row in rows:
-        wind = winds.at(row.altitude_ft)
-        minutes = _minutes(row, wind)
-        if minutes == _UNFLYABLE:
-            return _UNFLYABLE
-        # The row's own fuel flow, recovered from what it was charged. A row
-        # of no length has none to recover and costs nothing either way.
-        if row.ete_min <= 0.0:
+        if row.tas_kt <= 0.0:
             continue
-        total += row.fuel_gal * minutes / row.ete_min
-    return total
-
-
-def _minutes(row: nl.Leg, wind: nl.Wind) -> float:
-    """How long the row takes in a wind, or `_UNFLYABLE` if it cannot be flown."""
-    if row.tas_kt <= 0.0:
-        return 0.0
-    try:
-        triangle = solve_wind_triangle(
-            row.true_course_deg, row.tas_kt, wind.from_deg, wind.speed_kt
-        )
-    except WindTooStrong:
-        return _UNFLYABLE
-    if triangle.ground_speed_kt <= 0.0:
-        return _UNFLYABLE
-    return 60.0 * row.distance_nm / triangle.ground_speed_kt
+        wind = winds.at(row.altitude_ft)
+        try:
+            triangle = solve_wind_triangle(
+                row.true_course_deg, row.tas_kt, wind.from_deg, wind.speed_kt
+            )
+        except WindTooStrong:
+            return False
+        if triangle.ground_speed_kt <= 0.0:
+            return False
+    return True
 
 
 def _wind_over(rows: list[nl.Leg], winds: nl.WindsAloft) -> nl.Wind | None:
     """The wind at the altitude the leg is mostly flown at, for reporting."""
     if not rows:
         return None
-    highest = max(rows, key=lambda row: row.distance_nm)
-    return winds.at(highest.altitude_ft)
+    longest = max(rows, key=lambda row: row.distance_nm)
+    return winds.at(longest.altitude_ft)
 
 
 def _series(
     forecasts: tuple[PointForecast, ...], index: int
 ) -> PointForecast | None:
-    """The series for one waypoint, or `None` where the list is short."""
+    """The series for one leg, or `None` where the list is short."""
     if 0 <= index < len(forecasts) and forecasts[index].hours:
         return forecasts[index]
     return None
+
+
+def _midpoint_times(
+    navlog: nl.Navlog, drawn: list[nl.Waypoint], off_blocks: datetime | None
+) -> list[datetime | None]:
+    """When each drawn leg's midpoint is passed, one per leg.
+
+    Half way in time between reaching the leg's two ends. Not the same instant
+    as half way along it -- the climb is slower over the ground than the cruise
+    -- but the forecast is read to the nearest hour, and on a leg short enough
+    for one column to stand for it the two round to the same one.
+    """
+    reached = _arrival_times(navlog, drawn, off_blocks)
+    return [
+        None if start is None or end is None else start + (end - start) / 2
+        for start, end in zip(reached, reached[1:])
+    ]
 
 
 def _arrival_times(
@@ -464,11 +387,11 @@ def _arrival_times(
 
 
 def _same(left: tuple[LegWeather, ...], right: tuple[LegWeather, ...]) -> bool:
-    """Whether two weather lists make the same choices."""
+    """Whether two weather lists read the same hours."""
     return [entry.key for entry in left] == [entry.key for entry in right]
 
 
-# --- handing the choice back to the navlog --------------------------------
+# --- handing the weather back to the navlog -------------------------------
 
 
 def _with_weather(
@@ -476,16 +399,16 @@ def _with_weather(
     drawn: list[nl.Waypoint],
     weather: tuple[LegWeather, ...],
 ) -> nl.Conditions:
-    """The conditions a pass is planned in, given the weather chosen for it.
+    """The conditions a pass is planned in, given the weather read for it.
 
     The column goes in whole -- wind and temperature together -- placed at
-    each leg's midpoint, which is how `navlog._RouteColumns` finds it again:
-    by where it is, so that the tops of climb can move under it without it
-    moving with them. The navlog settles each leg's column into the one wind
-    and one ISA deviation the leg is flown in (`navlog._segment_air`). The
-    temperatures also go in route-wide, merging with the fields' own reports
-    into the curve that legs with no column of their own, and the rows on the
-    ground, still read.
+    the leg's midpoint, where it was fetched and which is how
+    `navlog._RouteColumns` finds it again: by where it is, so that the tops of
+    climb can move under it without it moving with them. The navlog flies each
+    leg in its column's wind and temperature profiles, read at each row's
+    altitude. The temperatures also go in route-wide, merging with the fields'
+    own reports into the curve that legs with no column of their own, and the
+    rows on the ground, still read.
     """
     if not weather:
         return conditions

@@ -1,10 +1,11 @@
 """The weather list beside the navlog, and the loop that settles the two.
 
 Two things are tested here and they are different. The **rule** -- a leg is
-planned in whichever of its two ends costs more fuel -- is a comparison, and
-it is checked by putting a known headwind at one end and a known tailwind at
-the other. The **loop** is a fixed point, and what is checked there is that it
-reaches one, that it notices when it has, and that it says so when it cannot.
+planned in the forecast over its midpoint, at the hour that midpoint is
+passed -- is checked by putting a known headwind over one leg and a known
+tailwind over the next. The **loop** is a fixed point, and what is checked
+there is that it reaches one, that it notices when it has, and that it says so
+when it cannot.
 
 The forecasts are built by hand rather than fetched. `solve` takes them
 already parsed, which is what makes any of this testable offline.
@@ -19,7 +20,7 @@ import pytest
 from engine import navlog as nl
 from engine import planwx as pw
 from engine.atmosphere import TemperatureSample
-from engine.geo import LatLon
+from engine.geo import LatLon, inverse
 
 # Three fields west to east, so an easterly is a headwind the whole way and a
 # westerly is a tailwind. KSQL to KLVK is short; KLVK to KMOD is longer.
@@ -32,21 +33,22 @@ CONDITIONS = nl.Conditions(flight_date=date(2026, 9, 3))
 
 HEADWIND = nl.WindsAloft.uniform(90.0, 30.0)  # easterly, against an eastbound leg
 TAILWIND = nl.WindsAloft.uniform(270.0, 30.0)
-CALM = nl.WindsAloft.calm()
+GALE = nl.WindsAloft.uniform(180.0, 400.0)  # no heading holds a course in it
 
 
-def hours(winds, count=6, temperatures=(), start=OFF_BLOCKS):
+def hours(winds, count=6, temperatures=(), start=OFF_BLOCKS, step=timedelta(hours=1)):
     """A flat forecast: the same column at every hour of the window."""
     return tuple(
-        pw.ForecastHour(start + timedelta(hours=n), winds, temperatures)
+        pw.ForecastHour(start + n * step, winds, temperatures)
         for n in range(count)
     )
 
 
-def point(waypoint, winds=None, **kwargs):
+def leg(start, end, winds=None, **kwargs):
+    """The forecast over one leg's midpoint."""
     return pw.PointForecast(
-        name=waypoint.name,
-        position=waypoint.position,
+        name=f"{start.name}-{end.name}",
+        position=inverse(start.position, end.position).point_at_fraction(0.5),
         hours=() if winds is None else hours(winds, **kwargs),
     )
 
@@ -64,87 +66,63 @@ def solve(waypoints, forecasts, off_blocks=OFF_BLOCKS, **kwargs):
 
 
 def flying(navlog):
-    return [leg for leg in navlog.legs if leg.covers_ground]
+    return [row for row in navlog.legs if row.covers_ground]
+
+
+def rows_of(solved, route):
+    return nl.rows_by_drawn_leg(solved.navlog.legs, route)
 
 
 class TestTheRule:
-    """Two ends, and the one that costs more."""
+    """One forecast per leg, over its midpoint."""
 
-    def test_the_headwind_end_is_the_one_planned_in(self):
-        solved = solve([KSQL, KMOD], [point(KSQL, HEADWIND), point(KMOD, TAILWIND)])
+    def test_each_leg_is_flown_in_its_own_midpoints_forecast(self):
+        route = [KSQL, KLVK, KMOD]
+        solved = solve(route, [leg(KSQL, KLVK, HEADWIND), leg(KLVK, KMOD, TAILWIND)])
+        rows = rows_of(solved, route)
+        assert all(r.wind_from_deg == pytest.approx(90.0) for r in rows[0])
+        assert all(r.wind_from_deg == pytest.approx(270.0) for r in rows[1])
+
+    def test_the_forecast_wind_is_reported_on_the_leg(self):
+        solved = solve([KSQL, KMOD], [leg(KSQL, KMOD, HEADWIND)])
         entry = solved.weather[0]
-        assert entry.chosen == "start"
-        assert entry.start_fuel_gal > entry.end_fuel_gal
-        # And the rows are actually flown in it.
-        assert all(leg.wind_from_deg == pytest.approx(90.0) for leg in flying(solved.navlog))
-
-    def test_and_it_is_the_end_that_wins_not_the_departure(self):
-        """The rule is 'costs more', not 'is nearer the start'."""
-        solved = solve([KSQL, KMOD], [point(KSQL, TAILWIND), point(KMOD, HEADWIND)])
-        assert solved.weather[0].chosen == "end"
-        assert all(leg.wind_from_deg == pytest.approx(90.0) for leg in flying(solved.navlog))
-
-    def test_the_comparison_is_shown_in_gallons(self):
-        """Both ends' costs are reported, not just the winner's.
-
-        A pilot can see from them whether the choice was close or obvious.
-        """
-        solved = solve([KSQL, KMOD], [point(KSQL, HEADWIND), point(KMOD, TAILWIND)])
-        entry = solved.weather[0]
-        assert entry.start_fuel_gal > 0
-        assert entry.end_fuel_gal > 0
-        assert "gal" in entry.note
-
-    def test_an_end_nothing_can_hold_a_course_in_is_reported_not_planned_on(self):
-        """The most expensive forecast there is, and the one thing not chosen.
-
-        Planning on it would make the route unbuildable and leave the pilot
-        looking at an error instead of a plan. The other end is used and the
-        leg says what happened, which is strictly more than the refusal.
-        """
-        gale = nl.WindsAloft.uniform(180.0, 400.0)
-        solved = solve([KSQL, KMOD], [point(KSQL, gale), point(KMOD, CALM)])
-        entry = solved.weather[0]
-        assert entry.start_unflyable
-        assert entry.chosen == "end"
-        assert "cannot be flown" in entry.note
-        assert flying(solved.navlog)  # and a plan came back
-
-    def test_both_ends_unflyable_leaves_the_leg_with_no_forecast(self):
-        gale = nl.WindsAloft.uniform(180.0, 400.0)
-        solved = solve([KSQL, KMOD], [point(KSQL, gale), point(KMOD, gale)])
-        entry = solved.weather[0]
-        assert entry.chosen == ""
-        assert entry.start_unflyable and entry.end_unflyable
-        assert "neither end" in entry.note
-        assert flying(solved.navlog)
+        assert entry.has_forecast
+        assert entry.wind.from_deg == pytest.approx(90.0)
+        assert entry.wind.speed_kt == pytest.approx(30.0)
 
     def test_the_column_travels_whole_wind_and_temperature_together(self):
-        """Not the worst wind from one end and the worst temperature from the
-        other: half of one forecast against half of another describes air that
-        neither of them reported."""
         warm = (TemperatureSample(6000.0, 20.0),)
-        solved = solve(
-            [KSQL, KMOD],
-            [point(KSQL, HEADWIND, temperatures=warm), point(KMOD, TAILWIND)],
-        )
+        solved = solve([KSQL, KMOD], [leg(KSQL, KMOD, HEADWIND, temperatures=warm)])
+        assert solved.weather[0].temperatures == warm
+
+    def test_a_wind_nothing_can_hold_a_course_in_is_reported_not_planned_on(self):
+        """Planning on it would make the route unbuildable and leave the pilot
+        looking at an error instead of a plan. The leg falls back to calm and
+        says what happened, which is strictly more than the refusal."""
+        solved = solve([KSQL, KMOD], [leg(KSQL, KMOD, GALE)])
         entry = solved.weather[0]
-        assert entry.chosen == "start"
-        assert entry.temperatures == warm
+        assert entry.unflyable
+        assert not entry.has_forecast
+        assert "cannot be flown" in entry.note
+        assert flying(solved.navlog)  # and a plan came back
+        assert all(r.wind_speed_kt == pytest.approx(0.0) for r in flying(solved.navlog))
 
 
-class TestWhenAnEndIsMissing:
-    def test_one_end_with_no_forecast_leaves_the_other_to_it(self):
-        solved = solve([KSQL, KMOD], [point(KSQL), point(KMOD, HEADWIND)])
-        entry = solved.weather[0]
-        assert entry.chosen == "end"
-        assert "only KMOD" in entry.note
+class TestWhenALegIsMissing:
+    def test_a_leg_with_no_forecast_is_flown_calm(self):
+        route = [KSQL, KLVK, KMOD]
+        solved = solve(route, [leg(KSQL, KLVK, HEADWIND), leg(KLVK, KMOD)])
+        assert solved.weather[0].has_forecast
+        assert not solved.weather[1].has_forecast
+        assert "no forecast" in solved.weather[1].note
+        rows = rows_of(solved, route)
+        assert all(r.wind_speed_kt == pytest.approx(0.0) for r in rows[1])
 
-    def test_neither_end_leaves_the_leg_with_no_forecast(self):
+    def test_no_forecast_anywhere_leaves_no_list(self):
         """And the plan is the one it would have been: calm, as always."""
-        solved = solve([KSQL, KMOD], [point(KSQL), point(KMOD)])
+        solved = solve([KSQL, KMOD], [leg(KSQL, KMOD)])
         assert solved.weather == ()
-        assert all(leg.wind_speed_kt == pytest.approx(0.0) for leg in flying(solved.navlog))
+        assert all(r.wind_speed_kt == pytest.approx(0.0) for r in flying(solved.navlog))
 
     def test_a_gap_in_the_middle_still_leaves_one_entry_per_leg(self):
         """The list is read positionally against the route.
@@ -152,20 +130,17 @@ class TestWhenAnEndIsMissing:
         A leg dropped rather than reported empty would shift every entry after
         it onto the wrong leg.
         """
-        solved = solve(
-            [KSQL, KLVK, KMOD], [point(KSQL, HEADWIND), point(KLVK), point(KMOD)]
-        )
-        assert len(solved.weather) == 2
+        route = [KSQL, KLVK, KMOD]
+        solved = solve(route, [leg(KSQL, KLVK), leg(KLVK, KMOD, HEADWIND)])
         assert [entry.leg for entry in solved.weather] == [0, 1]
-        assert solved.weather[0].chosen == "start"
-        assert solved.weather[1].chosen == ""
-        assert "no forecast" in solved.weather[1].note
+        assert not solved.weather[0].has_forecast
+        assert solved.weather[1].has_forecast
 
     def test_a_short_forecast_list_is_not_an_error(self):
-        solved = solve([KSQL, KLVK, KMOD], [point(KSQL, HEADWIND)])
+        solved = solve([KSQL, KLVK, KMOD], [leg(KSQL, KLVK, HEADWIND)])
         assert len(solved.weather) == 2
-        assert solved.weather[0].chosen == "start"
-        assert solved.weather[1].chosen == ""
+        assert solved.weather[0].has_forecast
+        assert not solved.weather[1].has_forecast
 
 
 class TestTheLoop:
@@ -178,31 +153,46 @@ class TestTheLoop:
         assert solved.notes == ()
 
     def test_a_settled_run_says_how_many_passes_it_took(self):
-        solved = solve([KSQL, KMOD], [point(KSQL, HEADWIND), point(KMOD, TAILWIND)])
+        solved = solve([KSQL, KMOD], [leg(KSQL, KMOD, HEADWIND)])
         assert solved.settled
         assert 1 < solved.passes <= pw.MAX_PASSES
         assert solved.notes == ()
 
-    def test_a_later_leg_is_read_at_a_later_forecast_hour(self):
-        """The point of the loop: when a leg is reached decides its weather.
+    def test_a_leg_is_read_at_the_hour_its_midpoint_is_passed(self):
+        """Not at departure and not at arrival: half way between the two.
 
-        The second leg of this route is reached over an hour after the first,
-        so it must not be planned on the departure hour.
+        Forecast every ten minutes so the hours are fine enough to tell.
         """
+        solved = solve(
+            [KSQL, KMOD],
+            [leg(KSQL, KMOD, HEADWIND, count=18, step=timedelta(minutes=10))],
+        )
+        arrival = OFF_BLOCKS + timedelta(
+            minutes=next(r for r in solved.navlog.legs if r.to_name == "KMOD").cumulative_ete_min
+        )
+        middle = OFF_BLOCKS + (arrival - OFF_BLOCKS) / 2
+        read = solved.weather[0].valid_time
+        assert OFF_BLOCKS < read < arrival
+        assert abs(read - middle) <= timedelta(minutes=5)
+
+    def test_a_later_leg_is_read_at_a_later_forecast_hour(self):
+        """The point of the loop: when a leg is flown decides its weather."""
         slow = nl.WindsAloft.uniform(90.0, 40.0)  # a headwind, to stretch the day out
         solved = solve(
             [KSQL, KLVK, KMOD],
-            [point(KSQL, slow), point(KLVK, slow), point(KMOD, slow)],
+            [
+                leg(KSQL, KLVK, slow, count=18, step=timedelta(minutes=10)),
+                leg(KLVK, KMOD, slow, count=18, step=timedelta(minutes=10)),
+            ],
         )
         first, second = solved.weather
-        assert first.valid_time is not None and second.valid_time is not None
         assert second.valid_time > first.valid_time
 
     def test_with_no_off_blocks_every_leg_reads_the_hour_it_was_fetched_for(self):
-        """Nothing about the times can move the choice, so it settles at once."""
+        """Nothing about the times can move the hours, so it settles at once."""
         solved = solve(
             [KSQL, KLVK, KMOD],
-            [point(KSQL, HEADWIND), point(KLVK, HEADWIND), point(KMOD, HEADWIND)],
+            [leg(KSQL, KLVK, HEADWIND), leg(KLVK, KMOD, HEADWIND)],
             off_blocks=None,
         )
         assert solved.settled
@@ -217,11 +207,7 @@ class TestTheLoop:
         forecast that genuinely oscillates: what is being tested is the cap
         and what it says, and one pass can never confirm itself.
         """
-        solved = solve(
-            [KSQL, KMOD],
-            [point(KSQL, HEADWIND), point(KMOD, TAILWIND)],
-            max_passes=1,
-        )
+        solved = solve([KSQL, KMOD], [leg(KSQL, KMOD, HEADWIND)], max_passes=1)
         assert not solved.settled
         assert solved.passes == 1
         assert solved.notes and "did not settle" in solved.notes[0]
@@ -234,9 +220,9 @@ class TestTheLoop:
         arrives sooner, so every later row is reached at a different time.
         """
         calm = solve([KSQL, KMOD], [])
-        blown = solve([KSQL, KMOD], [point(KSQL, HEADWIND), point(KMOD, HEADWIND)])
-        calm_toc = next(leg for leg in flying(calm.navlog) if leg.end_role == "TOC")
-        blown_toc = next(leg for leg in flying(blown.navlog) if leg.end_role == "TOC")
+        blown = solve([KSQL, KMOD], [leg(KSQL, KMOD, HEADWIND)])
+        calm_toc = next(r for r in flying(calm.navlog) if r.end_role == "TOC")
+        blown_toc = next(r for r in flying(blown.navlog) if r.end_role == "TOC")
         assert blown_toc.distance_nm < calm_toc.distance_nm
 
 
@@ -246,7 +232,7 @@ class TestTheTwoListsAgree:
     def test_every_drawn_leg_has_exactly_one_entry_in_route_order(self):
         solved = solve(
             [KSQL, KLVK, KMOD],
-            [point(KSQL, HEADWIND), point(KLVK, TAILWIND), point(KMOD, HEADWIND)],
+            [leg(KSQL, KLVK, HEADWIND), leg(KLVK, KMOD, TAILWIND)],
         )
         assert [(e.from_name, e.to_name) for e in solved.weather] == [
             ("KSQL", "KLVK"),
@@ -256,15 +242,14 @@ class TestTheTwoListsAgree:
     def test_each_rows_wind_is_the_one_its_leg_was_planned_in(self):
         """Including the rows the planner invented, which have no leg of their
         own: a top of climb splits a row in two without splitting the sky."""
-        solved = solve(
-            [KSQL, KLVK, KMOD],
-            [point(KSQL, HEADWIND), point(KLVK, CALM), point(KMOD, CALM)],
-        )
-        rows = nl.rows_by_drawn_leg(solved.navlog.legs, [KSQL, KLVK, KMOD])
+        route = [KSQL, KLVK, KMOD]
+        solved = solve(route, [leg(KSQL, KLVK, HEADWIND), leg(KLVK, KMOD, TAILWIND)])
+        rows = rows_of(solved, route)
         for entry in solved.weather:
             for row in rows.get(entry.leg, []):
                 expected = entry.winds.at(row.altitude_ft)
                 assert row.wind_speed_kt == pytest.approx(expected.speed_kt, abs=0.1)
+                assert row.wind_from_deg == pytest.approx(expected.from_deg, abs=0.1)
 
     def test_a_route_with_a_stop_gets_a_column_on_each_of_its_flights(self):
         """Two flights, two legs, and the weather list spans both."""
@@ -273,8 +258,8 @@ class TestTheTwoListsAgree:
         )
         solved = solve(
             [KSQL, stop, KMOD],
-            [point(KSQL, HEADWIND), point(stop, HEADWIND), point(KMOD, TAILWIND)],
+            [leg(KSQL, stop, HEADWIND), leg(stop, KMOD, TAILWIND)],
         )
         assert len(solved.weather) == 2
         assert all(entry.has_forecast for entry in solved.weather)
-        assert all(leg.wind_speed_kt > 0 for leg in flying(solved.navlog))
+        assert all(r.wind_speed_kt > 0 for r in flying(solved.navlog))

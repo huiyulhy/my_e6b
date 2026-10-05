@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Literal
 
 from engine import performance as perf
 from engine import preflight
-from engine.atmosphere import tas_from_cas
+from engine.atmosphere import TemperatureProfile, tas_from_cas
 from engine.geo import (
     LatLon,
     Segment,
@@ -49,15 +49,15 @@ SegmentType = Literal["climb", "cruise", "descent", "automatic"]
 class LegAir:
     """The air one leg the pilot drew is planned in.
 
-    One wind per phase -- something answering `at(altitude_ft)` -- and one ISA
-    deviation for the whole leg. Both are the leg's, not an altitude's: every
-    row cut from the leg, and every climb or descent the planner fits into it,
-    is flown in this same air. `None` for the deviation leaves the route-wide
-    temperature profile in charge.
+    One wind per phase -- something answering `at(altitude_ft)`, normally the
+    forecast column's profile -- and the column's temperature profile. Both
+    are read by altitude: each row at its own (a climb or descent at its
+    midpoint), and a climb or descent band by band as it is integrated. `None`
+    for the temperatures leaves the route-wide profile in charge.
     """
 
     winds_by_phase: dict[str, "object"] = dataclass_field(default_factory=dict)
-    isa_deviation_c: float | None = None
+    temperatures: TemperatureProfile | None = None
 
 
 LegWinds = dict[int, LegAir]
@@ -923,22 +923,15 @@ def _in_phase_wind(
 
 
 def _in_air(conditions: Conditions, air: LegAir | None, phase: str) -> Conditions:
-    """`conditions` with one leg's wind and temperature swapped in.
-
-    The ISA deviation replaces the route-wide temperature profile outright for
-    the same reason the wind does: it is a statement about the leg, held at
-    every altitude the leg is flown through, not a sample to interpolate
-    between.
-    """
+    """`conditions` with one leg's wind and temperature profiles swapped in."""
     if air is None:
         return conditions
     changes: dict[str, object] = {}
     winds = air.winds_by_phase.get(phase)
     if winds is not None:
         changes["winds"] = winds
-    if air.isa_deviation_c is not None:
-        changes["temperatures"] = None
-        changes["isa_deviation_c"] = air.isa_deviation_c
+    if air.temperatures is not None:
+        changes["temperatures"] = air.temperatures
     return replace(conditions, **changes) if changes else conditions
 
 

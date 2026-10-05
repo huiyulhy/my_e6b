@@ -172,12 +172,12 @@ class ForecastHourIn(BaseModel):
 
 
 class PointForecastIn(BaseModel):
-    """Every hour fetched over one waypoint of the route.
+    """Every hour fetched over one leg's midpoint.
 
-    One of these per waypoint the pilot drew, in route order. A window rather
-    than a single hour because `engine/planwx` re-reads it as the times move:
-    a leg's weather is chosen from the forecast at the hour that leg is
-    actually reached, and that hour is not known until the plan is built.
+    One of these per leg the pilot drew, in route order. A window rather than
+    a single hour because `engine/planwx` re-reads it as the times move: a
+    leg's weather is read at the hour its midpoint is passed, and that hour is
+    not known until the plan is built.
     """
 
     name: str = ""
@@ -251,11 +251,10 @@ class PlanRequest(BaseModel):
     # Edits filed under the leg they were typed on. What the UI sends; the
     # row-indexed `overrides` above remain for callers that want one row.
     segment_overrides: list[SegmentOverrideIn] = Field(default_factory=list)
-    # One forecast series per waypoint the pilot drew, in route order, from
-    # "Get weather". Each leg is then costed at both of its ends and planned
-    # in whichever costs more. Empty is the ordinary case and means every leg
-    # reads the wind typed on its row, or calm -- which is what a plan with
-    # nothing entered has always meant.
+    # One forecast series per leg the pilot drew, fetched over its midpoint,
+    # in route order, from "Get weather". Empty is the ordinary case and means
+    # every leg reads the wind typed on its row, or calm -- which is what a
+    # plan with nothing entered has always meant.
     forecasts: list[PointForecastIn] = Field(default_factory=list)
     # How far either side of track a NOTAM still counts as being on the route.
     notam_corridor_nm: float = nt.DEFAULT_CORRIDOR_NM
@@ -1284,8 +1283,7 @@ def plan(request: PlanRequest) -> dict:
             "extrapolated_legs": list(log.extrapolated_legs),
         },
         # The second of the two lists: the weather each leg the pilot drew was
-        # planned in, and which end of the leg it came from. Empty when
-        # nothing was fetched.
+        # planned in. Empty when nothing was fetched.
         "weather": [_leg_weather_json(entry) for entry in solved.weather],
         "weather_passes": solved.passes,
         "weather_settled": solved.settled,
@@ -1307,24 +1305,15 @@ def _leg_weather_json(entry: pw.LegWeather) -> dict:
         "leg": entry.leg,
         "from": entry.from_name,
         "to": entry.to_name,
-        # "start" | "end" | "" -- which end of the leg the forecast came from.
-        "chosen": entry.chosen,
+        # Whether the leg is planned on this forecast. False with no forecast,
+        # or with one whose wind no heading can hold the course in.
+        "planned": entry.has_forecast,
         "valid_time": None if entry.valid_time is None else entry.valid_time.isoformat(),
-        # What each end was worth over this leg. The comparison that decided
-        # it, shown rather than asserted.
-        "start_fuel_gal": _finite(entry.start_fuel_gal),
-        "end_fuel_gal": _finite(entry.end_fuel_gal),
-        "start_wind": wind(entry.start_wind),
-        "end_wind": wind(entry.end_wind),
+        # The forecast's wind at the altitude the leg is mostly flown at.
+        "wind": wind(entry.wind),
+        "unflyable": entry.unflyable,
         "note": entry.note,
     }
-
-
-def _finite(value: float | None) -> float | None:
-    """JSON has no infinity, and an unflyable leg is reported as one anyway."""
-    if value is None or value != value or value in (float("inf"), float("-inf")):
-        return None
-    return round(value, 2)
 
 
 # What the UI can send as a waypoint's kind when it means "a field". The map

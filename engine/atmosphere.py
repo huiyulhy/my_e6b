@@ -243,7 +243,8 @@ def altitude_for_relative_density(sigma: float) -> float:
 
 DRY_ADIABATIC_C_PER_1000FT = 2.98
 _IMPLAUSIBLE_LAPSE_C_PER_1000FT = 4.5
-_MERGE_TOLERANCE_FT = 250.0
+# Samples closer than this are one level, and averaged into one.
+TEMPERATURE_MERGE_TOLERANCE_FT = 250.0
 
 
 @dataclass(frozen=True)
@@ -284,7 +285,7 @@ class TemperatureProfile:
         observations: Iterable[TemperatureSample],
         *,
         default_deviation_c: float = 0.0,
-        merge_tolerance_ft: float = _MERGE_TOLERANCE_FT,
+        merge_tolerance_ft: float = TEMPERATURE_MERGE_TOLERANCE_FT,
     ) -> TemperatureProfile:
         """Sort, merge near-coincident observations, and keep the result.
         """

@@ -139,7 +139,7 @@ POH Section 5 tables and interpolation. **Two rules govern this module:**
 | takeoff | weight × press alt × temp | Full 3-D grid. Temps live in the **column names** (`groundroll_0`…`_40`), so rows are melted before gridding. |
 | landing | press alt × temp | 2550 lb only — the POH publishes max weight only. Using it at lower weights is conservative, which errs the right way. |
 | climb rate | press alt × temp | **One blank cell** at 12000 ft / 40 °C. |
-| climb dist | press alt | Time and fuel are cumulative from sea level — a segment is the difference of two rows. The speed column is read directly and averaged over the segment; the distance column is not read at all (see below). |
+| climb dist | press alt | Time and fuel are cumulative from sea level — a segment is the difference of the two columns interpolated at its ends, never rounded out to the printed rows (rounding planned a 191→4500 ft climb as 0→5000 and overstated it by over a minute). The speed column is read directly and averaged over the segment; the distance column is not read at all (see below). |
 | cruise | alt → (RPM × temp) | **Ragged**: 2100 RPM exists only at 2000–4000 ft, 2700 RPM only at 8000–10000 ft. Temp is always full. Altitude is a page *selector*, not an axis — see below. |
 
 ### Two mechanisms handle the irregularity
@@ -239,8 +239,11 @@ behind the first occurrence rather than repeating one sentence per row.
 
 Wind and surface corrections (10% per 9 kt headwind, 10% per 2 kt tailwind, +15% of ground roll
 for takeoff on dry grass, +45% for landing) and the climb temperature note (±10% per 10 °C from
-standard, applied to time and fuel at the segment midpoint, in both directions so a cold day
-is credited — floored at half the published figure so no forecast climbs in no time).
+standard, applied to time and fuel at the midpoint of each 1000 ft band the climb is integrated
+in, so it follows the temperature profile up the climb; in both directions so a cold day is
+credited — floored at half the published figure so no forecast climbs in no time). The climb
+table is printed at 2550 lb only and is used as printed at every weight: a lighter aeroplane
+out-climbs the plan, and that is left as margin rather than estimated.
 
 ---
 
@@ -379,9 +382,9 @@ A MapLibre map with a route editor and a navlog that updates as you type.
 **Nothing is fetched from the network at runtime.** That constraint drove three decisions:
 
 - **The basemap is local GeoJSON, not tiles.** Natural Earth clipped to a US box and
-  simplified — 998 KB for states, coastline, lakes and major highways, down from 53 MB of
+  simplified — 976 KB for states, coastline, lakes and major highways, down from 53 MB of
   source. Roads are the bulk of both numbers: the world file is 56,600 features, and
-  filtering to US major highways leaves 2,014, which is 463 KB instead of fifty megabytes.
+  filtering to US major highways leaves 2,014, which is 428 KB instead of fifty megabytes.
   At VFR planning zoom the simplification is invisible, and no tile pipeline or server is
   needed.
 - **MapLibre is vendored** into `ui/vendor/` (939 KB). A CDN link would defeat the point.
@@ -617,7 +620,8 @@ network.
 
 Not the FD product, deliberately. An FD level is one number for a quarter of a state, and the
 wind on the coast is not the wind over the valley twenty miles inland — §4b's reason for keeping
-route-wide winds out of the plan. A gridded model is interpolated to the position asked about,
+route-wide winds out of the plan. A gridded model answers for the grid cell over the position asked
+about — HRRR's is 3 km, and Open-Meteo returns the cell's values, not a blend of its neighbours —
 which answers that objection rather than arguing with it. `GET /api/wx/aloft` therefore takes a
 **lat/lon, not an ident**: reading the cruise wind off the departure airport would reproduce the
 exact mistake.
@@ -665,48 +669,48 @@ altimeter setting first.
 the weather each of them was planned in. They agree, which is the whole difficulty — each is an
 input to the other.
 
-**Both ends of every leg, and the worse of the two.** A leg is not a point. The forecast over the
-field it starts at and the forecast over the field it ends at are two different columns of air and
-the aeroplane flies through both. Planning on either alone guesses which half of the leg matters;
-planning on their average is a wind that was forecast nowhere. So each leg is costed under both
-and planned in whichever **costs more fuel** — a plan that comes in early is a good day, a plan
-that comes in late is a diversion.
+**One column per leg, fetched over its midpoint.** A leg is planned in a single forecast column,
+read by altitude, and the column is fetched over the leg's midpoint — the one point nearest, on
+average, to every part of the leg. The model is asked there directly rather than at the two ends
+and averaged: an average of two columns is a wind that was forecast nowhere. Legs are short enough
+for one column to stand for the whole of one; nothing is interpolated along a leg.
 
-Fuel rather than time, because fuel is what a reserve is measured in and the two can disagree: a
-leg flown higher is slower over the ground and cheaper per hour. Only the ground speed is
-recomputed to compare the two candidates — the power setting is the same either way, so the rows'
-own distance, altitude, TAS and fuel flow are read as they stand.
+It used to be the other way: each leg costed under the forecasts at both of its ends and planned
+in whichever burned more fuel. That biased every plan late — a flight from Castle that beat its
+plan on every phase was the evidence — and a plan that is systematically pessimistic is not saying
+what the day will be. Margin belongs in the reserve, where it is visible, not hidden in the wind.
 
-The column is taken **whole**, its wind and its temperature together, rather than the worst wind
-from one end and the worst temperature from the other. Half of one forecast against half of
-another describes air neither of them reported — the same objection `resolve_surface` makes about
-mixing a METAR's ceiling with a TAF's cover.
+The column is taken **whole**, its wind and its temperature together. Half of one forecast against
+half of another describes air neither of them reported — the same objection `resolve_surface`
+makes about mixing a METAR's ceiling with a TAF's cover.
 
 **Why it has to loop.** The weather a leg is flown in depends on when the leg is reached; when the
 leg is reached depends on the wind it is flown in. Planning once on the departure hour is the
 error the whole tier exists to remove — a three-hour leg planned on the 1300Z forecast is not the
 leg you fly at 1600Z. So `solve` settles the two lists:
 
-1. Plan with no forecast, to learn roughly when each waypoint is reached.
-2. Choose each leg's weather from the forecasts at its two ends, at those times, taking the dearer.
+1. Plan with no forecast, to learn roughly when each leg is flown.
+2. Read each leg's forecast at the hour its midpoint is passed — half way in time between reaching
+   the leg's two ends.
 3. Plan again on that weather — which moves the times, and the tops of climb.
-4. Re-choose. If nothing changed, the two lists agree and it is done.
+4. Re-read. If no leg's hour changed, the two lists agree and it is done.
 
-**"No more changes" means the choice, not the numbers.** The numbers move by seconds forever. What
-has to stop moving is which end of each leg won and which forecast hour it was read at — both
-discrete, so settling is a real event rather than a tolerance. Two or three passes is the usual
+**"No more changes" means the hours, not the numbers.** The numbers move by seconds forever. What
+has to stop moving is which forecast hour each leg was read at, and whether it could be planned on
+at all — both discrete, so settling is a real event rather than a tolerance. Two or three passes is the usual
 count; `MAX_PASSES` caps it, and a run that hits the cap still returns its last plan, labelled,
 because that is more use than an error.
 
-**One request per waypoint, a window of hours each.** Over the waypoints rather than the leg
-midpoints, since adjacent legs share the point between them — N points cover N-1 legs. A *window*
+**One point per leg, all in one request, a window of hours each.** The UI computes each leg's
+great-circle midpoint and asks for all of them in a single batch call, since the free Open-Meteo
+tier limits requests per address. A *window*
 because the loop re-reads the forecast at a different hour on every pass, and going back to the
 network each time would put a fetch inside a loop. It costs nothing extra: the Open-Meteo URL is
 keyed by day and already carries 48 hours, so `fetch_aloft_series` parses more of one cached
 payload. The UI asks for the flight's length plus an hour at each end.
 
-**The engine still takes wind by position.** `solve` hands each chosen column to `build_navlog` at
-its leg's midpoint, and `navlog._RouteColumns` files it back under that leg. The obvious key is
+**The engine still takes wind by position.** `solve` hands each leg's column to `build_navlog` at
+the leg's midpoint, where it was fetched, and `navlog._RouteColumns` files it back under that leg. The obvious key is
 the row and it does not work: a forecast wind moves the tops of climb — into a headwind the same
 climb covers less ground and tops out sooner — which renumbers the very rows the wind was keyed
 to. A point on the earth does not move.
@@ -716,45 +720,40 @@ along-track and cross-track distances `geo.Segment` already computes. Nearest-co
 tempting shortcut and is wrong at exactly one place: the first ten miles of a 130 nm leg are sixty
 miles nearer the *previous* leg's column. The row is still unambiguously on the second leg.
 
-**One air per leg the pilot drew.** A column answers by altitude, and the rows cut from one leg
-fly at different altitudes — the climb at its midpoint, the cruise, the descent off it. Read
-literally, the leg would be flown in three winds and three temperatures from one forecast, and
-the join between two rows would be a wind shift that nobody forecast. So `navlog._segment_air`
-settles each leg's column into **one wind and one ISA deviation**: the column read at each of
-the leg's rows and averaged, each row weighing the ground it covers (the wind as a vector, so two
-winds either side of north average to a northerly). Every row of the leg, and every climb or
-descent the planner fits into it, is then flown in that air; OAT still falls with altitude under
-the constant deviation, so density altitude stays honest on a climb. The rows' altitudes are
-needed before the average can be taken, which is why `_build_flight` always lays the flight out
-twice: a rehearsal on the forecast as it stands, then the plan in the settled air. Twice and no
-more — chasing the small movement of the tops of climb converges nowhere better. The leg boundary,
-not the top of climb, is where the wind changes. A leg with no column of its own averages the
-route-wide profile the same way, so a layered wind typed for the route is never two winds on one
-leg either.
+**Wind and temperature by altitude, under each leg's own column.** A column answers by altitude,
+and the rows cut from one leg fly at different altitudes — the climb at its midpoint, the cruise,
+the descent off it. Both are read that way: a level row at its own altitude, a climb or descent
+integrated through the profiles band by band and shown at its midpoint. They were once averaged
+into one wind and one ISA deviation per leg, and that let the long cruise rows dominate — a level
+stretch under a Class B shelf was planned in the air 5000 ft above it. A temperature typed on a
+row is hung at that row's altitude and replaces the column's levels within merging distance of
+it; the row's altitude is only known once the profile is built, which is why `_build_flight`
+lays the flight out twice: a rehearsal on the forecast as it stands, then the plan with the typed
+temperatures in place. Twice and no more — chasing the small movement of the tops of climb
+converges nowhere better. A leg with no column of its own reads the route-wide profile for both.
 
-The column carries its temperatures (`WindColumn.temperatures`), which is where a leg's deviation
-is read from. They also go in route-wide as `temperatures_aloft`, merging with the fields' own
+The column carries its temperatures (`WindColumn.temperatures`), which is where a leg's
+temperatures are read from. They also go in route-wide as `temperatures_aloft`, merging with the fields' own
 METARs into the curve `build_navlog` builds — a pressure altitude is the coordinate every station
 shares, and `TemperatureProfile.from_observations` averages samples that land on the same level —
 which the rows on the ground, the reserve and any leg without a column still read.
 
-Where an end has no forecast the other is used; where neither does, the leg falls back to the wind
-typed on its row and to calm under that, which is what a plan with nothing entered has always
-meant. A wind the pilot typed still wins on its own row, and a half-typed wind takes its other
-half from **that leg's** column rather than from a route-wide profile. An end whose wind no
-heading can hold the course in is the one thing never chosen despite being the dearest: planning
-on it makes the route unbuildable and leaves the pilot looking at an error instead of a plan, so
-the other end is used and the leg says so.
+A leg whose midpoint has no forecast falls back to the wind typed on its row and to calm under
+that, which is what a plan with nothing entered has always meant. A wind the pilot typed still
+wins on its own row, and a half-typed wind takes its other half from **that leg's** column rather
+than from a route-wide profile. A forecast whose wind no heading can hold the course in is not
+planned on: that would make the route unbuildable and leave the pilot looking at an error instead
+of a plan, so the leg falls back the same way and says so.
 
 This settles §4b's open question about whether a wind should move the top of climb. It does: the
 reason it did not was that an FD level is too coarse to trust that far, and a point-resolved model
 column is not. A column belongs to a leg by where it was forecast, so the
-planner has it from the rehearsal onward; the plan itself is laid out in the leg's settled air.
+planner has it from the rehearsal onward; the plan itself is laid out in it.
 
-The UI shows the second list under the navlog — both ends' costs, not just the winner's, so a
-pilot can see whether the choice was close or obvious.
-
-The navlog says so under the table — a model forecast and a number read off a chart look identical
+The second list comes back with the plan as `weather` — each leg's forecast hour, its wind at the
+leg's main altitude, and a note where it could not be planned on. The UI does not lay it out as a
+table yet; what it shows is a line under the navlog saying the winds are a model forecast over the
+leg midpoints and how many passes the loop took. It says so under the table — a model forecast and a number read off a chart look identical
 in a wind column, and they are not the same thing to be flying on.
 
 ### 4e. NOTAMs — `engine/notam.py` + `server/notams.py`

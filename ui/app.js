@@ -286,12 +286,11 @@ let fieldAir = [];
  */
 let fieldWx = new Map();
 
-/** A window of forecast hours over each waypoint the pilot drew.
+/** A window of forecast hours over the midpoint of each leg the pilot drew.
  *
- *  Over the waypoints, not the leg midpoints, because a leg is costed at both
- *  of its ends and flown in whichever end costs more -- see `engine/planwx`.
- *  Two adjacent legs share the waypoint between them, so N waypoints cover
- *  N-1 legs with N requests rather than 2(N-1).
+ *  One column per leg, fetched where it stands for the leg best: its
+ *  midpoint, the point nearest on average to every part of it -- see
+ *  `engine/planwx`. One entry per leg, in route order.
  *
  *  A window rather than an hour because the engine settles the weather and
  *  the log against each other, and each pass reads the forecast at the hour
@@ -2489,12 +2488,13 @@ function renderSummary(plan) {
     const missed = forecastWx.of - forecastWx.points;
     const passes = plan.weather_passes;
     div.textContent =
-      `Winds and temperatures aloft: model forecast over ${forecastWx.points} `
-      + `point${forecastWx.points === 1 ? '' : 's'}, `
+      `Winds and temperatures aloft: model forecast over the midpoint of `
+      + `${forecastWx.points} leg${forecastWx.points === 1 ? '' : 's'}, `
       + `${forecastWx.hours} hour${forecastWx.hours === 1 ? '' : 's'} each. `
-      + `Each leg is planned in whichever of its two ends costs more fuel`
+      + `Each leg is planned in its midpoint's forecast at the hour it is flown, `
+      + `read at each row's altitude`
       + (passes ? `; settled in ${passes} pass${passes === 1 ? '' : 'es'}` : '')
-      + (missed ? `; ${missed} point(s) unavailable` : '')
+      + (missed ? `; ${missed} leg(s) unavailable` : '')
       + '. A forecast, not an observation — and no substitute for a briefing.';
     warnings.appendChild(div);
   }
@@ -2756,8 +2756,8 @@ async function getWeather() {
 
   renderWaypointList();
 
-  // The sky between the fields: a window of forecast hours over every
-  // waypoint, which the engine costs each leg against at both of its ends.
+  // The sky between the fields: a window of forecast hours over the midpoint
+  // of every leg, which the engine reads at the hour the leg is flown.
   const aloft = await getForecasts(arrivals);
 
   // Pass two: the fetched conditions change the density altitude, so every
@@ -2768,18 +2768,17 @@ async function getWeather() {
   // reads the same whether it was observed now or forecast for tonight, and
   // those are very different things to be planning on.
   const when = arrivals.size ? ` for ${zulu(offBlocksUtc().toISOString())}+` : '';
-  const legs = aloft ? `, ${aloft} point${aloft === 1 ? '' : 's'} aloft` : '';
+  const legs = aloft ? `, ${aloft} leg${aloft === 1 ? '' : 's'} aloft` : '';
   flashButton(button, failed.length
     ? `${filled} filled, ${failed.length} unavailable${legs}`
     : `Filled ${filled} field${filled === 1 ? '' : 's'}${legs}${when}`);
 }
 
-/** Fetch a window of forecast hours over every waypoint the pilot drew.
+/** Fetch a window of forecast hours over the midpoint of every drawn leg.
  *
- *  Over the waypoints rather than the leg midpoints, because each leg is
- *  costed at both of its ends and planned in whichever costs more. Two legs
- *  meeting at a waypoint share its forecast, so this is one request per
- *  point, not two per leg.
+ *  The midpoint rather than the ends: a leg is planned in one column, and
+ *  the model asked at the middle of the leg beats an average of its ends,
+ *  which is air that was forecast nowhere. Still one request for the route.
  *
  *  A window rather than a single hour. The engine settles the weather list
  *  and the navlog against each other -- the wind moves the times, the times
@@ -2788,13 +2787,17 @@ async function getWeather() {
  *  flight itself plus an hour at each end, so it is two or three hours for a
  *  local trip and never more than the server's cap.
  *
- *  Returns how many points came back. A point that fails is left out rather
- *  than faked: its legs fall back to the other end's forecast, and a leg with
- *  neither end to the wind typed on its row, and to calm under that.
+ *  Returns how many legs came back. A leg whose fetch fails is left without
+ *  rather than faked: it falls back to the wind typed on its rows, and to
+ *  calm under that.
  */
 async function getForecasts(arrivals) {
   const drawn = route.filter((w) => !w.generated);
   if (drawn.length < 2) return 0;
+  const legs = drawn.slice(1).map((to, n) => {
+    const from = drawn[n];
+    return { name: `${from.name}–${to.name}`, ...greatCircleMidpoint(from, to) };
+  });
 
   const start = offBlocksUtc();
   // How long the day is, from the plan we already have. An hour either side:
@@ -2806,27 +2809,25 @@ async function getForecasts(arrivals) {
   let series;
   try {
     series = await api.aloftSeriesMany(
-      drawn, start ? start.toISOString() : null, hours);
+      legs, start ? start.toISOString() : null, hours);
   } catch {
     clearForecasts();
     return 0;
   }
 
-  // Every waypoint keeps its slot even when its fetch failed: the engine
-  // reads the list positionally against the route, and a gap would shift
-  // every forecast after it onto the wrong point.
+  // Every leg keeps its slot even when its fetch failed: the engine reads
+  // the list positionally against the route, and a gap would shift every
+  // forecast after it onto the wrong leg.
   const notes = new Set();
   let got = 0;
-  forecasts = drawn.map((w, n) => {
+  forecasts = legs.map((leg, n) => {
     const answer = series[n];
     const ok = answer && !answer.error && Array.isArray(answer.hours);
-    if (!ok) return { name: w.name, lat: w.lat, lon: w.lon, hours: [] };
+    if (!ok) return { ...leg, hours: [] };
     got += 1;
     answer.hours.forEach((hour) => (hour.notes || []).forEach((x) => notes.add(x)));
     return {
-      name: w.name,
-      lat: w.lat,
-      lon: w.lon,
+      ...leg,
       hours: answer.hours.map((hour) => ({
         valid_time: hour.valid_time, levels: hour.levels,
       })),
@@ -2834,10 +2835,28 @@ async function getForecasts(arrivals) {
   });
 
   forecastWx = got
-    ? { points: got, of: drawn.length, hours, notes: [...notes] }
+    ? { points: got, of: legs.length, hours, notes: [...notes] }
     : null;
   if (!got) forecasts = [];
   return got;
+}
+
+/** The point half way along the great circle between two waypoints.
+ *
+ *  Where a leg's forecast is fetched. The engine finds the column again by
+ *  its own midpoint of the same leg, so the two need only agree to within a
+ *  model grid cell, which a sphere does. */
+function greatCircleMidpoint(a, b) {
+  const rad = Math.PI / 180;
+  const [lat1, lon1, lat2] = [a.lat * rad, a.lon * rad, b.lat * rad];
+  const dLon = (b.lon - a.lon) * rad;
+  const bx = Math.cos(lat2) * Math.cos(dLon);
+  const by = Math.cos(lat2) * Math.sin(dLon);
+  const lat = Math.atan2(
+    Math.sin(lat1) + Math.sin(lat2),
+    Math.sqrt((Math.cos(lat1) + bx) ** 2 + by ** 2));
+  const lon = lon1 + Math.atan2(by, Math.cos(lat1) + bx);
+  return { lat: lat / rad, lon: lon / rad };
 }
 
 /** What the last NOTAM search found, or why it could not look. */

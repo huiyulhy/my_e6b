@@ -7,9 +7,11 @@ decides ground speed, fuel and every time on the log.
 **Why a model at all.** The traditional answer is the FD winds-aloft forecast,
 and this project deliberately does not use it: an FD level is one number for a
 quarter of a state, issued for a handful of stations, and the wind on the coast
-is not the wind over the valley twenty miles inland. A gridded model is
-interpolated to the position asked about, which is the objection answered
-rather than argued with. It is still a forecast, and it is labelled as one.
+is not the wind over the valley twenty miles inland. A gridded model answers
+for the grid cell over the position asked about -- HRRR's is 3 km, and
+Open-Meteo returns that cell's values rather than a blend of its neighbours --
+which is the objection answered rather than argued with. It is still a
+forecast, and it is labelled as one.
 
 **Constant-pressure surfaces, not altitudes.** The model publishes on pressure
 levels -- 850 hPa, 700 hPa -- and that turns out to be the convenient frame,
