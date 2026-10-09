@@ -20,11 +20,13 @@ make serve      # then open http://127.0.0.1:8137
 Type an identifier to add airports, click the map to insert a waypoint, drag markers to move
 them, and the navigation log updates as you go. It works with the network off.
 
-Live surface weather is the one thing that needs a connection. When it is available, the
-temperature and altimeter setting at each airport come from the current METAR — or, for a
-departure hours away, from the TAF and a forecast model — so takeoff and landing distances are
-computed on the air that will actually be there. Without a connection you type them in, as
-before, and everything else works unchanged.
+Live weather is the one thing that needs a connection. When it is available, **Get weather**
+fills in two things. At each airport, the temperature and altimeter setting come from the
+current METAR — or, for a departure hours away, from the TAF and a forecast model — so takeoff
+and landing distances are computed on the air that will actually be there. Between them, the
+winds and temperatures aloft come from a model forecast (HRRR, then GFS beyond about two days)
+over the midpoint of each leg, read at the hour that leg is flown and at each row's altitude.
+Without a connection you type them in, as before, and everything else works unchanged.
 
 NOTAMs need one extra thing: a SkyLink licence (1,000 queries). Without it every other
 feature works and **Get NOTAMs** says what is missing rather
@@ -62,7 +64,7 @@ make altimeter-trend   # how far the altimeter setting really moves in a day, an
 
 ## Status
 
-Built, with 672 tests:
+Built, with 1,132 tests:
 
 - [engine/atmosphere.py](engine/atmosphere.py) — ISA, pressure and density altitude, TAS
 - [engine/performance.py](engine/performance.py) — POH Section 5 tables and interpolation
@@ -70,8 +72,19 @@ Built, with 672 tests:
   latitudes refused
 - [engine/magnetic.py](engine/magnetic.py) — WMM2025 variation, validated against NOAA's own
   100-point reference set
-- [engine/navlog.py](engine/navlog.py) — full navigation log with top-of-climb and
-  top-of-descent, fuel accounting and VFR reserve checking
+- [engine/navlog.py](engine/navlog.py) + [engine/profile.py](engine/profile.py) — full
+  navigation log with top-of-climb and top-of-descent placed in the forecast wind, pinned
+  climbs and descents ("level by", "start climb at"), fuel accounting and VFR reserve checking
+- [engine/aloft.py](engine/aloft.py) + [engine/planwx.py](engine/planwx.py) — winds and
+  temperatures aloft from a model column over each leg, and the loop that settles the
+  forecast hour each leg is read at against the navlog's own times
+- [engine/preflight.py](engine/preflight.py) — go/no-go: takeoff and landing distance
+  against the runways, crosswind, fuel reserve, weight and balance, and VFR weather at both
+  fields
+- [engine/notam.py](engine/notam.py) — NOTAMs filtered to the route's corridor, altitude
+  and time
+- [engine/mission.py](engine/mission.py) + [engine/kml.py](engine/kml.py) — the plan saved
+  as KML and loaded back, re-solved in the weather of the day
 - [engine/airports.py](engine/airports.py) — lookup over 15,762 US airports
 - [engine/weight_balance.py](engine/weight_balance.py) — gross weight and centre of
   gravity from a loading form
@@ -86,7 +99,7 @@ Built, with 672 tests:
   Conic into map tiles, and dated from the FAA's own metadata so the currency list says when
   each edition lapses
 - [ui/](ui/) + [server/](server/) — MapLibre route editor with a live navigation log,
-  on a 535 KB offline basemap, with the raster charts under it on a layer switch
+  on a 976 KB offline basemap, with the raster charts under it on a layer switch
 
 ## Charts
 
@@ -110,5 +123,6 @@ server renders each tile the first time the map asks for it.
 
 The NASR dataset requires updating every 28 days; VFR charts every 56.
 
-Next: the FAA NASR pipeline, then the map UI, then corridor-constrained A\* routing. See
+Next: the rest of the FAA NASR pipeline (fixes, navaids, obstacles), then corridor-constrained
+A\* routing. See
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §6 for the design of everything not yet written.
