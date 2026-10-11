@@ -81,6 +81,13 @@ def mission_json(plan: dict[str, Any]) -> str:
         for waypoint in plan.get("waypoints", [])
         if not waypoint.get("generated")
     ]
+    # The alternate is a choice the pilot made and keeps; its weather is not.
+    if isinstance(plan.get("alternate"), dict):
+        kept["alternate"] = {
+            k: v
+            for k, v in plan["alternate"].items()
+            if k not in _OBSERVED_WAYPOINT_KEYS
+        }
     return json.dumps({"schema": SCHEMA, "plan": kept}, separators=(",", ":"), default=str)
 
 

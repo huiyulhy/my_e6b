@@ -265,6 +265,10 @@ class PlanRequest(BaseModel):
     # Fractions: 0.20 means "require 20% more than the book distance".
     runway_margin: float = pf.DEFAULT_RUNWAY_MARGIN
     fuel_margin: float = pf.DEFAULT_FUEL_MARGIN
+    # The field the pilot would divert to. Never flown in the log and never a
+    # gate on the go/no-go: it is on the pre-dispatch sheet, with takeoff and
+    # landing distances read at its own reported weather.
+    alternate: WaypointIn | None = None
 
 
 class RouteFileIn(BaseModel):
@@ -691,45 +695,47 @@ def _waypoint_json(waypoint: nl.Waypoint, conditions: nl.Conditions) -> dict:
     }
 
 
+def _engine_waypoint(w: WaypointIn) -> nl.Waypoint:
+    """One waypoint as the engine's own type, runways and pattern included."""
+    return nl.Waypoint(
+        name=w.name,
+        position=LatLon(w.lat, w.lon),
+        kind=w.kind,
+        elevation_ft=w.elevation_ft,
+        is_landing=w.is_landing,
+        altitude_ft=w.altitude_ft,
+        segment_type=w.segment_type,
+        generated=w.generated,
+        id=w.id,
+        events=tuple(
+            nl.VerticalEvent(e.kind, LatLon(e.lat, e.lon), e.target_altitude_ft)
+            for e in w.events
+        ),
+        altimeter_inhg=w.altimeter_inhg,
+        oat_c=w.oat_c,
+        wind_from_deg=w.wind_from_deg,
+        wind_speed_kt=w.wind_speed_kt,
+        gust_kt=w.gust_kt,
+        visibility_sm=w.visibility_sm,
+        ceiling_ft_agl=w.ceiling_ft_agl,
+        ceiling_cover=w.ceiling_cover,
+        sky_reported=w.sky_reported,
+        weather_reported=w.weather_reported,
+        runways=_runways_for(w),
+        # Looked up here rather than sent, for the same reason the runways
+        # are: it is a fact about the field, not about the plan, and the
+        # database already on disk is a better source than a round trip.
+        pattern_altitude_agl_ft=_pattern_altitude_for(w),
+    )
+
+
 def _build_from_request(request: PlanRequest):
     """Turn a request into the engine objects a plan is built from.
 
     Shared by `/api/plan` and `/api/consistency` so the two can never disagree
     about what the plan being described actually is.
     """
-    waypoints = [
-        nl.Waypoint(
-            name=w.name,
-            position=LatLon(w.lat, w.lon),
-            kind=w.kind,
-            elevation_ft=w.elevation_ft,
-            is_landing=w.is_landing,
-            altitude_ft=w.altitude_ft,
-            segment_type=w.segment_type,
-            generated=w.generated,
-            id=w.id,
-            events=tuple(
-                nl.VerticalEvent(e.kind, LatLon(e.lat, e.lon), e.target_altitude_ft)
-                for e in w.events
-            ),
-            altimeter_inhg=w.altimeter_inhg,
-            oat_c=w.oat_c,
-            wind_from_deg=w.wind_from_deg,
-            wind_speed_kt=w.wind_speed_kt,
-            gust_kt=w.gust_kt,
-            visibility_sm=w.visibility_sm,
-            ceiling_ft_agl=w.ceiling_ft_agl,
-            ceiling_cover=w.ceiling_cover,
-            sky_reported=w.sky_reported,
-            weather_reported=w.weather_reported,
-            runways=_runways_for(w),
-            # Looked up here rather than sent, for the same reason the runways
-            # are: it is a fact about the field, not about the plan, and the
-            # database already on disk is a better source than a round trip.
-            pattern_altitude_agl_ft=_pattern_altitude_for(w),
-        )
-        for w in request.waypoints
-    ]
+    waypoints = [_engine_waypoint(w) for w in request.waypoints]
     # No route-wide winds or temperatures aloft: an FD level is one number for
     # a quarter of a state, and the wind on the coast is not the wind over the
     # valley. Wind is entered per navlog row instead, where it belongs to the
@@ -1175,7 +1181,7 @@ def plan(request: PlanRequest) -> dict:
         return {"ok": False, "error": "Add a departure and a destination."}
 
     try:
-        solved, _aircraft, conditions = _build_from_request(request)
+        solved, aircraft, conditions = _build_from_request(request)
         log = solved.navlog
     except (nl.RouteError, OutsideModelValidity) as exc:
         return {"ok": False, "error": str(exc)}
@@ -1183,6 +1189,9 @@ def plan(request: PlanRequest) -> dict:
         # Includes OutsidePOHEnvelope and AboveModelCeiling -- a refusal to
         # invent numbers is a real answer, so it reads as one.
         return {"ok": False, "error": str(exc)}
+    dispatch = _dispatch_json(
+        request, aircraft, log.conditions or conditions, log.resolved_waypoints
+    )
 
     return {
         "ok": True,
@@ -1257,6 +1266,9 @@ def plan(request: PlanRequest) -> dict:
             for leg in log.legs
         ],
         "checklist": _checklist_json(log.checklist),
+        # The pre-dispatch sheet: takeoff and landing at the departure, the
+        # destination and the alternate, each at its own field's weather.
+        "dispatch": dispatch,
         # The route the rows were built from. In automatic mode this has the
         # TOC/TOD the planner inserted, so the UI can show them in the waypoint
         # list and let the pilot take them over.
@@ -1314,6 +1326,55 @@ def _leg_weather_json(entry: pw.LegWeather) -> dict:
         "unflyable": entry.unflyable,
         "note": entry.note,
     }
+
+
+def _dispatch_json(
+    request: PlanRequest,
+    aircraft: nl.Aircraft,
+    conditions: nl.Conditions,
+    resolved: tuple[nl.Waypoint, ...],
+) -> list[dict]:
+    """Both operations at each field on the pre-dispatch sheet.
+
+    The departure and destination are the resolved route's ends, which carry
+    the elevation the log was built with. The alternate is not on the route,
+    so it is converted here; a refusal at one field -- no elevation, say -- is
+    reported on that field and leaves the others standing.
+    """
+    margins = pf.Margins(runway=request.runway_margin, fuel=request.fuel_margin)
+    fields: list[tuple[str, nl.Waypoint]] = []
+    if resolved:
+        fields += [("departure", resolved[0]), ("destination", resolved[-1])]
+    if request.alternate is not None:
+        fields.append(("alternate", _engine_waypoint(request.alternate)))
+
+    out = []
+    for role, waypoint in fields:
+        entry: dict = {"role": role, "airport": waypoint.name}
+        try:
+            checks = nl.field_checks(waypoint, aircraft, conditions, margins)
+        except (nl.RouteError, ValueError) as exc:
+            out.append({**entry, "ok": False, "error": str(exc)})
+            continue
+        if checks is None:
+            out.append(
+                {**entry, "ok": False, "error": "no field elevation to read distances at"}
+            )
+            continue
+        takeoff, landing = checks
+        air = nl.field_weather(waypoint, conditions)
+        out.append(
+            {
+                **entry,
+                "ok": True,
+                # The setting the pressure altitude was read through, which
+                # the checks themselves do not carry.
+                "altimeter_inhg": None if air is None else air.altimeter_inhg,
+                "takeoff": _airport_check_json(takeoff),
+                "landing": _airport_check_json(landing),
+            }
+        )
+    return out
 
 
 # What the UI can send as a waypoint's kind when it means "a field". The map
@@ -1427,61 +1488,7 @@ def _checklist_json(checklist: pf.GoNoGo | None) -> dict | None:
             }
             for entry in checklist.extrapolations
         ],
-        "airports": [
-            {
-                "airport": check.airport,
-                "operation": check.operation,
-                "elevation_ft": check.elevation_ft,
-                "pressure_altitude_ft": check.pressure_altitude_ft,
-                "density_altitude_ft": check.density_altitude_ft,
-                "oat_c": check.oat_c,
-                "weight_lb": check.weight_lb,
-                "margin": check.margin,
-                "passes": check.passes,
-                # Magnetic, because that is the frame the runways are in and
-                # the frame the numbers beside them were worked out in.
-                "wind_from_deg": None if check.wind is None else check.wind.from_deg,
-                "wind_speed_kt": None if check.wind is None else check.wind.speed_kt,
-                "gust_kt": None if check.wind is None else check.wind.gust_kt,
-                # Null where the field had no report at all, which is not the
-                # same as a report the check could not judge -- that one comes
-                # back with `passes: null` and says why.
-                "weather": _weather_check_json(check.weather),
-                "runways": [
-                    {
-                        "runway": runway.runway,
-                        "surface": runway.surface,
-                        "dry_grass_applied": runway.dry_grass_applied,
-                        "end_used": runway.end_used,
-                        "headwind_kt": runway.headwind_kt,
-                        "crosswind_kt": runway.crosswind_kt,
-                        "crosswind_from_right": runway.crosswind_from_right,
-                        "crosswind_exceeds_demonstrated": (
-                            runway.crosswind_exceeds_demonstrated
-                        ),
-                        "runway_available_ft": runway.runway_available_ft,
-                        "ground_roll_ft": runway.ground_roll_ft,
-                        "over_50ft_ft": runway.over_50ft_ft,
-                        "required_ft": runway.required_ft,
-                        "spare_ft": runway.spare_ft,
-                        "passes": runway.passes,
-                        "outside_envelope": runway.outside_envelope,
-                        "extrapolated": runway.extrapolated,
-                        "off_chart": [
-                            {
-                                "what": entry.what,
-                                "detail": entry.detail,
-                                "conservative": entry.conservative,
-                            }
-                            for entry in runway.off_chart
-                        ],
-                        "note": runway.note,
-                    }
-                    for runway in check.runways
-                ],
-            }
-            for check in checklist.airports
-        ],
+        "airports": [_airport_check_json(check) for check in checklist.airports],
         "fuel": {
             "fuel_on_board_gal": checklist.fuel.fuel_on_board_gal,
             "burn_gal": checklist.fuel.burn_gal,
@@ -1495,6 +1502,61 @@ def _checklist_json(checklist: pf.GoNoGo | None) -> dict | None:
             "spare_minutes": checklist.fuel.spare_minutes,
             "passes": checklist.fuel.passes,
         },
+    }
+
+
+def _airport_check_json(check: pf.AirportCheck) -> dict:
+    return {
+        "airport": check.airport,
+        "operation": check.operation,
+        "elevation_ft": check.elevation_ft,
+        "pressure_altitude_ft": check.pressure_altitude_ft,
+        "density_altitude_ft": check.density_altitude_ft,
+        "oat_c": check.oat_c,
+        "weight_lb": check.weight_lb,
+        "margin": check.margin,
+        "passes": check.passes,
+        # Magnetic, because that is the frame the runways are in and
+        # the frame the numbers beside them were worked out in.
+        "wind_from_deg": None if check.wind is None else check.wind.from_deg,
+        "wind_speed_kt": None if check.wind is None else check.wind.speed_kt,
+        "gust_kt": None if check.wind is None else check.wind.gust_kt,
+        # Null where the field had no report at all, which is not the
+        # same as a report the check could not judge -- that one comes
+        # back with `passes: null` and says why.
+        "weather": _weather_check_json(check.weather),
+        "runways": [
+            {
+                "runway": runway.runway,
+                "surface": runway.surface,
+                "dry_grass_applied": runway.dry_grass_applied,
+                "end_used": runway.end_used,
+                "headwind_kt": runway.headwind_kt,
+                "crosswind_kt": runway.crosswind_kt,
+                "crosswind_from_right": runway.crosswind_from_right,
+                "crosswind_exceeds_demonstrated": (
+                    runway.crosswind_exceeds_demonstrated
+                ),
+                "runway_available_ft": runway.runway_available_ft,
+                "ground_roll_ft": runway.ground_roll_ft,
+                "over_50ft_ft": runway.over_50ft_ft,
+                "required_ft": runway.required_ft,
+                "spare_ft": runway.spare_ft,
+                "passes": runway.passes,
+                "outside_envelope": runway.outside_envelope,
+                "extrapolated": runway.extrapolated,
+                "off_chart": [
+                    {
+                        "what": entry.what,
+                        "detail": entry.detail,
+                        "conservative": entry.conservative,
+                    }
+                    for entry in runway.off_chart
+                ],
+                "note": runway.note,
+            }
+            for runway in check.runways
+        ],
     }
 
 

@@ -1140,8 +1140,7 @@ function fieldBlock(waypoint, index) {
  *  that kept saying so would be the kind of quiet lie this whole panel exists
  *  to avoid. An entry with nothing left to claim disappears.
  */
-function fieldWxText(waypoint) {
-  const wx = fieldWx.get(waypoint.name);
+function fieldWxText(waypoint, wx = fieldWx.get(waypoint.name)) {
   if (!wx) return '';
   if (wx.error) {
     return `<div class="field-wx none">No weather for ${waypoint.name}: ` +
@@ -1901,34 +1900,42 @@ function requestPlan() {
   planTimer = setTimeout(runPlan, 180);
 }
 
+/** One waypoint as the plan request carries it. */
+function waypointPayload(w) {
+  return {
+    name: w.name, lat: w.lat, lon: w.lon, kind: w.kind,
+    elevation_ft: w.elevation_ft, ident: w.name,
+    is_landing: !!w.is_landing,
+    altitude_ft: w.altitude_ft ?? null,
+    segment_type: w.segment_type || 'automatic',
+    generated: !!w.generated,
+    id: w.generated ? null : (w.id ?? null),
+    events: w.generated ? [] : (w.events || []),
+    altimeter_inhg: w.altimeter_inhg ?? null,
+    oat_c: w.oat_c ?? null,
+    wind_from_deg: w.wind_from_deg ?? null,
+    wind_speed_kt: w.wind_speed_kt ?? null,
+    gust_kt: w.gust_kt ?? null,
+    // The rest of the field's report, for the VFR half of the go/no-go.
+    // `sky_reported` travels with them: without it the engine cannot tell a
+    // reported clear sky from a source that never looked.
+    visibility_sm: w.visibility_sm ?? null,
+    ceiling_ft_agl: w.ceiling_ft_agl ?? null,
+    ceiling_cover: w.ceiling_cover ?? '',
+    sky_reported: !!w.sky_reported,
+    weather_reported: !!w.weather_reported,
+  };
+}
+
 /** The plan request for the current route and form. Shared by the plan call
  *  and the consistency check, so the two can never describe different flights. */
 function planBody() {
   return {
-    waypoints: route.map((w) => ({
-      name: w.name, lat: w.lat, lon: w.lon, kind: w.kind,
-      elevation_ft: w.elevation_ft, ident: w.name,
-      is_landing: !!w.is_landing,
-      altitude_ft: w.altitude_ft ?? null,
-      segment_type: w.segment_type || 'automatic',
-      generated: !!w.generated,
-      id: w.generated ? null : (w.id ?? null),
-      events: w.generated ? [] : (w.events || []),
-      altimeter_inhg: w.altimeter_inhg ?? null,
-      oat_c: w.oat_c ?? null,
-      wind_from_deg: w.wind_from_deg ?? null,
-      wind_speed_kt: w.wind_speed_kt ?? null,
-      gust_kt: w.gust_kt ?? null,
-      // The rest of the field's report, for the VFR half of the go/no-go.
-      // `sky_reported` travels with them: without it the engine cannot tell a
-      // reported clear sky from a source that never looked.
-      visibility_sm: w.visibility_sm ?? null,
-      ceiling_ft_agl: w.ceiling_ft_agl ?? null,
-      ceiling_cover: w.ceiling_cover ?? '',
-      sky_reported: !!w.sky_reported,
-      weather_reported: !!w.weather_reported,
-    })),
+    waypoints: route.map(waypointPayload),
     planning_mode: planningMode,
+    // Not flown: the engine reads its takeoff and landing distances for the
+    // pre-dispatch sheet and nothing else.
+    alternate: alternate ? waypointPayload(alternate) : null,
     segment_overrides: segmentOverridesPayload(),
     forecasts,
     // What turns a cumulative ETE into a clock time, and so what decides
@@ -2091,6 +2098,7 @@ function renderNavlog(plan) {
   // list left standing beside no navlog claims to describe rows that are not
   // there.
   renderChecklist(null);
+  renderDispatch(null);
 
   if (!plan) {
     empty.hidden = false;
@@ -2105,6 +2113,7 @@ function renderNavlog(plan) {
     empty.hidden = false;
     empty.className = 'alert';
     empty.textContent = plan.error;
+    renderDispatch(null, plan.error);
     setStatus('Cannot plan this route');
     return;
   }
@@ -2262,6 +2271,7 @@ function renderNavlog(plan) {
 
   renderSummary(plan);
   renderChecklist(plan.checklist);
+  renderDispatch(plan.dispatch);
   restoreFocus();
 }
 
@@ -2274,11 +2284,92 @@ function renderNavlog(plan) {
  */
 // --- go / no-go ---------------------------------------------------------
 
+/** Number and wording helpers shared by the go/no-go and the pre-dispatch
+ *  sheet, so the same check reads the same way in both. */
+const CHECK_FORMAT = {
+  ft: (v) => (v == null ? '—' : `${Math.round(v)}`),
+  mark: (p) => (p === true ? 'ok' : p === false ? 'short' : 'unknown'),
+  label: (p) => (p === true ? 'OK' : p === false ? 'SHORT' : '?'),
+  // The field as a whole, where "SHORT" would be a lie: a field can fail on
+  // its sky with 10,000 ft of runway under it.
+  fieldLabel: (p) => (p === true ? 'OK' : p === false ? 'NO GO' : '?'),
+  // Signed, because the sign is the whole story: -6 on the runway you were
+  // going to use is a longer roll, not a shorter one.
+  kt: (v) => (v == null ? '—' : `${v > 0 ? '+' : ''}${Math.round(v)}`),
+  // What the sky is doing, in the words the report used.
+  skyText: (wx) => {
+    if (wx.obscured) return `sky obscured (${wx.ceiling_cover})`;
+    if (wx.ceiling_ft_agl != null) {
+      return `${wx.ceiling_cover || 'ceiling'} ${CHECK_FORMAT.ft(wx.ceiling_ft_agl)} ft AGL`;
+    }
+    return wx.sky_reported ? 'no ceiling' : 'sky not reported';
+  },
+  // What the facts above do not already say. The full reason is spelled out
+  // in the blocker list below -- repeating it here would print the ceiling
+  // twice in one line -- so all this adds is the number the ceiling missed,
+  // and the note for a sky nobody could judge.
+  weatherDetail: (wx) => {
+    if (wx.passes === null) return ` — ${wx.summary}`;
+    const short = wx.required_ceiling_ft_agl != null && wx.ceiling_ft_agl != null
+      && wx.ceiling_ft_agl < wx.required_ceiling_ft_agl;
+    return short ? ` — needs ${CHECK_FORMAT.ft(wx.required_ceiling_ft_agl)} ft` : '';
+  },
+  windText: (c) => {
+    if (c.wind_speed_kt == null) return 'wind not given';
+    if (c.wind_speed_kt === 0) return 'wind calm';
+    const gust = c.gust_kt == null ? '' : `G${Math.round(c.gust_kt)}`;
+    return `Wind ${String(Math.round(c.wind_from_deg)).padStart(3, '0')}°M at ` +
+      `${Math.round(c.wind_speed_kt)}${gust} kt`;
+  },
+};
+
+
+/** The field's sky against VFR, as one line with its own verdict. */
+function checkWeatherRow(wx) {
+  const { ft, mark, skyText, weatherDetail } = CHECK_FORMAT;
+  const row = document.createElement('div');
+  row.className = `check-weather ${mark(wx.passes)}`;
+  row.innerHTML =
+    `<span class="pill ${mark(wx.passes)}">` +
+      `${wx.passes === true ? 'VFR' : wx.passes === false ? 'NOT VFR' : '?'}` +
+    `</span> ${skyText(wx)} · ` +
+    `${wx.visibility_sm == null ? 'visibility not reported'
+      : `${wx.visibility_sm} sm visibility`} · ` +
+    `pattern ${ft(wx.pattern_altitude_agl_ft)} ft AGL` +
+    weatherDetail(wx);
+  return row;
+}
+
+/** A runway's crosswind cell, with its side. */
+function crossCell(runway) {
+  return `<td class="num${runway.crosswind_exceeds_demonstrated ? ' over' : ''}">` +
+    `${CHECK_FORMAT.ft(runway.crosswind_kt)}` +
+    // A side on a crosswind that rounds to nothing is noise: straight down
+    // the runway has no left or right about it.
+    `${runway.crosswind_kt >= 0.5
+      ? (runway.crosswind_from_right ? ' R' : ' L') : ''}` +
+    `</td>`;
+}
+
+/** A runway's verdict as a pill.
+ *
+ *  A blank chart cell, a crosswind past the demonstrated maximum and a runway
+ *  that is simply too short all read as no-go, but they are not the same
+ *  problem and the pilot acts on each differently. */
+function outcomePill(runway, prefix = '') {
+  const { mark, label } = CHECK_FORMAT;
+  const word = runway.outside_envelope ? 'NO DATA'
+    : runway.crosswind_exceeds_demonstrated ? 'XWIND'
+      : label(runway.passes);
+  return `<span class="pill ${mark(runway.passes)}">${prefix}${word}</span>`;
+}
+
 function renderChecklist(checklist) {
   const block = $('checklist-block');
   const body = $('checklist');
   body.innerHTML = '';
-  if (!checklist) { block.hidden = true; return; }
+  const badge = $('tab-verdict');
+  if (!checklist) { block.hidden = true; badge.hidden = true; return; }
   block.hidden = false;
 
   const verdict = $('verdict');
@@ -2290,41 +2381,13 @@ function renderChecklist(checklist) {
     || (checklist.is_go ? 'GO' : 'NO GO');
   verdict.className =
     `verdict ${!checklist.is_go ? 'nogo' : extrapolated ? 'extrapolated' : 'go'}`;
+  // The verdict on the tab itself, now that the checklist lives behind one: a
+  // NO GO must be seen from the navigation log without going looking for it.
+  badge.textContent = checklist.is_go ? 'GO' : 'NO GO';
+  badge.className = verdict.className.replace('verdict', 'tab-verdict');
+  badge.hidden = false;
 
-  const ft = (v) => (v == null ? '—' : `${Math.round(v)}`);
-  const mark = (p) => (p === true ? 'ok' : p === false ? 'short' : 'unknown');
-  const label = (p) => (p === true ? 'OK' : p === false ? 'SHORT' : '?');
-  // The field as a whole, where "SHORT" would be a lie: a field can fail on
-  // its sky with 10,000 ft of runway under it.
-  const fieldLabel = (p) => (p === true ? 'OK' : p === false ? 'NO GO' : '?');
-  // Signed, because the sign is the whole story: -6 on the runway you were
-  // going to use is a longer roll, not a shorter one.
-  const kt = (v) => (v == null ? '—' : `${v > 0 ? '+' : ''}${Math.round(v)}`);
-  // What the sky is doing, in the words the report used.
-  const skyText = (wx) => {
-    if (wx.obscured) return `sky obscured (${wx.ceiling_cover})`;
-    if (wx.ceiling_ft_agl != null) {
-      return `${wx.ceiling_cover || 'ceiling'} ${ft(wx.ceiling_ft_agl)} ft AGL`;
-    }
-    return wx.sky_reported ? 'no ceiling' : 'sky not reported';
-  };
-  // What the facts above do not already say. The full reason is spelled out
-  // in the blocker list below -- repeating it here would print the ceiling
-  // twice in one line -- so all this adds is the number the ceiling missed,
-  // and the note for a sky nobody could judge.
-  const weatherDetail = (wx) => {
-    if (wx.passes === null) return ` — ${wx.summary}`;
-    const short = wx.required_ceiling_ft_agl != null && wx.ceiling_ft_agl != null
-      && wx.ceiling_ft_agl < wx.required_ceiling_ft_agl;
-    return short ? ` — needs ${ft(wx.required_ceiling_ft_agl)} ft` : '';
-  };
-  const windText = (c) => {
-    if (c.wind_speed_kt == null) return 'wind not given';
-    if (c.wind_speed_kt === 0) return 'wind calm';
-    const gust = c.gust_kt == null ? '' : `G${Math.round(c.gust_kt)}`;
-    return `Wind ${String(Math.round(c.wind_from_deg)).padStart(3, '0')}°M at ` +
-      `${Math.round(c.wind_speed_kt)}${gust} kt`;
-  };
+  const { ft, mark, label, fieldLabel, kt, windText } = CHECK_FORMAT;
 
   for (const check of checklist.airports) {
     const section = document.createElement('div');
@@ -2347,20 +2410,7 @@ function renderChecklist(checklist) {
     // The sky, on its own line. It is a gate in its own right -- the longest
     // runway on the field is no use under an obscuration -- so it gets a
     // verdict of its own rather than being folded in among the conditions.
-    if (check.weather) {
-      const wx = check.weather;
-      const row = document.createElement('div');
-      row.className = `check-weather ${mark(wx.passes)}`;
-      row.innerHTML =
-        `<span class="pill ${mark(wx.passes)}">` +
-          `${wx.passes === true ? 'VFR' : wx.passes === false ? 'NOT VFR' : '?'}` +
-        `</span> ${skyText(wx)} · ` +
-        `${wx.visibility_sm == null ? 'visibility not reported'
-          : `${wx.visibility_sm} sm visibility`} · ` +
-        `pattern ${ft(wx.pattern_altitude_agl_ft)} ft AGL` +
-        weatherDetail(wx);
-      section.appendChild(row);
-    }
+    if (check.weather) section.appendChild(checkWeatherRow(check.weather));
 
     const table = document.createElement('table');
     table.className = 'runways';
@@ -2385,25 +2435,13 @@ function renderChecklist(checklist) {
         `<td>${runway.surface || '—'}${runway.dry_grass_applied ? ' (grass)' : ''}</td>` +
         `<td>${runway.end_used || '—'}</td>` +
         `<td class="num">${kt(runway.headwind_kt)}</td>` +
-        `<td class="num${runway.crosswind_exceeds_demonstrated ? ' over' : ''}">` +
-          `${ft(runway.crosswind_kt)}` +
-          // A side on a crosswind that rounds to nothing is noise: straight
-          // down the runway has no left or right about it.
-          `${runway.crosswind_kt >= 0.5
-            ? (runway.crosswind_from_right ? ' R' : ' L') : ''}` +
-        `</td>` +
+        crossCell(runway) +
         `<td class="num">${ft(runway.runway_available_ft)}</td>` +
         `<td class="num">${ft(runway.ground_roll_ft)}</td>` +
         `<td class="num">${ft(runway.over_50ft_ft)}</td>` +
         `<td class="num">${ft(runway.required_ft)}</td>` +
         `<td class="num">${ft(runway.spare_ft)}</td>` +
-        `<td><span class="pill ${mark(runway.passes)}">` +
-        // A blank chart cell, a crosswind past the demonstrated maximum and a
-        // runway that is simply too short all read as no-go, but they are not
-        // the same problem and the pilot acts on each differently.
-        `${runway.outside_envelope ? 'NO DATA'
-          : runway.crosswind_exceeds_demonstrated ? 'XWIND'
-            : label(runway.passes)}</span></td>`;
+        `<td>${outcomePill(runway)}</td>`;
       tbody.appendChild(tr);
       if (runway.note) {
         const note = document.createElement('tr');
@@ -2464,6 +2502,244 @@ function renderChecklist(checklist) {
     body.appendChild(div);
   }
 }
+
+// --- pre-dispatch: takeoff and landing at every field --------------------
+
+/** The field the pilot would divert to, shaped like a route waypoint so it
+ *  travels to the engine the same way. Never in `route`: it is planned for,
+ *  not flown. */
+let alternate = null;
+/** What the last "Get weather" fetched for the alternate, in the shape
+ *  `fieldWx` holds for the route's fields. Separate because the alternate
+ *  can share a name with a field on the route and still be its own entry. */
+let alternateWx = null;
+
+const DISPATCH_ROLES = {
+  departure: 'Departure', destination: 'Destination', alternate: 'Alternate',
+};
+
+/** The waypoint a dispatch entry describes, for its weather provenance. */
+function dispatchWaypoint(field) {
+  if (field.role === 'alternate') return alternate;
+  const drawn = route.filter((w) => !w.generated);
+  return field.role === 'departure' ? drawn[0] : drawn[drawn.length - 1];
+}
+
+/** One card per field: its air, its sky, then every runway both ways round.
+ *
+ *  Takeoff and landing share a row because they share a runway end -- the
+ *  wind picks the same one for both -- and a pilot comparing the two is
+ *  comparing columns, not hunting between tables. */
+function renderDispatch(dispatch, refused = null) {
+  const box = $('dispatch-fields');
+  box.innerHTML = '';
+  if (refused) {
+    // The fields' air is read off the log, so no log means no distances --
+    // and saying "add a departure" beside a route that has one would send
+    // the pilot looking for the wrong problem.
+    box.innerHTML = `<p class="alert">No distances: the route cannot be ` +
+      `planned — ${escapeHtml(refused)}</p>`;
+    return;
+  }
+  if (!dispatch || !dispatch.length) {
+    box.innerHTML = '<p class="hint">Add a departure and a destination to see ' +
+      'their takeoff and landing distances.</p>';
+    return;
+  }
+  const { ft, mark, fieldLabel, kt, windText } = CHECK_FORMAT;
+  for (const field of dispatch) {
+    const section = document.createElement('div');
+    section.className = `check dispatch-field ${field.role}`;
+    const title = `<span class="check-title">${escapeHtml(field.airport)}` +
+      ` <span class="role">${DISPATCH_ROLES[field.role] || field.role}</span></span>`;
+    if (!field.ok) {
+      section.innerHTML = `<div class="check-head">${title}</div>` +
+        `<div class="alert unknown">${escapeHtml(field.error)}</div>`;
+      box.appendChild(section);
+      continue;
+    }
+    const to = field.takeoff;
+    const ldg = field.landing;
+    const waypoint = dispatchWaypoint(field);
+    const wx = field.role === 'alternate' ? alternateWx : undefined;
+    section.innerHTML =
+      `<div class="check-head">${title}<span class="pills">` +
+        `<span class="pill ${mark(to.passes)}">T/O ${fieldLabel(to.passes)}</span> ` +
+        `<span class="pill ${mark(ldg.passes)}">LDG ${fieldLabel(ldg.passes)}</span>` +
+      `</span></div>` +
+      `<div class="check-conditions">` +
+        `Field ${ft(to.elevation_ft)} ft · ` +
+        (field.altimeter_inhg == null ? ''
+          : `Alt set ${field.altimeter_inhg.toFixed(2)} · `) +
+        `OAT ${Math.round(to.oat_c)} °C · ` +
+        `Pressure alt ${ft(to.pressure_altitude_ft)} ft · ` +
+        `<strong>Density alt ${ft(to.density_altitude_ft)} ft</strong> · ` +
+        `${ft(to.weight_lb)} lb · margin ${Math.round(to.margin * 100)}% · ` +
+        `<strong>${windText(to)}</strong>` +
+      `</div>` +
+      (waypoint ? fieldWxText(waypoint, wx) : '');
+    // The sky is the same report for both operations.
+    if (to.weather) section.appendChild(checkWeatherRow(to.weather));
+
+    const table = document.createElement('table');
+    table.className = 'runways dispatch-runways';
+    table.innerHTML =
+      `<thead><tr><th>Runway</th><th>Surface</th>` +
+      `<th title="The end with the better headwind — the one these numbers ` +
+        `are for">Use</th>` +
+      `<th class="num" title="Headwind on that end; negative is a tailwind">Head</th>` +
+      `<th class="num" title="Crosswind, at the gust where there is one">Cross</th>` +
+      `<th class="num">Length</th>` +
+      `<th class="num op-start" title="Takeoff ground roll">T/O roll</th>` +
+      `<th class="num" title="Takeoff, total over a 50 ft obstacle">T/O 50</th>` +
+      `<th class="num" title="Takeoff over 50 ft plus your runway margin">T/O req</th>` +
+      `<th class="num op-start" title="Landing ground roll">LDG roll</th>` +
+      `<th class="num" title="Landing, total over a 50 ft obstacle">LDG 50</th>` +
+      `<th class="num" title="Landing over 50 ft plus your runway margin">LDG req</th>` +
+      `<th></th><th></th></tr></thead><tbody></tbody>`;
+    const tbody = table.querySelector('tbody');
+    to.runways.forEach((t, i) => {
+      // Both lists are built from the field's runways in the same order.
+      const l = ldg.runways[i] || {};
+      const tr = document.createElement('tr');
+      tr.className = t.passes === false || l.passes === false ? 'short'
+        : t.passes && l.passes ? 'ok' : 'unknown';
+      tr.innerHTML =
+        `<td>${t.runway || '—'}</td>` +
+        `<td>${t.surface || '—'}${t.dry_grass_applied ? ' (grass)' : ''}</td>` +
+        `<td>${t.end_used || '—'}</td>` +
+        `<td class="num">${kt(t.headwind_kt)}</td>` +
+        crossCell(t) +
+        `<td class="num">${ft(t.runway_available_ft)}</td>` +
+        `<td class="num op-start">${ft(t.ground_roll_ft)}</td>` +
+        `<td class="num"><strong>${ft(t.over_50ft_ft)}</strong></td>` +
+        `<td class="num">${ft(t.required_ft)}</td>` +
+        `<td class="num op-start">${ft(l.ground_roll_ft)}</td>` +
+        `<td class="num"><strong>${ft(l.over_50ft_ft)}</strong></td>` +
+        `<td class="num">${ft(l.required_ft)}</td>` +
+        `<td>${outcomePill(t, 'T/O ')}</td>` +
+        `<td>${outcomePill(l, 'LDG ')}</td>`;
+      tbody.appendChild(tr);
+      // The two operations' notes overlap -- the same wind, the same
+      // surface -- so each distinct one is said once.
+      const notes = [...new Set([t.note, l.note]
+        .flatMap((n) => (n ? n.split('; ') : [])))];
+      if (notes.length) {
+        const note = document.createElement('tr');
+        note.className = 'note';
+        note.innerHTML = `<td colspan="14">${escapeHtml(notes.join('; '))}</td>`;
+        tbody.appendChild(note);
+      }
+    });
+    section.appendChild(table);
+
+    // Off-chart readings at this field, once each.
+    const offChart = new Map();
+    for (const [op, check] of [['takeoff', to], ['landing', ldg]]) {
+      for (const runway of check.runways) {
+        for (const entry of runway.off_chart || []) {
+          offChart.set(`${op}: ${entry.detail}`, entry.conservative);
+        }
+      }
+    }
+    for (const [text, conservative] of offChart) {
+      const div = document.createElement('div');
+      div.className = `alert ${conservative ? 'extrapolated' : 'extrapolated-optimistic'}`;
+      div.textContent = `Extrapolated — ${text}`;
+      section.appendChild(div);
+    }
+    box.appendChild(section);
+  }
+}
+
+/** The alternate's chip and its weather boxes, from `alternate`. */
+function renderAlternate() {
+  const chosen = $('alternate-chosen');
+  chosen.hidden = !alternate;
+  chosen.textContent = alternate ? alternate.name : '';
+  chosen.title = alternate?.label || '';
+  $('alternate-clear').hidden = !alternate;
+  $('alternate-wx').hidden = !alternate;
+  $('alternate-search').placeholder = alternate
+    ? 'Change alternate…' : 'Alternate — type KHAF, Half Moon Bay…';
+  for (const [id, key] of ALTERNATE_INPUTS) {
+    $(id).value = alternate?.[key] ?? '';
+  }
+}
+
+function setAlternate(airport) {
+  alternate = airport ? {
+    name: airport.ident, lat: airport.lat, lon: airport.lon,
+    kind: airport.kind || 'airport', elevation_ft: airport.elevation_ft,
+    label: airport.label,
+  } : null;
+  alternateWx = null;
+  renderAlternate();
+  requestPlan();
+}
+
+// [input id, alternate key, lowest, highest]: the same bounds as the boxes
+// on a route field.
+const ALTERNATE_INPUTS = [
+  ['alt-qnh', 'altimeter_inhg', 27, 32],
+  ['alt-oat', 'oat_c', -40, 55],
+  ['alt-wind-from', 'wind_from_deg', 0, 360],
+  ['alt-wind-kt', 'wind_speed_kt', 0, 99],
+  ['alt-wind-gust', 'gust_kt', 0, 99],
+];
+for (const [id, key, low, high] of ALTERNATE_INPUTS) {
+  $(id).addEventListener('change', () => {
+    if (!alternate) return;
+    const raw = $(id).value.trim();
+    const value = raw === '' ? null : Number(raw);
+    if (value !== null && (!Number.isFinite(value) || value < low || value > high)) return;
+    alternate[key] = value;
+    requestPlan();
+  });
+}
+
+$('alternate-clear').addEventListener('click', () => setAlternate(null));
+
+let alternateTimer = null;
+$('alternate-search').addEventListener('input', (event) => {
+  clearTimeout(alternateTimer);
+  const query = event.target.value.trim();
+  const box = $('alternate-results');
+  if (query.length < 2) { box.hidden = true; return; }
+  alternateTimer = setTimeout(async () => {
+    // Fields only: an alternate is somewhere to land, and a VFR checkpoint
+    // has no runway and no elevation to read a distance at.
+    const found = (await api.searchAirports(query))
+      .filter((a) => isAirport(a) && a.elevation_ft != null);
+    box.innerHTML = '';
+    for (const airport of found) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      const runway = airport.longest_runway_ft
+        ? ` · ${Math.round(airport.longest_runway_ft)} ft` : '';
+      button.innerHTML =
+        `<span class="ident">${escapeHtml(airport.ident)}</span> ` +
+        `${escapeHtml(airport.name)}` +
+        `<span class="meta">${escapeHtml(airport.municipality ?? '')} ` +
+        `${escapeHtml(airport.region ?? '')} · ` +
+        `${Math.round(airport.elevation_ft)} ft${runway}</span>`;
+      button.addEventListener('click', () => {
+        $('alternate-search').value = '';
+        box.hidden = true;
+        setAlternate(airport);
+      });
+      box.appendChild(button);
+    }
+    box.hidden = !found.length;
+  }, 150);
+});
+$('alternate-search').addEventListener('keydown', (event) => {
+  if (event.key === 'Escape') $('alternate-results').hidden = true;
+  if (event.key === 'Enter') $('alternate-results').querySelector('button')?.click();
+});
+document.addEventListener('click', (event) => {
+  if (!event.target.closest('.alternate-pick')) $('alternate-results').hidden = true;
+});
 
 function renderSummary(plan) {
   const t = plan.totals;
@@ -2655,6 +2931,59 @@ function plannedArrivals() {
   return times;
 }
 
+/** Write one surface report onto a field, and return its provenance entry.
+ *
+ *  Only what the report actually gives is written to the boxes; the rest of
+ *  the report replaces whatever the last one said. Shared by the route's
+ *  fields and the alternate, so the two can never be filled differently.
+ */
+function applySurfaceReport(waypoint, report) {
+  const wrote = {};
+  if (report.altimeter_inhg != null) {
+    wrote.altimeter_inhg = Math.round(report.altimeter_inhg * 100) / 100;
+  }
+  if (report.oat_c != null) wrote.oat_c = Math.round(report.oat_c);
+  // Direction and speed together or not at all -- half a wind is not one,
+  // and a direction with no speed would read as a calm from the north.
+  if (report.wind_from_deg != null && report.wind_speed_kt != null) {
+    wrote.wind_from_deg = Math.round(report.wind_from_deg);
+    wrote.wind_speed_kt = Math.round(report.wind_speed_kt);
+    // A report with no gust in it says there is no gust. Keeping the last
+    // one would hold a peak that has since dropped against the crosswind
+    // limit, so the wind is replaced whole. What arrives is already known
+    // to belong to this wind -- `weather.resolve_surface` drops a gust
+    // that came from a weaker source than the wind it would attach to.
+    wrote.gust_kt = report.gust_kt == null ? null : Math.round(report.gust_kt);
+  }
+  Object.assign(waypoint, wrote);
+  // The sky and the visibility go straight onto the waypoint rather than
+  // through `wrote`: they fill no box on the form, so they are not part of
+  // what "filled 2 fields" counts or of what the source line describes.
+  //
+  // Replaced whole, on the same reasoning as the gust. A report that no
+  // longer mentions an overcast is saying the overcast has gone, and
+  // keeping the last one would hold a ceiling against a field that has
+  // cleared. A report with no sky group at all leaves `sky_reported` false,
+  // which the go/no-go reads as unknown rather than as clear.
+  Object.assign(waypoint, {
+    visibility_sm: report.visibility_sm ?? null,
+    ceiling_ft_agl: report.ceiling_ft_agl ?? null,
+    ceiling_cover: report.ceiling_cover ?? '',
+    sky_reported: !!report.sky_reported,
+    // A report came back, whatever was in it. A model-only answer has no
+    // cloud and no visibility in it, and the go/no-go has to be able to
+    // tell that from a field nobody asked about.
+    weather_reported: true,
+  });
+  return {
+    station: report.station,
+    valid_time: report.valid_time,
+    sources: report.sources || {},
+    notes: report.notes || [],
+    wrote,
+  };
+}
+
 async function getWeather() {
   const button = $('get-weather');
   // Airports only: a fix or a private strip has no station to ask about, and
@@ -2678,10 +3007,17 @@ async function getWeather() {
   const arrivals = plannedArrivals();
 
   button.textContent = 'Fetching…';
+  // The alternate is wanted when the destination is reached: that is when
+  // the decision to divert is made.
+  const alternateAt = arrivals.get(route[route.length - 1].name);
   let reports;
+  let alternateReport = null;
   try {
-    reports = await Promise.all(fields.map(
-      (w) => api.surface(w.name, arrivals.get(w.name)?.toISOString())));
+    [reports, alternateReport] = await Promise.all([
+      Promise.all(fields.map(
+        (w) => api.surface(w.name, arrivals.get(w.name)?.toISOString()))),
+      alternate ? api.surface(alternate.name, alternateAt?.toISOString()) : null,
+    ]);
   } catch {
     // The one thing worse than no weather is a button that stays greyed out
     // because the network went away mid-fetch.
@@ -2700,43 +3036,8 @@ async function getWeather() {
       failed.push(waypoint.name);
       return;
     }
-    const wrote = {};
-    if (report.altimeter_inhg != null) {
-      wrote.altimeter_inhg = Math.round(report.altimeter_inhg * 100) / 100;
-    }
-    if (report.oat_c != null) wrote.oat_c = Math.round(report.oat_c);
-    // Direction and speed together or not at all -- half a wind is not one,
-    // and a direction with no speed would read as a calm from the north.
-    if (report.wind_from_deg != null && report.wind_speed_kt != null) {
-      wrote.wind_from_deg = Math.round(report.wind_from_deg);
-      wrote.wind_speed_kt = Math.round(report.wind_speed_kt);
-      // A report with no gust in it says there is no gust. Keeping the last
-      // one would hold a peak that has since dropped against the crosswind
-      // limit, so the wind is replaced whole. What arrives is already known
-      // to belong to this wind -- `weather.resolve_surface` drops a gust
-      // that came from a weaker source than the wind it would attach to.
-      wrote.gust_kt = report.gust_kt == null ? null : Math.round(report.gust_kt);
-    }
-    Object.assign(waypoint, wrote);
-    // The sky and the visibility go straight onto the waypoint rather than
-    // through `wrote`: they fill no box on the form, so they are not part of
-    // what "filled 2 fields" counts or of what the source line describes.
-    //
-    // Replaced whole, on the same reasoning as the gust. A report that no
-    // longer mentions an overcast is saying the overcast has gone, and
-    // keeping the last one would hold a ceiling against a field that has
-    // cleared. A report with no sky group at all leaves `sky_reported` false,
-    // which the go/no-go reads as unknown rather than as clear.
-    Object.assign(waypoint, {
-      visibility_sm: report.visibility_sm ?? null,
-      ceiling_ft_agl: report.ceiling_ft_agl ?? null,
-      ceiling_cover: report.ceiling_cover ?? '',
-      sky_reported: !!report.sky_reported,
-      // A report came back, whatever was in it. A model-only answer has no
-      // cloud and no visibility in it, and the go/no-go has to be able to
-      // tell that from a field nobody asked about.
-      weather_reported: true,
-    });
+    const entry = applySurfaceReport(waypoint, report);
+    const { wrote } = entry;
     // The departure setting is the one to fly the route on, on the same
     // reasoning as typing it by hand -- and only while the route field is
     // still standard, so it never overwrites a figure somebody chose.
@@ -2744,15 +3045,20 @@ async function getWeather() {
         && +$('altimeter').value === 29.92) {
       $('altimeter').value = wrote.altimeter_inhg;
     }
-    fieldWx.set(waypoint.name, {
-      station: report.station,
-      valid_time: report.valid_time,
-      sources: report.sources || {},
-      notes: report.notes || [],
-      wrote,
-    });
+    fieldWx.set(waypoint.name, entry);
     if (Object.keys(wrote).length) filled += 1;
   });
+
+  if (alternate) {
+    if (!alternateReport || alternateReport.error) {
+      alternateWx = { error: (alternateReport && alternateReport.error) || 'no answer' };
+      failed.push(alternate.name);
+    } else {
+      alternateWx = applySurfaceReport(alternate, alternateReport);
+      if (Object.keys(alternateWx.wrote).length) filled += 1;
+    }
+    renderAlternate();
+  }
 
   renderWaypointList();
 
@@ -3440,6 +3746,10 @@ function restoreMission(mission, snapshot) {
   // The field reports were not saved -- they are fetched again -- so the
   // provenance lines for the old ones go too.
   fieldWx = new Map();
+  // The alternate comes back too, without the weather it was saved with.
+  alternate = mission.alternate ? { ...mission.alternate } : null;
+  alternateWx = null;
+  renderAlternate();
   onRouteChanged();
   fitRoute();
   flashButton($('get-weather'), 'Get weather for today');

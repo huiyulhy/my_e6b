@@ -90,32 +90,6 @@
       <div id="warnings"></div>
     </section>
 
-    <section class="block" id="checklist-block" hidden>
-      <div class="navlog-head">
-        <h2>Go / no-go</h2>
-        <span id="verdict" class="verdict"></span>
-      </div>
-      <div id="checklist"></div>
-      <p class="hint">
-        Each runway is checked end by end at the field's wind: the end with the
-        better headwind is the one the distances are read for, and its
-        crosswind is checked against the 15 kt maximum demonstrated. A gust
-        counts against you — for the crosswind and for a tailwind — and never
-        for you. <strong>Get weather</strong>, over the navlog, fills each
-        field's wind, temperature and altimeter setting from its current
-        report; with no wind entered the distances are the zero-wind book
-        figures, which every runway says beside itself. Landing distance is the
-        POH max-weight figure. An unknown runway is never treated as a pass.
-        A query past the edge of a chart is refused, or answered from the
-        nearest published air and listed as <strong>extrapolated</strong> —
-        with the navlog row it first appears on, since time and fuel are
-        cumulative from there. Cruise is the chart's ISA ±20 columns at the
-        row's own pressure altitude; outside that band there is no published
-        column for the operating point, so the reading is an extrapolation
-        however close the substituted air is.
-      </p>
-    </section>
-
     <section class="block" id="consistency-block">
       <div class="navlog-head">
         <h2>Navlog consistency</h2>
@@ -265,6 +239,9 @@
     <div class="tabs" role="tablist">
       <button type="button" role="tab" id="tab-btn-navlog" aria-selected="true"
               aria-controls="tab-navlog" data-tab="navlog">Navigation log</button>
+      <button type="button" role="tab" id="tab-btn-dispatch" aria-selected="false"
+              aria-controls="tab-dispatch" data-tab="dispatch">Pre-dispatch
+        <span id="tab-verdict" class="tab-verdict" hidden></span></button>
       <button type="button" role="tab" id="tab-btn-route-file" aria-selected="false"
               aria-controls="tab-route-file" data-tab="route-file">Route file</button>
       <button type="button" id="navlog-size" class="navlog-size"
@@ -352,6 +329,76 @@
       </div>
       <div id="notam-list"></div>
     </div>
+    </div>
+
+    <div id="tab-dispatch" role="tabpanel" aria-labelledby="tab-btn-dispatch" hidden>
+      <div class="dispatch">
+        <section class="block dispatch-fields">
+          <div class="navlog-head">
+            <h2>Takeoff &amp; landing</h2>
+            <div class="alternate-pick">
+              <span id="alternate-chosen" class="alternate-chosen" hidden></span>
+              <button id="alternate-clear" type="button" hidden
+                      title="Remove the alternate">×</button>
+              <div class="search">
+                <input id="alternate-search" type="search" autocomplete="off"
+                       spellcheck="false" placeholder="Alternate — type KHAF, Half Moon Bay…">
+                <div id="alternate-results" class="results" hidden></div>
+              </div>
+            </div>
+          </div>
+          <!-- The alternate is not on the route, so it has no field boxes in
+               the sidebar; its weather is typed, or fetched, here. -->
+          <div id="alternate-wx" class="coords field alternate-wx" hidden>
+            <label title="Field altimeter setting, off this station's METAR or ATIS">Alt set
+              <input id="alt-qnh" type="number" step="0.01" min="27" max="32" placeholder="route"></label>
+            <label title="Field temperature">OAT °C
+              <input id="alt-oat" type="number" step="1" min="-40" max="55" placeholder="ISA"></label>
+            <label title="Surface wind direction, degrees TRUE as the METAR reports it">Wind
+              <input id="alt-wind-from" type="number" step="10" min="0" max="360" placeholder="—"></label>
+            <label title="Surface wind speed, knots. 0 is calm">kt
+              <input id="alt-wind-kt" type="number" step="1" min="0" max="99" placeholder="—"></label>
+            <label title="Peak gust, knots">Gust
+              <input id="alt-wind-gust" type="number" step="1" min="0" max="99" placeholder="—"></label>
+          </div>
+          <div id="dispatch-fields"></div>
+          <p class="hint">
+            Both operations at every field: the landing back into the departure
+            after a problem on climb-out, the takeoff out of the destination,
+            and both at the alternate. Each is read at that field's own
+            altimeter setting, temperature and wind — <strong>Get weather</strong>
+            fetches them, the alternate included, for the time each field is
+            reached. Roll is the ground roll; 50 is the total over a 50 ft
+            obstacle, and Req is that plus your runway margin. The alternate is
+            information, not part of the go/no-go verdict.
+          </p>
+        </section>
+        <section class="block" id="checklist-block" hidden>
+          <div class="navlog-head">
+            <h2>Go / no-go</h2>
+            <span id="verdict" class="verdict"></span>
+          </div>
+          <div id="checklist"></div>
+          <p class="hint">
+            Each runway is checked end by end at the field's wind: the end with the
+            better headwind is the one the distances are read for, and its
+            crosswind is checked against the 15 kt maximum demonstrated. A gust
+            counts against you — for the crosswind and for a tailwind — and never
+            for you. <strong>Get weather</strong>, over the navlog, fills each
+            field's wind, temperature and altimeter setting from its current
+            report; with no wind entered the distances are the zero-wind book
+            figures, which every runway says beside itself. Landing distance is the
+            POH max-weight figure. An unknown runway is never treated as a pass.
+            A query past the edge of a chart is refused, or answered from the
+            nearest published air and listed as <strong>extrapolated</strong> —
+            with the navlog row it first appears on, since time and fuel are
+            cumulative from there. Cruise is the chart's ISA ±20 columns at the
+            row's own pressure altitude; outside that band there is no published
+            column for the operating point, so the reading is an extrapolation
+            however close the substituted air is.
+          </p>
+        </section>
+      </div>
     </div>
 
     <div id="tab-route-file" role="tabpanel" aria-labelledby="tab-btn-route-file" hidden>

@@ -1083,34 +1083,9 @@ def _build_checklist(
             if key in seen:
                 continue
             seen.add(key)
-
-            # Field weather beats the en-route figures when it is given: the
-            # density altitude these distances are read at is the one at the
-            # airport, not the one along the way.
-            air = field_weather(waypoint, conditions)
-            assert air is not None  # the elevation was checked above
             checks.append(
-                preflight.check_airport(
-                    airport=waypoint.name,
-                    operation=operation,
-                    runways=waypoint.runways,
-                    elevation_ft=air.altitude_ft,
-                    oat_c=air.oat_c,
-                    pressure_altitude_ft=air.pressure_altitude_ft,
-                    density_altitude_ft=air.density_altitude_ft,
-                    weight_lb=aircraft.weight_lb,
-                    margin=margins.runway,
-                    wind=_field_wind(waypoint, decimal_year),
-                    # Only what the field actually reported. A waypoint with
-                    # no weather on it leaves the VFR check out rather than
-                    # failing it, so a plan built without fetching weather
-                    # reads exactly as it did before.
-                    weather=waypoint.field_weather_report,
-                    pattern_altitude_agl_ft=(
-                        waypoint.pattern_altitude_agl_ft
-                        if waypoint.pattern_altitude_agl_ft is not None
-                        else preflight.DEFAULT_PATTERN_HEIGHT_AGL_FT
-                    ),
+                _check_field(
+                    waypoint, operation, aircraft, conditions, margins, decimal_year
                 )
             )
 
@@ -1126,6 +1101,74 @@ def _build_checklist(
     )
     return preflight.summarise(
         checks, fuel, off_chart=_leg_off_chart(legs or [])
+    )
+
+
+def _check_field(
+    waypoint: Waypoint,
+    operation: str,
+    aircraft: Aircraft,
+    conditions: Conditions,
+    margins: preflight.Margins,
+    decimal_year: float,
+) -> preflight.AirportCheck:
+    """One operation at one field, at that field's own air and wind."""
+    # Field weather beats the en-route figures when it is given: the density
+    # altitude these distances are read at is the one at the airport, not the
+    # one along the way.
+    air = field_weather(waypoint, conditions)
+    if air is None:
+        raise RouteError(f"{waypoint.name} has no elevation to read distances at")
+    return preflight.check_airport(
+        airport=waypoint.name,
+        operation=operation,
+        runways=waypoint.runways,
+        elevation_ft=air.altitude_ft,
+        oat_c=air.oat_c,
+        pressure_altitude_ft=air.pressure_altitude_ft,
+        density_altitude_ft=air.density_altitude_ft,
+        weight_lb=aircraft.weight_lb,
+        margin=margins.runway,
+        wind=_field_wind(waypoint, decimal_year),
+        # Only what the field actually reported. A waypoint with no weather on
+        # it leaves the VFR check out rather than failing it, so a plan built
+        # without fetching weather reads exactly as it did before.
+        weather=waypoint.field_weather_report,
+        pattern_altitude_agl_ft=(
+            waypoint.pattern_altitude_agl_ft
+            if waypoint.pattern_altitude_agl_ft is not None
+            else preflight.DEFAULT_PATTERN_HEIGHT_AGL_FT
+        ),
+    )
+
+
+def field_checks(
+    waypoint: Waypoint,
+    aircraft: Aircraft,
+    conditions: Conditions,
+    margins: preflight.Margins | None = None,
+) -> tuple[preflight.AirportCheck, preflight.AirportCheck] | None:
+    """Takeoff and landing at one field, both ways round.
+
+    For the pre-dispatch sheet, which wants every distance at every field it
+    names -- the landing back into the departure field after a problem on
+    climb-out, the takeoff out of the destination on the way home, and both
+    at an alternate the route never visits. The go/no-go checks only the
+    operations the route actually performs; these are information beside it,
+    computed by the same function so the two cannot read different numbers.
+
+    `conditions` should be the navlog's own (`Navlog.conditions`), so a field
+    with no reported temperature is read in the same air the log used.
+    `None` where the waypoint has no elevation to read distances at.
+    """
+    if waypoint.elevation_ft is None:
+        return None
+    margins = margins or preflight.Margins()
+    flight_date = conditions.flight_date or DateTime.now(tz=UTC).date()
+    decimal_year = decimal_year_for(flight_date.year, flight_date.month, flight_date.day)
+    return tuple(
+        _check_field(waypoint, operation, aircraft, conditions, margins, decimal_year)
+        for operation in ("takeoff", "landing")
     )
 
 

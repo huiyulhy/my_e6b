@@ -249,6 +249,43 @@ input:disabled { opacity: .45; cursor: not-allowed; }
   display: flex; flex-direction: column; flex: 1; min-height: 0; min-width: 0;
 }
 #tab-route-file:not([hidden]) { overflow-y: auto; flex: 1; min-height: 0; }
+
+/* The verdict, small, on the Pre-dispatch tab itself: the checklist lives
+   behind the tab now, and a NO GO must still be seen from the log. */
+.tab-verdict { font-family: var(--mono); font-size: 10px; font-weight: 700;
+  letter-spacing: .06em; padding: 1px 6px; border-radius: 999px; margin-left: 4px; }
+.tab-verdict.go { background: rgba(126, 224, 129, 0.16); color: var(--ok); }
+.tab-verdict.nogo { background: rgba(255, 123, 114, 0.16); color: var(--warn); }
+.tab-verdict.extrapolated { background: rgba(230, 180, 80, 0.18); color: #e6b450; }
+
+/* Pre-dispatch: the field distances, then the go/no-go under them. One
+   column, because a field's runway table is fourteen columns wide and side by
+   side neither half had room for its own table. A table still wider than the
+   panel scrolls inside its card rather than over its neighbour. */
+#tab-dispatch:not([hidden]) { overflow-y: auto; flex: 1; min-height: 0; }
+.dispatch { padding: 0 14px 14px; max-width: 1100px; }
+.dispatch .check { overflow-x: auto; }
+.dispatch .block { margin-top: 0; padding-top: 4px; }
+.dispatch .block:first-child { border-top: none; }
+.dispatch .navlog-head { padding: 6px 0; flex-wrap: wrap; gap: 8px; }
+.dispatch .check-head .role { font-family: inherit; font-weight: 500;
+  font-size: 11px; color: var(--ink-dim); margin-left: 4px; }
+.dispatch .check-head .pills { display: flex; gap: 4px; }
+.dispatch-field.alternate { border-left: 2px solid var(--line); padding-left: 8px; }
+.dispatch-runways .op-start { border-left: 1px solid var(--line); }
+.dispatch-runways strong { font-weight: 600; color: var(--ink); }
+
+.alternate-pick { display: flex; align-items: center; gap: 6px; }
+.alternate-pick .search { width: 260px; }
+.alternate-pick input[type="search"] { padding: 4px 8px; font-size: 12px; }
+.alternate-chosen { font-family: var(--mono); font-weight: 600; font-size: 12px;
+  padding: 2px 8px; border: 1px solid var(--accent); border-radius: 999px;
+  color: var(--accent); }
+#alternate-clear { background: none; border: 1px solid var(--line); border-radius: 5px;
+  color: var(--ink-dim); cursor: pointer; padding: 1px 7px; font: inherit; }
+#alternate-clear:hover { color: var(--warn); border-color: var(--warn); }
+.alternate-wx:not([hidden]) { grid-template-columns: repeat(5, minmax(0, 90px));
+  margin: 2px 0 6px; }
 .route-file { padding: 0 14px 14px; max-width: 560px; }
 .route-file .block:first-child { border-top: none; margin-top: 0; padding-top: 12px; }
 .route-file h2 { margin: 0 0 4px; }
