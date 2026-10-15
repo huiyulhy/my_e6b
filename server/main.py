@@ -35,7 +35,7 @@ from engine import charts as ch
 from engine import consistency as consistency_checks
 from engine import csv_download as csv_export
 from engine import currency as cur
-from engine import kml
+from engine import fpl, kml
 from engine import magnetic as mag
 from engine import mission as ms
 from engine import navlog as nl
@@ -272,7 +272,7 @@ class PlanRequest(BaseModel):
 
 
 class RouteFileIn(BaseModel):
-    """A `.kml` or `.kmz` file, as the browser read it.
+    """A `.kml`, `.kmz` or `.fpl` file, as the browser read it.
 
     Base64 in JSON rather than a multipart upload: a KMZ is binary, every
     other endpoint here speaks JSON, and multipart would be the one dependency
@@ -925,6 +925,35 @@ def route_kml(request: PlanRequest) -> Response:
     )
 
 
+@app.post("/api/route.fpl")
+def route_fpl(request: PlanRequest) -> Response:
+    """The route as a Garmin flight plan, for ForeFlight and Garmin devices.
+
+    Built from the request's own points rather than a solve: the format has
+    no altitudes and no room for TOC or TOD, so a plan that does not solve
+    today exports exactly as one that does.
+    """
+    points = [
+        nl.Waypoint(
+            name=w.name,
+            position=LatLon(w.lat, w.lon),
+            kind=w.kind,
+            elevation_ft=w.elevation_ft,
+            generated=w.generated,
+        )
+        for w in request.waypoints
+    ]
+    try:
+        text = fpl.flight_plan(points)
+    except fpl.FplError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    return Response(
+        content=text,
+        media_type="application/xml",
+        headers={"Content-Disposition": f'attachment; filename="{fpl.fpl_filename(points)}"'},
+    )
+
+
 # What an airport identifier looks like: KSQL, SQL, 1C9, O88. Used to decide
 # which placemarks in somebody else's file are worth looking up.
 _IDENT_LIKE = re.compile(r"^[A-Z0-9]{3,4}$")
@@ -932,12 +961,14 @@ _IDENT_LIKE = re.compile(r"^[A-Z0-9]{3,4}$")
 
 @app.post("/api/route/import")
 def import_route(request: RouteFileIn) -> dict:
-    """The waypoints in a KML file, in the shape the UI adds a waypoint in.
+    """The waypoints in a KML or Garmin `.fpl` file, in the shape the UI adds
+    a waypoint in.
 
     Parsing is the engine's. What this adds is the airport database: a point
     that names an airport comes back as that airport, at its published
     position, so that the runways and pattern altitude the go/no-go needs are
-    found again. A file of ours says which of its points are airports; for
+    found again. A file of ours, or a flight plan, says which of its points
+    are airports; for
     anybody else's, anything that looks like an identifier is tried, and
     silently kept as a plain waypoint when it is not one. Nothing is added to
     the route here: the UI shows what was found and asks first.
@@ -947,8 +978,8 @@ def import_route(request: RouteFileIn) -> dict:
     except (binascii.Error, ValueError):
         return JSONResponse({"ok": False, "error": "file content is not base64"}, status_code=400)
     try:
-        read = kml.read_kml(data)
-    except kml.KmlError as exc:
+        read = fpl.read_fpl(data) if fpl.looks_like_fpl(data) else kml.read_kml(data)
+    except (kml.KmlError, fpl.FplError) as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
     points = read.waypoints
 

@@ -123,6 +123,8 @@ input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 .results button:hover .meta, .results button.active .meta { color: #06121f; opacity: .8; }
 
 .waypoints { list-style: none; margin: 12px 0 8px; padding: 0; }
+.route-tools { display: flex; gap: 8px; margin: 0 0 4px; }
+.route-tools button { font-size: 11px; }
 .waypoints li {
   display: flex; align-items: center; gap: 8px; padding: 6px 8px; margin-bottom: 4px;
   background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px;

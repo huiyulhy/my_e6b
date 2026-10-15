@@ -23,6 +23,7 @@ from engine.navlog import Navlog, Waypoint
 
 __all__ = [
     "ImportedWaypoint",
+    "decode_xml",
     "KmlError",
     "KmlFile",
     "kml_filename",
@@ -90,9 +91,7 @@ class KmlFile:
 # --- export ----------------------------------------------------------------
 
 
-def route_kml(
-    navlog: Navlog, *, mission: str | None = None, snapshot: str | None = None
-) -> str:
+def route_kml(navlog: Navlog, *, mission: str | None = None, snapshot: str | None = None) -> str:
     """The resolved route as a KML document: a placemark per waypoint at its
     planned altitude, and the route as a line through them.
 
@@ -145,7 +144,9 @@ def _document(
 
     coordinates = []
     for waypoint, altitude_ft in zip(points, altitudes, strict=True):
-        coordinate = f"{waypoint.position.lon:.6f},{waypoint.position.lat:.6f},{altitude_ft * M_PER_FT:.1f}"
+        coordinate = (
+            f"{waypoint.position.lon:.6f},{waypoint.position.lat:.6f},{altitude_ft * M_PER_FT:.1f}"
+        )
         coordinates.append(coordinate)
         placemark = _child(document, "Placemark")
         _child(placemark, "name", waypoint.name)
@@ -210,7 +211,9 @@ def _planned_altitudes(navlog: Navlog) -> list[float]:
     # A point no leg described -- a single-point route, or a row that never
     # left the ground -- is placed at its constraint, failing that its ground.
     return [
-        alt if alt is not None else (w.altitude_ft if w.altitude_ft is not None else (w.elevation_ft or 0.0))
+        alt
+        if alt is not None
+        else (w.altitude_ft if w.altitude_ft is not None else (w.elevation_ft or 0.0))
         for alt, w in zip(altitudes, points, strict=True)
     ]
 
@@ -294,18 +297,45 @@ def read_kml(data: bytes) -> KmlFile:
 
 
 def _parse(data: bytes) -> ET.Element:
-    text = _unwrap(data)
-    if len(text) > MAX_BYTES:
-        raise KmlError(f"file is larger than {MAX_BYTES // (1024 * 1024)} MB")
+    text = decode_xml(_unwrap(data), KmlError)
     # Refused rather than parsed with entities disabled: expat's entity
     # handling cannot be turned off from ElementTree, and nothing that writes
     # KML writes a DOCTYPE.
-    if re.search(rb"<!\s*DOCTYPE", text, re.IGNORECASE):
+    if re.search(r"<!\s*DOCTYPE", text, re.IGNORECASE):
         raise KmlError("file declares a document type, which KML never does")
     try:
         return ET.fromstring(text)
     except ET.ParseError as exc:
         raise KmlError(f"not well-formed XML: {exc}") from None
+
+
+_XML_DECLARATION = re.compile(r"^\s*<\?xml\b[^>]*\?>")
+_DECLARED_ENCODING = re.compile(r'encoding\s*=\s*["\']([A-Za-z0-9._-]+)["\']')
+
+
+def decode_xml(data: bytes, error: type[ValueError]) -> str:
+    """The file as text, with its XML declaration removed.
+
+    A byte-order mark decides the encoding when there is one; the
+    declaration's `encoding` otherwise; UTF-8 failing both. The declaration
+    is then dropped, because expat reads it again from the text and refuses
+    a file whose bytes were not what it claims -- which is exactly what
+    ForeFlight writes: UTF-16 with a mark, declared as UTF-8.
+    """
+    if len(data) > MAX_BYTES:
+        raise error(f"file is larger than {MAX_BYTES // (1024 * 1024)} MB")
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        encoding = "utf-16"
+    elif data.startswith(b"\xef\xbb\xbf"):
+        encoding = "utf-8-sig"
+    else:
+        declared = _DECLARED_ENCODING.search(data[:200].decode("ascii", "ignore"))
+        encoding = declared.group(1) if declared else "utf-8"
+    try:
+        text = data.decode(encoding)
+    except (UnicodeDecodeError, LookupError):
+        raise error(f"file is not readable as {encoding} text") from None
+    return _XML_DECLARATION.sub("", text, count=1)
 
 
 def _document_data(root: ET.Element) -> dict[str, str]:
@@ -379,7 +409,9 @@ def _placemark_points(root: ET.Element) -> list[ImportedWaypoint | None]:
                 )
             )
         else:
-            found.append(ImportedWaypoint(name=name, lat=lat, lon=lon, altitude_ft=_altitude(alt_m)))
+            found.append(
+                ImportedWaypoint(name=name, lat=lat, lon=lon, altitude_ft=_altitude(alt_m))
+            )
     return found
 
 

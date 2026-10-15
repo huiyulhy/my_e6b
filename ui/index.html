@@ -33,6 +33,10 @@
         Add a departure and destination. Click the map to insert a waypoint,
         drag any marker to move it.
       </p>
+      <div id="route-tools" class="route-tools" hidden>
+        <button id="reverse-route" type="button" data-label="Reverse route"
+                title="Fly it home: destination first, departure last. Leg types and typed winds follow their leg, climbs becoming descents; TOC and TOD are placed again; events pinned on a leg are dropped.">Reverse route</button>
+      </div>
     </section>
 
     <section class="block">
@@ -407,8 +411,8 @@
           <h2>Export</h2>
           <p class="hint">
             Every waypoint of the plan, TOC and TOD included, at its planned
-            altitude, plus the route as a line. Opens in Google Earth, ForeFlight
-            or anything else that reads KML.
+            altitude, plus the route as a line. Opens in Google Earth or anything
+            else that reads KML.
           </p>
           <p class="hint">
             The file is also the mission: your fixes, each leg's events and
@@ -419,14 +423,34 @@
           <button id="download-kml" type="button" data-label="Download mission (KML)">Download mission (KML)</button>
         </section>
         <section class="block">
+          <h2>Flight plan for ForeFlight / Garmin</h2>
+          <p class="hint">
+            The route as a Garmin <code>.fpl</code> file, which ForeFlight,
+            Garmin Pilot and Garmin avionics import. Airports go in by
+            identifier. Every other point goes in as a user waypoint, named
+            from your label: upper case, letters and digits only, up to 12
+            characters. The full label goes in the waypoint's comment.
+          </p>
+          <p class="hint">
+            Only your own points go in. ForeFlight works out its own TOC and
+            TOD, and the format has no altitudes, so the KML above is still
+            the file that reloads the whole mission here. An <code>.fpl</code>
+            loads back as the route alone.
+          </p>
+          <button id="download-fpl" type="button" data-label="Download flight plan (FPL)">Download flight plan (FPL)</button>
+        </section>
+        <section class="block">
           <h2>Import</h2>
           <p class="hint">
-            A <code>.kml</code> or <code>.kmz</code> file. One exported from here
-            comes back exactly; a file drawn elsewhere brings its positions and
-            leaves each leg's climb, cruise or descent to be chosen in the route
-            list.
+            A <code>.kml</code> or <code>.kmz</code> file, or a Garmin
+            <code>.fpl</code> flight plan from ForeFlight, Garmin Pilot or
+            elsewhere. A KML exported from here comes back exactly. Anything
+            else brings its positions and leaves each leg's climb, cruise or
+            descent to be chosen in the route list. In a flight plan, airports
+            are found in the airport database and every other point is kept
+            at the position the file gives it.
           </p>
-          <input id="kml-file" type="file" accept=".kml,.kmz,application/vnd.google-earth.kml+xml,application/vnd.google-earth.kmz">
+          <input id="kml-file" type="file" accept=".kml,.kmz,.fpl,application/vnd.google-earth.kml+xml,application/vnd.google-earth.kmz">
           <p id="kml-error" class="alert" hidden></p>
           <ol id="kml-preview" class="kml-preview"></ol>
           <p id="kml-warnings" class="hint" hidden></p>

@@ -147,7 +147,19 @@ const api = {
     const named = /filename="([^"]+)"/.exec(disposition);
     return { blob: await r.blob(), filename: named ? named[1] : 'route.kml' };
   },
-  /** The waypoints in a KML/KMZ file. The bytes go up base64 in JSON, like
+  /** The route as a Garmin flight plan (.fpl), for ForeFlight and Garmin. */
+  async routeFpl(body) {
+    const r = await fetch('/api/route.fpl', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) return { error: (await r.json()).error || 'could not export' };
+    const disposition = r.headers.get('Content-Disposition') || '';
+    const named = /filename="([^"]+)"/.exec(disposition);
+    return { blob: await r.blob(), filename: named ? named[1] : 'route.fpl' };
+  },
+  /** The waypoints in a KML/KMZ or .fpl file. The bytes go up base64 in JSON, like
    *  every other request here; the server parses and resolves airports. */
   async importRoute(file) {
     const bytes = new Uint8Array(await file.arrayBuffer());
@@ -1542,6 +1554,7 @@ function renderWaypointList() {
     list.appendChild(li);
   });
   $('route-hint').hidden = route.length >= 2;
+  $('route-tools').hidden = route.length < 2;
 }
 
 /*  Reordering runs on pointer events rather than HTML5 drag-and-drop: Safari
@@ -3554,6 +3567,73 @@ $('download-kml').addEventListener('click', async () => {
     return;
   }
   saveBlob(blob, filename);
+});
+
+$('download-fpl').addEventListener('click', async () => {
+  const button = $('download-fpl');
+  if (route.length < 2) {
+    button.textContent = 'Nothing to export yet';
+    setTimeout(() => { button.textContent = button.dataset.label; }, 1600);
+    return;
+  }
+  const { blob, filename, error } = await api.routeFpl(planBody());
+  if (error) {
+    button.textContent = 'Export failed';
+    setTimeout(() => { button.textContent = button.dataset.label; }, 1600);
+    return;
+  }
+  saveBlob(blob, filename);
+});
+
+/** The mission flown the other way: destination first, departure last.
+ *
+ *  Only the pilot's points are kept; TOC and TOD are the planner's and it
+ *  puts them back where the reversed profile needs them. What was said about
+ *  a leg goes to the same leg flown backwards: its type moves to the point
+ *  that now ends it, with climb and descent swapped, and its typed winds and
+ *  air are re-keyed to the reversed leg -- the same air either way. Pinned
+ *  events are dropped: "start the climb here" has no meaning flown in the
+ *  direction that descends. */
+const REVERSED_PHASE = { climb: 'descent', descent: 'climb' };
+
+function reverseRoute() {
+  setEventPick(null);
+  const pilot = route.filter((w) => !w.generated);
+  if (pilot.length < 2) return 0;
+  const dropped = pilot.reduce((n, w) => n + (w.events?.length || 0), 0);
+  // Leg i in flying order arrives at pilot[i + 1] and carries its type. In
+  // the reversed route it arrives at pilot[i], so the types shift one point
+  // back; the old departure ends a leg now and the old destination starts one.
+  const types = pilot.map((w) => w.segment_type || 'automatic');
+  const reversed = pilot.map((w, i) => ({
+    ...w,
+    events: [],
+    segment_type: i + 1 < pilot.length
+      ? (REVERSED_PHASE[types[i + 1]] || types[i + 1]) : 'automatic',
+  })).reverse();
+  const edits = new Map();
+  for (const [key, fields] of segmentEdits) {
+    const [leg, phase] = key.split('|');
+    const [from, to] = leg.split('>');
+    edits.set(editKey(`${to}>${from}`, REVERSED_PHASE[phase] || phase), fields);
+  }
+  segmentEdits = edits;
+  route = reversed;
+  onRouteChanged();
+  fitRoute();
+  return dropped;
+}
+
+$('reverse-route').addEventListener('click', () => {
+  const button = $('reverse-route');
+  if (route.filter((w) => !w.generated).length < 2) {
+    flashButton(button, 'Nothing to reverse yet');
+    return;
+  }
+  const dropped = reverseRoute();
+  flashButton(button, dropped
+    ? `Reversed; ${dropped} leg event${dropped === 1 ? '' : 's'} dropped`
+    : 'Reversed');
 });
 
 /** What the last chosen file parsed to, waiting for "Load into route". Kept
