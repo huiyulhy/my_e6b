@@ -171,6 +171,28 @@ _token_lock = threading.Lock()
 _token: tuple[str, float] | None = None  # (bearer, expires_at epoch seconds)
 
 
+def _token_error(exc: urllib.error.HTTPError) -> str:
+    """The OAuth2 error from a token rejection, as `: reason`, or empty.
+
+    Read before anything else touches the response, because an HTTPError's
+    body can only be read once and is gone if it is not taken here.
+    """
+    try:
+        body = exc.read().decode("utf-8", "replace").strip()
+    except Exception:  # noqa: BLE001 -- diagnostics must never mask the real error
+        return ""
+    if not body:
+        return ""
+    try:
+        answer = json.loads(body)
+    except ValueError:
+        return f": {body[:200]}"
+    code = answer.get("error")
+    description = answer.get("error_description")
+    detail = " - ".join(part for part in (code, description) if part)
+    return f": {detail}" if detail else ""
+
+
 def _bearer(*, refresh: bool = False) -> str:
     """The current access token, fetched or renewed as needed."""
     global _token
@@ -204,14 +226,21 @@ def _bearer(*, refresh: bool = False) -> str:
             with urllib.request.urlopen(request, timeout=TIMEOUT_S) as response:
                 answer = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
+            # The token service says *why* in the body, as OAuth2 requires:
+            # `invalid_client` is a wrong id or secret, `unauthorized_client`
+            # a client that exists but may not use this grant. Without it
+            # every rejection reads the same and there is nothing to act on.
+            reason = _token_error(exc)
             if exc.code in (400, 401, 403):
                 raise FlightsUnavailable(
-                    f"OpenSky rejected the API client ({exc.code}); check "
+                    f"OpenSky rejected the API client ({exc.code}{reason}); check "
                     f"{CLIENT_ID_ENV} and {CLIENT_SECRET_ENV} against the client "
                     f"created on your OpenSky account page",
                     needs_credentials=True,
                 ) from exc
-            raise FlightsUnavailable(f"OpenSky token service answered {exc.code}") from exc
+            raise FlightsUnavailable(
+                f"OpenSky token service answered {exc.code}{reason}"
+            ) from exc
         except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
             raise FlightsUnavailable(f"could not reach OpenSky's token service: {exc}") from exc
         token = answer.get("access_token") if isinstance(answer, dict) else None
