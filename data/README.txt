@@ -1,13 +1,13 @@
-AIS subscriber files effective date October 01, 2026.
+AIS subscriber files effective date October 29, 2026.
 
 Dear Subscribers,
 
-For the October 01, 2026 subscriber files, the files incorporate data 
+For the October 29, 2026 subscriber files, the files incorporate data 
 published in the daily National Flight Data Digest (NFDD) through
  
-    NFDD 167 dated 08/31/2026.  
+    NFDD 186 dated 09/28/2026.  
 
-The October 01, 2026 cycle is a 28 Day Change Notice Cycle subscriber set. 
+The October 29, 2026 cycle is a 56 Day Major Cycle subscriber set. 
 
 By FAA policy and order, some NASR resources, generally categorized as 
 "Enroute", are only updated on a 56 day charting basis. The following legacy 
@@ -134,13 +134,15 @@ ATS NON-REGULATORY AIRWAYS (ATS.txt) ADDITION OF AK CAPSTONE ROUTES
     EnRoute Operations.
 
 SUNSETTING OF LEGACY .TXT SUBSCRIBER FILES
-
+    
     FAA is in the process of sunsetting the legacy .txt NASR subscriber files. 
-    The timeframe for sunsetting .txt subscriber files is targeted for the 
-    24 Dec 2026 AIRAC cycle. The .txt format NASR subscriber files will be 
-    replaced with a set of .csv format subscriber files, which are currently 
-    available. A Legacy TXT to CSV Mapping Document is available for download 
-    via the main 28-Day Subscription page to ease transition.
+    The .txt format NASR subscriber files will be replaced with a set of .csv 
+    format subscriber files, which are currently available. Legacy TXT NASR 
+    Subscriber Files will be generated and made available through the end of 
+    the 2026 calendar year. TXT NASR Subscriber files will no longer be 
+    available beginning January 21, 2027 ahead of the February 18, 2027 
+    effective cycle. A Legacy TXT to CSV Mapping Document is available for 
+    download via the main 28-Day Subscription page to ease transition.
 
     NOTE: An enhancement to the NASR database was released effective for the 
     03 September 2026 AIRAC cycle. After this NASR release, .txt subscriber 
@@ -301,6 +303,16 @@ LOCATION IDENTIFIER (LID.txt) CANADIAN DATA
 
     Refer to current Canadian charts and flight information publications for 
     information within Canadian airspace.
+
+LOCATION IDENTIFIER (LID.txt) SUPPLEMENTAL STATE CODES
+
+    NOTE: JO 7350.9 (Location Identifiers) outlines two-letter, two-number 
+    identifiers that are assigned to private-use landing facilities in the 
+    United States and its jurisdictions which do not meet the requirements for 
+    three-character assignments. LOCID order JO 7350.9 is scheduled to 
+    incorporate new supplemental state codes tentatively effective for the 
+    24 DEC 2026 AIRAC cycle. NASR is scheduled to incorporate these new 
+    supplemental state codes tentatively for the 24 DEC 2026 AIRAC cycle.
                       
 ILS (ILS.txt) PUBLISHED DISTANCES SCRUB
 

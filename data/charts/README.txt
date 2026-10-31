@@ -15,32 +15,22 @@ and is where the chart's effective and expiry dates come from; without it
 the chart still draws, but the currency list cannot say when it lapses.
 VFR charts are reissued every 56 days.
 
-Tiles rendered from the charts land in two places, and the difference
-matters to git:
+Tiles rendered from the charts land in two places, neither of them
+committed:
 
-  data/charts/tiles/     what `make charts` built. Committed.
+  data/charts/tiles/     what `make charts` built, from the sources here
   .cache/chart-tiles/    what the dev server rendered as you panned past
-                         the committed zoom cap. Ignored, delete any time.
+                         the committed zoom cap
 
-Only `make charts` writes the first one. Panning the map at a high zoom
-renders thousands of tiles, and if those landed beside the build output
-git could not tell them apart.
+Both are ignored. The GeoTIFFs above are the data; tiles are derived from
+them in about a minute and would otherwise store the same charts twice.
+Only `make charts` writes the first directory, so the two never mix.
 
-Unlike the charts, the tiles ARE committed. A deployed instance has no
-GeoTIFFs on it and not enough memory to decode one, so committed tiles are
-the only form in which a chart reaches a browser there. After adding or
-updating a chart:
+    make charts                 # native zoom
+    make charts MAXZOOM=11      # smaller and faster, soft past z11
 
-    make charts                     # or: make charts MAXZOOM=11
-    git add data/charts/tiles
+MapLibre overzooms past the top level rather than showing nothing, so a
+capped chart goes soft rather than blank.
 
-Each zoom level has four times the tiles of the one below, so the top one
-or two are most of the bytes. What is committed is the sectional to z10 and
-the terminal area charts to z12 -- 33 MB for the Bay Area set, against
-93 MB for the full pyramid. MAXZOOM sets the cap, and MapLibre overzooms
-past the top level rather than showing nothing, so a capped chart goes soft
-rather than blank.
-
-To trade storage back for sharpness:
-
-    make charts MAXZOOM=11      # or leave MAXZOOM off for native zoom
+Because the tiles are not committed, anything serving this app from a fresh
+checkout has to build them. See docs/ARCHITECTURE.md section 4e.

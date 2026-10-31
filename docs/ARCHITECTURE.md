@@ -889,21 +889,25 @@ in a tab and take tens of seconds. Pre-rendered PNG tiles load lazily and are wh
 bundle will ship. Pillow joins the runtime dependencies for this — it is in Pyodide, so the
 rule from §1 holds, and on a deployed server it is never imported at all.
 
-### The deployed case — what is committed and why
+### What is committed, and what a deployed instance needs
 
-`data/charts/` holds the FAA downloads, which are **not** committed: 30–80 MB each, reissued
-every 56 days, and useless to a server that cannot afford to decode one. `data/charts/tiles/`
-holds the pyramid built from them, which **is** committed, on the same reasoning as
-`data/aero/airports.sqlite` — it is the build output the app ships with, and the only form in
-which a chart reaches a browser anywhere but this desktop.
+`data/charts/` holds the FAA downloads and **they are committed**: 30–80 MB each, reissued
+every 56 days, and the thing every tile is derived from. `data/charts/tiles/` holds the
+pyramid built from them and is **not** committed — it is build output, rebuilt in about a
+minute, and storing it would hold the same charts twice over.
 
-That makes the two run modes genuinely different, and `charts.available()` is where the fork
-lives:
+That makes the source the single copy, which is the right call for data, and it puts a
+requirement on anything serving the app from a fresh checkout: **it has to build the tiles
+before it can draw a chart.** The runtime cannot do it lazily. Decoding one sectional peaks
+at 410 MB of arrays, well past a small instance, so a deploy that renders on demand will be
+killed the first time someone pans.
 
-| | Desktop | Deployed |
+`charts.available()` is where the two cases fork:
+
+| | Charts present | Tiles only |
 |---|---|---|
 | Charts listed from | GeoTIFF headers | `tiles/manifest.json` |
-| Tiles come from | `/api/charts/tiles/…`, rendered on demand | `/data/charts/tiles/…`, static files |
+| Tiles come from | `/api/charts/tiles/…` | `/data/charts/tiles/…`, static files |
 | Peak memory | 410 MB for a sectional | nothing decoded, ever |
 
 The manifest carries what the headers would have said — footprint, zoom range, edition dates —
@@ -911,35 +915,24 @@ so the layer menu and the currency list read identically either way. Its zoom ra
 back off the tile directories rather than taken from the chart, because `make charts MAXZOOM=`
 caps the pyramid and a source advertising a level with no tiles behind it shows as holes.
 
-**Tiles are palette PNGs**, which is a third the size of RGBA and matters when every byte is
-committed and cloned on each deploy. A tile cut at the chart's own scale holds only palette
-colours, so its palette is exact and nothing is lost; a tile off a pyramid level holds blended
-colours and is quantised to 255, which is the one lossy step in the pipeline and sits on an
-image that is already a reduction. The palette is written no longer than the tile needs, since
-most tiles hold a handful of colours and a padded 256-entry table would be 768 bytes on each.
+**Tiles are palette PNGs**, a third the size of RGBA. A tile cut at the chart's own scale holds
+only palette colours, so its palette is exact and nothing is lost; a tile off a pyramid level
+holds blended colours and is quantised to 255, which is the one lossy step in the pipeline and
+sits on an image that is already a reduction. The palette is written no longer than the tile
+needs, since most tiles hold a handful of colours and a padded 256-entry table would be 768
+bytes on each.
 
-Zoom is where the size is, and it is the dial to turn when the committed tree gets too big.
-Each level has four times the tiles of the one below, so the top one or two are most of the
-bytes — for the Bay Area set, the full pyramid is 93 MB and two levels off the top is 33 MB.
-MapLibre overzooms past whatever the manifest advertises, so a capped chart goes soft rather
-than blank, and `make charts MAXZOOM=` is what sets the cap.
+**The committed sources and the two tile directories are kept apart** for a git reason rather
+than an aesthetic one. `make charts` writes `data/charts/tiles/`; the dev server writes
+`.cache/chart-tiles/`. Both are ignored, and before they were separated, panning at a zoom past
+the built cap left 5,700 stray tiles, 75 MB, indistinguishable from deliberate output.
+`TileStore` reads the built root first and writes only to the other, so a tile `make charts`
+produced is never re-rendered or rewritten.
 
-**The committed tiles and the on-demand ones are different directories**, which is a git
-constraint rather than an aesthetic one. `make charts` writes `data/charts/tiles/` and that
-is committed. The dev server writes `.cache/chart-tiles/` and that is ignored, because
-panning at a zoom past the committed cap renders thousands of tiles — 5,700 of them, 75 MB,
-the first time this was not separated — and beside the build output git cannot tell which
-were deliberate. `TileStore` reads the committed root first and writes only to the other, so
-a tile `make charts` built is never re-rendered or rewritten.
-
-What is committed now is the sectional to z10 and the terminal area charts to z12. The
-sectional is crisp at the zoom a route is actually planned at and blocky if you push past it;
-the terminal charts are within a level of native over the ground where you would.
-
-| Committed | Tiles | Size |
-|---|---|---|
-| Sectional z5–10, TAC and Flyway z5–12 | 2,381 | 33 MB |
-| Sectional z5–11, TAC and Flyway z5–13 | 8,968 | 93 MB |
+Zoom is the dial for size. Each level has four times the tiles of the one below, so the top one
+or two are most of the bytes — for the Bay Area set, the full pyramid is 93 MB and two levels
+off the top is 33 MB. MapLibre overzooms past whatever the manifest advertises, so a capped
+chart goes soft rather than blank.
 
 ## 5. Verification strategy
 

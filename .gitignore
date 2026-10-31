@@ -20,22 +20,16 @@ wheels/
 .cache/
 data/nasr/
 
-# FAA raster charts are downloaded by hand into data/charts/<sectional|tac>/
-# (see data/charts/README.txt). At 30-80 MB each the source GeoTIFFs stay
-# out of the repo, so everything one level under data/charts/ is ignored --
-# each of those folders is one FAA download.
-data/charts/*/
-!data/charts/README.txt
-
-# Except the rendered tiles, which *are* committed, for the same reason
-# data/aero/airports.sqlite is: they are the build output the app actually
-# ships with. A deployed instance has no GeoTIFFs and not enough memory to
-# decode one, so pre-rendered tiles are the only form in which a chart
-# reaches the browser there. Rebuild with `make charts`.
+# FAA raster charts. The source GeoTIFFs under data/charts/<sectional|tac>/
+# are committed: they are the data, reissued every 56 days, and what every
+# tile is derived from. Download them by hand (data/charts/README.txt).
 #
-# Only `make charts` writes here. Tiles the dev server renders as you pan --
-# thousands of them, at zooms past the committed cap -- go to
-# .cache/chart-tiles/ instead, ignored by the .cache/ rule above. Were both
-# kinds in this folder git could not tell them apart, and `git add` of it
-# would commit whatever the last browsing session happened to look at.
-!data/charts/tiles/
+# The tiles are not. They are build output, rebuilt from the sources by
+# `make charts` in about a minute, and committing them would store the same
+# charts twice -- once as the GeoTIFF and once as a few thousand PNGs of it.
+data/charts/tiles/
+
+# Tiles the dev server renders as you pan go here instead of beside the
+# build output, so the two never mix. Already covered by .cache/ above;
+# named explicitly because it is easy to miss where they land.
+.cache/chart-tiles/
