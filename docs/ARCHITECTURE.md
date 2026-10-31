@@ -56,6 +56,7 @@ my_e6b/
     aloft.py         [built]  pressure-level winds and temperatures aloft (pure)
     planwx.py        [built]  the weather list beside the navlog, settled against it
     notam.py         [built]  NOTAM decoding + the 4D relevance filter (pure)
+    tracks.py        [built]  OpenSky flights and tracks decoded, sifted for VFR (pure)
   data/
     poh/c172s/       [built]  five CSVs + SOURCE.md provenance
     magnetic/        [built]  WMM2025.COF + NOAA's 100-point test set
@@ -72,8 +73,9 @@ my_e6b/
   ui/                [built]  static HTML/JS + MapLibre — same files dev and prod
   server/            [built]  FastAPI dev shim, never shipped
     main.py          [built]  the HTTP surface
-    wx_surface.py    [built]  the only network fetch: AWC METAR/TAF + model,
-                              surface and pressure-level (see 4d)
+    wx_surface.py    [built]  AWC METAR/TAF + model, surface and pressure-level (see 4d)
+    notams.py        [built]  SkyLink NOTAM fetch (see 4e)
+    opensky.py       [built]  OpenSky flights and tracks for a city pair (see 4f)
   tests/             [built]  750 tests
   Makefile           [built]  every recipe clears PYTHONPATH (see §7)
 ```
@@ -854,6 +856,55 @@ rather than showing an empty panel.
 
 ---
 
+### 4f. Route aggregation — `engine/tracks.py` + `server/opensky.py` — [built]
+
+What other pilots actually flew between the two fields, drawn under the route being planned:
+the last ten days of flights from the departure that ended at the arrival, up to ten of them,
+each as a ground track on the map and an altitude trace on one shared plot in the **Route
+aggregation** tab. The point is to plan against what the traffic does — where it crosses the
+ridge, how high it sits under the shelf — rather than from a blank chart.
+
+**The source is OpenSky, and it is asked in two stages.** The flights-by-departure endpoint
+returns everything that left a field in a window of at most two days, with the field each one
+*ended* near, so ten days is five windows fetched concurrently and the pair is found by
+filtering on the arrival. Then one tracks call per chosen flight, newest first. OpenSky fills
+its flights tables by a nightly batch, so yesterday is the newest day there is; the window still
+runs to now because asking costs nothing and today's records appear the moment they exist.
+Authentication is OAuth2 client credentials — `OPENSKY_CLIENT_ID` / `OPENSKY_CLIENT_SECRET`
+exchanged for a bearer token that lasts half an hour and is renewed in memory. Unconfigured,
+the tab says exactly that, on the same reasoning as NOTAMs: "no flights" and "no flight
+service" look identical and mean opposite things.
+
+**"VFR" is a guess, and the two proxies are stated rather than hidden.** ADS-B carries no
+flight rules. `engine/tracks.py` keeps a flight when its callsign is a US tail number rather
+than an airline designator (`N12345`, not `UAL123`) and its track never reached Class A — set a
+little under 18,000 ft because the barometric altitude ADS-B reports is referenced to 29.92 and
+quantised. A tail number may still have been IFR; that is the half this cannot see, and the tab
+says so. Both tests keep rather than drop when the evidence is missing: a blank callsign is the
+common case on a light aircraft, and a track with no altitude says nothing either way.
+
+**Every count on the way from "what flew the pair" to "what is drawn" is returned,** so the
+filter can be seen working — matched, candidates after the callsign test, tracks fetched, how
+many reached Class A, how many were too thin to draw, and how many older candidates the request
+cap kept from being examined. A window OpenSky would not answer is named rather than quietly
+shortening the history. The cap (`MAX_TRACK_FETCHES`) exists because each track is a request
+against a daily credit allowance that is small on the free tier, and a pair whose traffic is all
+airline should not spend the day's credits failing the Class A test one flight at a time.
+
+**Distance along the track is summed fix to fix,** not measured from the departure, so a flight
+that wandered — a practice area, a sightseeing loop — shows its true length on the profile rather
+than folding back on itself. The altitude plot is hand-drawn SVG (no chart library is in the
+bundle): one y axis in feet, x switchable between distance flown and time since first fix, a
+crosshair that reads every visible flight at the pointer. Hovering a flight on the legend, the
+map or the plot lifts it on all three; the first eight carry their own hue in a fixed,
+colour-vision-checked order and any past that share a neutral and are picked out by hover,
+since ten hues cannot be told apart.
+
+Responses are cached under `.cache/opensky/`: a finished day's flights for a day, a track — which
+never changes once recorded — for a week.
+
+---
+
 ## 4e. Raster charts — `engine/tiff_reader.py`, `engine/charts.py`, `engine/chart_render.py` — [built]
 
 The sectional and terminal area charts, drawn under the route. The FAA publishes each
@@ -889,31 +940,38 @@ in a tab and take tens of seconds. Pre-rendered PNG tiles load lazily and are wh
 bundle will ship. Pillow joins the runtime dependencies for this — it is in Pyodide, so the
 rule from §1 holds, and on a deployed server it is never imported at all.
 
-### What is committed, and what a deployed instance needs
+### The deployed case — what is committed and why
 
-`data/charts/` holds the FAA downloads and **they are committed**: 30–80 MB each, reissued
-every 56 days, and the thing every tile is derived from. `data/charts/tiles/` holds the
-pyramid built from them and is **not** committed — it is build output, rebuilt in about a
-minute, and storing it would hold the same charts twice over.
+`data/charts/` holds the FAA downloads, which are **not** committed: 30–80 MB each, reissued
+every 56 days, and useless to a server that cannot afford to decode one. `data/charts/tiles/`
+holds the pyramid built from them, which **is** committed, on the same reasoning as
+`data/aero/airports.sqlite` — it is the build output the app ships with, and the only form in
+which a chart reaches a browser anywhere but this desktop.
 
-That makes the source the single copy, which is the right call for data, and it puts a
-requirement on anything serving the app from a fresh checkout: **it has to build the tiles
-before it can draw a chart.** The runtime cannot do it lazily. Decoding one sectional peaks
-at 410 MB of arrays, well past a small instance, so a deploy that renders on demand will be
-killed the first time someone pans.
+Committing derived data is the wrong default, and this is the case that earns the exception.
+The alternative is a deploy that renders its own tiles, and it cannot: one sectional peaks at
+410 MB of arrays, past a small instance, and the full pyramid is several minutes of CPU on
+every deploy. Committed tiles buy the deploy out of that entirely — clone, install, serve.
 
-`charts.available()` is where the two cases fork:
+`charts.available()` is where the two run modes fork:
 
-| | Charts present | Tiles only |
+| | Desktop | Deployed |
 |---|---|---|
 | Charts listed from | GeoTIFF headers | `tiles/manifest.json` |
-| Tiles come from | `/api/charts/tiles/…` | `/data/charts/tiles/…`, static files |
+| Tiles come from | `/api/charts/tiles/…`, rendered on demand | `/data/charts/tiles/…`, static files |
 | Peak memory | 410 MB for a sectional | nothing decoded, ever |
 
 The manifest carries what the headers would have said — footprint, zoom range, edition dates —
 so the layer menu and the currency list read identically either way. Its zoom range is read
 back off the tile directories rather than taken from the chart, because `make charts MAXZOOM=`
 caps the pyramid and a source advertising a level with no tiles behind it shows as holes.
+
+**A new edition is detected rather than assumed.** The FAA reissues each chart under the same
+filename every 56 days, so the new edition produces identical tile paths, and `make charts`
+keeps whatever tiles it finds. The manifest therefore records each chart's edition date and
+source file size, and a mismatch forces that chart to be re-rendered. Without it the previous
+edition's pixels would sit under the new edition's dates, which on a chart is exactly the
+wrong way round to be wrong.
 
 **Tiles are palette PNGs**, a third the size of RGBA. A tile cut at the chart's own scale holds
 only palette colours, so its palette is exact and nothing is lost; a tile off a pyramid level
@@ -922,17 +980,19 @@ sits on an image that is already a reduction. The palette is written no longer t
 needs, since most tiles hold a handful of colours and a padded 256-entry table would be 768
 bytes on each.
 
-**The committed sources and the two tile directories are kept apart** for a git reason rather
-than an aesthetic one. `make charts` writes `data/charts/tiles/`; the dev server writes
-`.cache/chart-tiles/`. Both are ignored, and before they were separated, panning at a zoom past
-the built cap left 5,700 stray tiles, 75 MB, indistinguishable from deliberate output.
-`TileStore` reads the built root first and writes only to the other, so a tile `make charts`
-produced is never re-rendered or rewritten.
+**The committed tiles and the on-demand ones are different directories**, which is a git
+constraint rather than an aesthetic one. `make charts` writes `data/charts/tiles/` and that is
+committed. The dev server writes `.cache/chart-tiles/` and that is ignored, because panning at
+a zoom past the committed cap renders thousands of tiles — 5,700 of them, 75 MB, the first time
+this was not separated — and beside the build output git cannot tell which were deliberate.
+`TileStore` reads the committed root first and writes only to the other, so a tile `make
+charts` built is never re-rendered or rewritten. Two builds at once are refused by a lock, for
+the same reason: the second deletes a directory the first is still writing into.
 
 Zoom is the dial for size. Each level has four times the tiles of the one below, so the top one
-or two are most of the bytes — for the Bay Area set, the full pyramid is 93 MB and two levels
-off the top is 33 MB. MapLibre overzooms past whatever the manifest advertises, so a capped
-chart goes soft rather than blank.
+or two are most of the bytes. The sectionals are committed to z10 and the terminal area charts
+to z12. MapLibre overzooms past whatever the manifest advertises, so a capped chart goes soft
+rather than blank.
 
 ## 5. Verification strategy
 

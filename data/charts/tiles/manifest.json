@@ -1,0 +1,126 @@
+{
+  "version": 1,
+  "generated": "2026-10-31",
+  "charts": [
+    {
+      "kind": "sectional",
+      "slug": "los_angeles_sec",
+      "name": "Los Angeles SEC",
+      "width": 16645,
+      "height": 12349,
+      "pixel_m": 42.33503123790898,
+      "bounds": [
+        -122.395265991208,
+        31.89657777740372,
+        -114.50871309067665,
+        36.672345654386966
+      ],
+      "min_zoom": 5,
+      "max_zoom": 10,
+      "effective": "2026-10-29",
+      "expires": "2026-12-23",
+      "note": null,
+      "source_bytes": 75282427
+    },
+    {
+      "kind": "sectional",
+      "slug": "san_francisco_sec",
+      "name": "San Francisco SEC",
+      "width": 16658,
+      "height": 12340,
+      "pixel_m": 42.33660067792304,
+      "bounds": [
+        -125.94649911976954,
+        35.857057251937604,
+        -117.63328140547777,
+        40.63945206180063
+      ],
+      "min_zoom": 5,
+      "max_zoom": 10,
+      "effective": "2026-10-29",
+      "expires": "2026-12-23",
+      "note": null,
+      "source_bytes": 79736973
+    },
+    {
+      "kind": "tac",
+      "slug": "los_angeles_fly",
+      "name": "Los Angeles FLY",
+      "width": 16501,
+      "height": 6040,
+      "pixel_m": 21.167955306861266,
+      "bounds": [
+        -119.52263165425245,
+        33.36792351726622,
+        -115.70872143673762,
+        34.54588611313607
+      ],
+      "min_zoom": 5,
+      "max_zoom": 12,
+      "effective": "2026-10-29",
+      "expires": "2026-12-23",
+      "note": null,
+      "source_bytes": 11061938
+    },
+    {
+      "kind": "tac",
+      "slug": "los_angeles_tac",
+      "name": "Los Angeles TAC",
+      "width": 16501,
+      "height": 6040,
+      "pixel_m": 21.167955306861273,
+      "bounds": [
+        -120.23045234234972,
+        33.3660088859913,
+        -116.41668200903753,
+        34.54273551900136
+      ],
+      "min_zoom": 5,
+      "max_zoom": 12,
+      "effective": "2026-10-29",
+      "expires": "2026-12-23",
+      "note": null,
+      "source_bytes": 28462708
+    },
+    {
+      "kind": "tac",
+      "slug": "san_francisco_fly",
+      "name": "San Francisco FLY",
+      "width": 10823,
+      "height": 7098,
+      "pixel_m": 21.164659679388453,
+      "bounds": [
+        -123.94764494332966,
+        36.951833096280396,
+        -121.31415799388562,
+        38.32459909971787
+      ],
+      "min_zoom": 5,
+      "max_zoom": 12,
+      "effective": "2026-10-29",
+      "expires": "2026-12-23",
+      "note": null,
+      "source_bytes": 10119975
+    },
+    {
+      "kind": "tac",
+      "slug": "san_francisco_tac",
+      "name": "San Francisco TAC",
+      "width": 10493,
+      "height": 7265,
+      "pixel_m": 21.16900811235895,
+      "bounds": [
+        -123.91023240682081,
+        36.85655996012309,
+        -121.35877140572487,
+        38.26107912643405
+      ],
+      "min_zoom": 5,
+      "max_zoom": 12,
+      "effective": "2026-10-29",
+      "expires": "2026-12-23",
+      "note": null,
+      "source_bytes": 23677165
+    }
+  ]
+}
