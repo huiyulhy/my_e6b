@@ -47,7 +47,7 @@ from engine import weight_balance as wb
 from engine.geo import LatLon, inverse
 from engine.magnetic import AtGeographicPole, OutsideModelValidity
 from server import notams as notam_source
-from server import wx_surface
+from server import opensky, wx_surface
 
 # How long a forecast window one request may ask for. A light single's day is
 # a few hours, the model publishes 48, and a bound keeps a mistyped `hours=`
@@ -1725,6 +1725,90 @@ def status() -> dict:
         "airports": airport_count,
         "vfr_waypoints": waypoint_count,
         "data": data,
+    }
+
+
+# --- flown routes: what actually flew the city pair ---------------------------
+
+
+def _track_json(track) -> dict:
+    flight = track.flight
+    return {
+        "icao24": flight.icao24,
+        "callsign": flight.callsign or None,
+        "departed_at": flight.first_seen.isoformat(),
+        "arrived_at": flight.last_seen.isoformat(),
+        "duration_min": round(track.duration_min, 1),
+        "length_nm": round(track.length_nm, 1),
+        "max_altitude_ft": (
+            None if track.max_altitude_ft is None else round(track.max_altitude_ft)
+        ),
+        # Compact: one row per fix, in the order flown. Altitude is barometric
+        # (29.92), as ADS-B reports it, and null where the fix had none.
+        "points": [
+            [
+                round(p.elapsed_s),
+                round(p.distance_nm, 2),
+                round(p.position.lat, 5),
+                round(p.position.lon, 5),
+                None if p.altitude_ft is None else round(p.altitude_ft),
+            ]
+            for p in track.points
+        ],
+    }
+
+
+@app.get("/api/flights/route")
+def flights_on_route(
+    departure: str,
+    arrival: str,
+    days: int = opensky.DEFAULT_DAYS,
+    limit: int = opensky.DEFAULT_LIMIT,
+) -> dict:
+    """The most recent flights between two fields that look VFR, with tracks.
+
+    Asks OpenSky, so this is a deliberate act behind a button rather than part
+    of the plan: the daily credits -- 400 anonymously, 4,000 with an API client
+    -- run out in a few dozen calls. Both fields are looked up locally first, so a typo is answered here and
+    an identifier without an ICAO code (a small strip filed only under its
+    FAA code) is refused with a reason rather than searched for and missed.
+    """
+    fields = []
+    for ident in (departure, arrival):
+        airport = apt.find(ident)
+        if airport is None:
+            return {"ok": False, "error": f"{ident} is not in the airport database."}
+        if not airport.icao:
+            return {
+                "ok": False,
+                "error": f"{airport.ident} has no ICAO code, so OpenSky has no flights for it.",
+            }
+        fields.append(airport)
+    try:
+        found = opensky.fetch_route_flights(
+            fields[0].icao, fields[1].icao, days=days, limit=limit
+        )
+    except opensky.FlightsUnavailable as exc:
+        return {"ok": False, "error": str(exc), "needs_credentials": exc.needs_credentials}
+    return {
+        "ok": True,
+        "departure": found.departure,
+        "arrival": found.arrival,
+        "window": {"start": found.begin.isoformat(), "end": found.end.isoformat()},
+        # Every count on the way from "everything that flew the pair" to
+        # "what is drawn", so a reader can see the filter working.
+        "matched": found.matched,
+        "candidates": found.candidates,
+        "tracks_fetched": found.tracks_fetched,
+        "rejected_class_a": found.rejected_class_a,
+        "rejected_thin": found.rejected_thin,
+        "unexamined": found.unexamined,
+        "complete": found.complete,
+        "failed_windows": list(found.failed_windows),
+        # Asked without an API client: the same answer, on a tenth of the
+        # daily credits. Said so the UI can explain a 429 that comes later.
+        "anonymous": found.anonymous,
+        "flights": [_track_json(track) for track in found.tracks],
     }
 
 

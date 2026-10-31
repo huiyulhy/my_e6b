@@ -42,6 +42,23 @@ SkyLink is asked by airport identifier, so a briefing costs one request per aero
 near the route, capped at 40 — about 25 briefings a month in busy airspace. The route's own
 airports and the ARTCCs are always asked first, so the cap only ever drops outlying fields.
 
+**Route aggregation** — what other pilots actually flew between two fields — asks the OpenSky
+Network, which answers anonymously on 400 credits a day. An account is free and raises that to
+4,000: create an API client on the account page and set both halves before starting the server:
+
+```bash
+export OPENSKY_CLIENT_ID=...
+export OPENSKY_CLIENT_SECRET=...
+```
+
+Pick a departure and an arrival in the **Route aggregation** tab and **Pull flights** asks
+for the last ten days of departures, keeps the ones that ended at the arrival and look VFR
+(a tail-number callsign, and a track that never reached Class A), and draws the ten most
+recent on the map with their altitude profiles below. ADS-B carries no flight rules, so both
+proxies are stated on the tab rather than hidden behind the word "VFR". A search is a handful
+of requests against the daily allowance. OpenSky lists flights the day after they land, so the
+ten days end at the start of today and today itself is never asked for.
+
 What comes back is filtered to the flight rather than dumped: within 10 nm of track, at an
 altitude the aeroplane is actually at over that stretch, and in force while it is there. The
 panel says how many of how many survived, so you can see the filter working.
@@ -83,6 +100,9 @@ Built, with 1,132 tests:
   fields
 - [engine/notam.py](engine/notam.py) — NOTAMs filtered to the route's corridor, altitude
   and time
+- [engine/tracks.py](engine/tracks.py) — the flights that actually flew a city pair, decoded
+  from OpenSky's records and sifted for the ones that look VFR; drawn on the map and as an
+  altitude profile. Pure; [server/opensky.py](server/opensky.py) does the fetching
 - [engine/mission.py](engine/mission.py) + [engine/kml.py](engine/kml.py) — the plan saved
   as KML and loaded back, re-solved in the weather of the day
 - [engine/airports.py](engine/airports.py) — lookup over 15,762 US airports

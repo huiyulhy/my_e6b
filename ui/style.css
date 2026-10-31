@@ -251,6 +251,7 @@ input:disabled { opacity: .45; cursor: not-allowed; }
   display: flex; flex-direction: column; flex: 1; min-height: 0; min-width: 0;
 }
 #tab-route-file:not([hidden]) { overflow-y: auto; flex: 1; min-height: 0; }
+#tab-flown:not([hidden]) { overflow-y: auto; flex: 1; min-height: 0; }
 
 /* The verdict, small, on the Pre-dispatch tab itself: the checklist lives
    behind the tab now, and a NO GO must still be seen from the log. */
@@ -848,3 +849,73 @@ body.resizing-navlog #map { pointer-events: none; }
 /* An airport's crossing altitude sits beside its fixed position. */
 .coords.readonly label { display: inline-flex; align-items: center; gap: 4px; font-family: var(--font); }
 .coords.readonly input.alt { width: 72px; padding: 2px 4px; font-size: 11px; font-family: var(--mono); }
+
+/* --- route aggregation: what actually flew the city pair ------------------ */
+
+.flown { padding: 0 14px 14px; max-width: 1100px; }
+.flown .block:first-child { border-top: none; margin-top: 0; padding-top: 12px; }
+.flown .hint { margin: 8px 0 0; }
+.flown .alert { margin: 8px 0 0; }
+.flown-controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.flown-pick { width: 200px; }
+.flown-pick input[type="search"] { padding: 6px 8px; font-size: 13px; font-family: var(--mono); }
+.flown-arrow { color: var(--ink-dim); }
+.flown-summary strong { color: var(--ink); font-weight: 600; }
+.flown-summary .note { color: var(--edit); }
+
+/* The legend doubles as the flight list: colour key, callsign, when, how
+   long, how high. Hover a row to lift that flight on the map and the plot;
+   untick it to take it off both. Up to ten flights; the first eight carry
+   their own hue and any past that share a neutral, since more hues than that
+   cannot be told apart -- hover is how those two are picked out. */
+.flown-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 0 0 10px; }
+.flown-legend label {
+  display: flex; align-items: center; gap: 6px; font-size: 12px; cursor: pointer;
+  padding: 3px 6px; border-radius: 4px; border: 1px solid transparent;
+}
+.flown-legend label:hover, .flown-legend label.hot { background: var(--panel-2); border-color: var(--line); }
+.flown-legend label.off { opacity: .45; }
+.flown-legend input { margin: 0; }
+.flown-legend .key { width: 18px; height: 0; border-top: 3px solid; border-radius: 2px; flex: none; }
+.flown-legend .callsign { font-family: var(--mono); font-weight: 600; }
+.flown-legend .meta { color: var(--ink-dim); font-size: 11px; }
+
+.flown-plot-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.flown-plot-head h2 { margin: 0 0 6px; }
+.flown-plot-head label { font-size: 11px; color: var(--ink-dim); }
+.flown-plot-head select { font-size: 11px; padding: 2px 4px; background: var(--panel-2);
+  color: var(--ink); border: 1px solid var(--line); border-radius: 4px; }
+
+/* The chart is SVG drawn by hand -- there is no chart library in the bundle,
+   and a line chart with a crosshair does not need one. The surface is the
+   panel's second tone, the grid is the hairline, and text wears the text
+   colours rather than a series colour. */
+.flown-plot { position: relative; background: var(--panel-2); border: 1px solid var(--line);
+  border-radius: 6px; height: 240px; }
+.flown-plot svg { display: block; width: 100%; height: 100%; font-family: var(--font); }
+.flown-plot .grid { stroke: var(--line); stroke-width: 1; shape-rendering: crispEdges; }
+.flown-plot .axis { stroke: #3a4858; stroke-width: 1; shape-rendering: crispEdges; }
+.flown-plot .tick { fill: var(--ink-dim); font-size: 10px; font-variant-numeric: tabular-nums; }
+.flown-plot .axis-title { fill: var(--ink-dim); font-size: 10px; }
+.flown-plot .trace { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round;
+  opacity: .85; transition: opacity .12s, stroke-width .12s; }
+.flown-plot.has-hot .trace { opacity: .22; }
+.flown-plot.has-hot .trace.hot { opacity: 1; stroke-width: 3; }
+.flown-plot .trace.off { display: none; }
+.flown-plot .crosshair { stroke: var(--ink-dim); stroke-width: 1; shape-rendering: crispEdges;
+  pointer-events: none; }
+.flown-plot .hit { fill: transparent; cursor: crosshair; }
+.flown-tip {
+  position: absolute; top: 8px; pointer-events: none; z-index: 5;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+  padding: 6px 8px; font-size: 11px; line-height: 1.5; box-shadow: 0 6px 18px rgba(0,0,0,.45);
+  min-width: 150px;
+}
+.flown-tip .at { color: var(--ink-dim); margin-bottom: 2px; }
+.flown-tip .row { display: flex; align-items: center; gap: 6px; }
+.flown-tip .row .key { width: 12px; height: 0; border-top: 2px solid; flex: none; }
+.flown-tip .row .value { font-family: var(--mono); font-weight: 600; min-width: 48px; text-align: right; }
+.flown-tip .row .name { color: var(--ink-dim); }
+.flown-tip .row.hot .name { color: var(--ink); }
+.flown-empty { position: absolute; inset: 0; display: grid; place-items: center;
+  color: var(--ink-dim); font-size: 12px; }

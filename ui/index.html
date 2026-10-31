@@ -248,6 +248,8 @@
         <span id="tab-verdict" class="tab-verdict" hidden></span></button>
       <button type="button" role="tab" id="tab-btn-route-file" aria-selected="false"
               aria-controls="tab-route-file" data-tab="route-file">Route file</button>
+      <button type="button" role="tab" id="tab-btn-flown" aria-selected="false"
+              aria-controls="tab-flown" data-tab="flown">Route aggregation</button>
       <button type="button" id="navlog-size" class="navlog-size"
               title="Give the navigation log most of the screen">▲ Expand</button>
     </div>
@@ -459,6 +461,66 @@
             <label class="inline"><input type="radio" name="kml-mode" value="append"> Append to route</label>
             <button id="kml-load" type="button">Load into route</button>
           </div>
+        </section>
+      </div>
+    </div>
+
+    <!-- What actually flew the city pair. OpenSky's recent flights between two
+         fields, each drawn on the map above and as an altitude trace below,
+         so a route can be planned against what other pilots did rather than
+         from a blank chart. -->
+    <div id="tab-flown" role="tabpanel" aria-labelledby="tab-btn-flown" hidden>
+      <div class="flown">
+        <section class="block">
+          <div class="flown-controls">
+            <div class="search flown-pick">
+              <input id="flown-from" type="search" autocomplete="off" spellcheck="false"
+                     placeholder="Departure — KSQL" aria-label="Departure airport">
+              <div id="flown-from-results" class="results" hidden></div>
+            </div>
+            <span class="flown-arrow" aria-hidden="true">→</span>
+            <div class="search flown-pick">
+              <input id="flown-to" type="search" autocomplete="off" spellcheck="false"
+                     placeholder="Arrival — KMRY" aria-label="Arrival airport">
+              <div id="flown-to-results" class="results" hidden></div>
+            </div>
+            <button id="flown-use-route" type="button"
+                    title="Fill both fields from the first and last airports of the route">From route</button>
+            <button id="flown-pull" type="button" data-label="Pull flights"
+                    title="Ask OpenSky for the last ten whole days of flights from the departure that ended at the arrival (today is not listed until tonight), keep the ten most recent that look VFR, and draw each one's track on the map and its altitude below.">
+              Pull flights
+            </button>
+            <button id="flown-clear" type="button" hidden
+                    title="Take the tracks off the map">Clear</button>
+          </div>
+          <p id="flown-error" class="alert" hidden></p>
+          <p id="flown-summary" class="hint flown-summary" hidden></p>
+        </section>
+        <section class="block" id="flown-results" hidden>
+          <div id="flown-legend" class="flown-legend"></div>
+          <div class="flown-plot-head">
+            <h2>Altitude, barometric (29.92)</h2>
+            <label class="inline">against
+              <select id="flown-x">
+                <option value="distance" selected>distance flown</option>
+                <option value="time">time since first fix</option>
+              </select>
+            </label>
+          </div>
+          <div id="flown-plot" class="flown-plot"></div>
+        </section>
+        <section class="block">
+          <p class="hint">
+            The last ten days of flights from the departure that ended at the arrival,
+            from the OpenSky Network's ADS-B records, newest first and up to ten of
+            them. ADS-B does not say what rules a flight was under, so "VFR" is read off
+            two proxies and both are stated: the callsign is a tail number rather than an
+            airline designator, and the track never reached Class A. A flight under a
+            tail number may still have been IFR. Each flight is drawn on the map and as
+            an altitude trace below; hover either to pick one out. Works without an
+            OpenSky account on 400 credits a day; an API client on the server allows
+            ten times that.
+          </p>
         </section>
       </div>
     </div>

@@ -868,12 +868,13 @@ ridge, how high it sits under the shelf — rather than from a blank chart.
 returns everything that left a field in a window of at most two days, with the field each one
 *ended* near, so ten days is five windows fetched concurrently and the pair is found by
 filtering on the arrival. Then one tracks call per chosen flight, newest first. OpenSky fills
-its flights tables by a nightly batch, so yesterday is the newest day there is; the window still
-runs to now because asking costs nothing and today's records appear the moment they exist.
-Authentication is OAuth2 client credentials — `OPENSKY_CLIENT_ID` / `OPENSKY_CLIENT_SECRET`
-exchanged for a bearer token that lasts half an hour and is renewed in memory. Unconfigured,
-the tab says exactly that, on the same reasoning as NOTAMs: "no flights" and "no flight
-service" look identical and mean opposite things.
+its flights tables by a nightly batch, so yesterday is the newest day there is: the window ends
+at the start of today (UTC) and runs ten whole days back, since a window into today would spend
+credits on nothing. Credentials are optional — the endpoints answer anonymously on 400 credits
+a day per family, and an API client (`OPENSKY_CLIENT_ID` / `OPENSKY_CLIENT_SECRET`, OAuth2 client
+credentials exchanged for a half-hour bearer token renewed in memory) raises that to 4,000. The
+answer records whether it was asked anonymously, so a later 429 can be explained as the smaller
+allowance rather than as an outage.
 
 **"VFR" is a guess, and the two proxies are stated rather than hidden.** ADS-B carries no
 flight rules. `engine/tracks.py` keeps a flight when its callsign is a US tail number rather

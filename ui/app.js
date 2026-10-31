@@ -113,6 +113,16 @@ const api = {
     return answer || { ok: false, error: 'the NOTAM search did not answer' };
   },
 
+  /** Recent flights that flew a city pair, with their tracks. A refusal --
+   *  unknown field, no OpenSky client configured, credits used up -- comes
+   *  back as ok:false with the reason, the way the NOTAM search does. */
+  async routeFlights(departure, arrival) {
+    const p = new URLSearchParams({ departure, arrival });
+    const r = await fetch(`/api/flights/route?${p}`);
+    const body = await r.json().catch(() => null);
+    return body || { ok: false, error: 'the flight search did not answer' };
+  },
+
   async plan(body) {
     const r = await fetch('/api/plan', {
       method: 'POST',
@@ -619,6 +629,27 @@ function addRouteLayers() {
     },
   });
 
+  // Tracks other aeroplanes flew between the same two fields, under the
+  // route so the plan stays the line on top. Two layers from one source: the
+  // flight under the pointer is drawn again on top, at full weight, since
+  // MapLibre has no z-order within a layer.
+  map.addSource('flown', { type: 'geojson', data: emptyCollection() });
+  map.addLayer({
+    id: 'flown-line', type: 'line', source: 'flown',
+    layout: { 'line-cap': 'round', 'line-join': 'round' },
+    paint: {
+      'line-width': 2,
+      'line-color': ['get', 'colour'],
+      'line-opacity': ['case', ['boolean', ['get', 'dim'], false], 0.25, 0.8],
+    },
+  });
+  map.addLayer({
+    id: 'flown-line-hot', type: 'line', source: 'flown',
+    filter: ['==', ['get', 'id'], ''],
+    layout: { 'line-cap': 'round', 'line-join': 'round' },
+    paint: { 'line-width': 3.5, 'line-color': ['get', 'colour'], 'line-opacity': 1 },
+  });
+
   map.addSource('route', { type: 'geojson', data: emptyCollection() });
   map.addLayer({
     id: 'route-line', type: 'line', source: 'route',
@@ -667,6 +698,12 @@ function bindMapInteractions() {
   // altitude it starts.
   map.on('mousemove', 'airspace-fill', showAirspaceTooltip);
   map.on('mouseleave', 'airspace-fill', hideAirspaceTooltip);
+
+  map.on('mousemove', 'flown-line', (event) => {
+    const id = event.features?.[0]?.properties?.id;
+    if (id != null) setFlownHot(String(id), event.lngLat);
+  });
+  map.on('mouseleave', 'flown-line', () => setFlownHot(null));
 
   // Clicking empty map inserts a free waypoint into the nearest leg.
   map.on('click', (event) => {
@@ -3536,6 +3573,7 @@ function setTab(name) {
     button.setAttribute('aria-selected', String(selected));
     $(button.getAttribute('aria-controls')).hidden = !selected;
   }
+  if (name === 'flown') onFlownTabShown();
 }
 for (const button of document.querySelectorAll('.tabs [role="tab"]')) {
   button.addEventListener('click', () => setTab(button.dataset.tab));
@@ -4335,4 +4373,479 @@ function toggleNavlogExpanded() {
     const style = $('app').style.getPropertyValue('--navlog-h');
     if (style) setNavlogHeight(parseFloat(style), { save: false });
   });
+}
+
+
+// --- route aggregation: what actually flew the city pair -------------------
+//
+// OpenSky's recent flights between two fields, each drawn on the map and as
+// an altitude trace in the tab. The server does the asking and the VFR
+// filtering (engine/tracks.py says what "VFR" means there); this is only the
+// drawing, and one rule for the colours: eight hues in a fixed order, then a
+// neutral. Ten flights cannot carry ten hues anyone can tell apart, so past
+// eight a flight is grey and is picked out by hovering it instead -- on the
+// legend, on the map, or on the plot, and the other two follow.
+
+// The dark-surface categorical palette, in its validated order: blue,
+// orange, aqua, yellow, magenta, green, violet, red.
+const FLOWN_COLOURS = [
+  '#3987e5', '#d95926', '#199e70', '#c98500', '#d55181', '#008300', '#9085e9', '#e66767',
+];
+const FLOWN_OTHER = '#8b9bad';
+const flownColour = (i) => FLOWN_COLOURS[i] ?? FLOWN_OTHER;
+
+/** The last pull: the server's answer with a colour and a visibility on each
+ *  flight, and which one is under the pointer. */
+let flown = null;
+let flownHot = null;
+let flownPopup = null;
+
+function flownFlights() {
+  return flown?.ok ? flown.flights : [];
+}
+
+/** Fill the two boxes from the route the first time the tab is opened with
+ *  them empty: the question is almost always about the route being planned. */
+function onFlownTabShown() {
+  if ($('flown-from').value.trim() || $('flown-to').value.trim()) return;
+  fillFlownFromRoute();
+}
+
+function fillFlownFromRoute() {
+  const fields = route.filter((w) => !w.generated && isAirport(w));
+  if (fields.length < 2) return false;
+  $('flown-from').value = fields[0].ident || fields[0].name;
+  $('flown-to').value = fields[fields.length - 1].ident || fields[fields.length - 1].name;
+  return true;
+}
+
+/** An airport search box that writes the chosen identifier into itself. The
+ *  typed text is what is sent, so a pilot who knows the identifier can skip
+ *  the list; the server looks it up again before asking OpenSky. */
+function bindFlownPicker(inputId, resultsId) {
+  const input = $(inputId);
+  const box = $(resultsId);
+  let timer = null;
+  input.addEventListener('input', () => {
+    clearTimeout(timer);
+    const query = input.value.trim();
+    if (query.length < 2) { box.hidden = true; return; }
+    timer = setTimeout(async () => {
+      const found = (await api.searchAirports(query)).filter(isAirport);
+      box.innerHTML = '';
+      for (const airport of found) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.innerHTML =
+          `<span class="ident">${escapeHtml(airport.ident)}</span> ${escapeHtml(airport.name)}` +
+          `<span class="meta">${escapeHtml(airport.municipality ?? '')} ` +
+          `${escapeHtml(airport.region ?? '')}</span>`;
+        button.addEventListener('click', () => {
+          input.value = airport.ident;
+          box.hidden = true;
+        });
+        box.appendChild(button);
+      }
+      box.hidden = !found.length;
+    }, 150);
+  });
+  input.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') box.hidden = true;
+    if (event.key === 'Enter') {
+      const first = box.querySelector('button');
+      if (!box.hidden && first) first.click();
+      else pullFlights();
+    }
+  });
+  document.addEventListener('click', (event) => {
+    if (!event.target.closest('.flown-pick')) box.hidden = true;
+  });
+}
+bindFlownPicker('flown-from', 'flown-from-results');
+bindFlownPicker('flown-to', 'flown-to-results');
+
+$('flown-use-route').addEventListener('click', () => {
+  if (!fillFlownFromRoute()) flashButton($('flown-use-route'), 'Route needs two airports');
+});
+$('flown-use-route').dataset.label = 'From route';
+$('flown-pull').addEventListener('click', pullFlights);
+$('flown-clear').addEventListener('click', clearFlown);
+$('flown-x').addEventListener('change', renderFlownPlot);
+
+async function pullFlights() {
+  const button = $('flown-pull');
+  const departure = $('flown-from').value.trim().toUpperCase();
+  const arrival = $('flown-to').value.trim().toUpperCase();
+  if (!departure || !arrival) { flashButton(button, 'Pick both airports'); return; }
+  if (departure === arrival) { flashButton(button, 'Same airport twice'); return; }
+  $('flown-from-results').hidden = true;
+  $('flown-to-results').hidden = true;
+  button.disabled = true;
+  button.textContent = 'Searching…';
+  let answer;
+  try {
+    answer = await api.routeFlights(departure, arrival);
+  } catch {
+    answer = { ok: false, error: 'the flight search could not be reached' };
+  }
+  button.disabled = false;
+  flown = answer;
+  flownHot = null;
+  if (answer.ok) {
+    answer.flights.forEach((f, i) => { f.id = `${f.icao24}-${i}`; f.colour = flownColour(i); f.on = true; });
+    flashButton(button, answer.flights.length ? `${answer.flights.length} flights` : 'None found');
+  } else {
+    flashButton(button, answer.needs_credentials ? 'Not configured' : 'Search failed');
+  }
+  renderFlown();
+  if (answer.ok && answer.flights.length) {
+    fitFlown();
+    $('flown-results').scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  }
+}
+
+function clearFlown() {
+  flown = null;
+  flownHot = null;
+  renderFlown();
+}
+
+function renderFlown() {
+  const error = $('flown-error');
+  const summary = $('flown-summary');
+  const results = $('flown-results');
+  $('flown-clear').hidden = !flown;
+  if (!flown) {
+    error.hidden = true; summary.hidden = true; results.hidden = true;
+    renderFlownMap();
+    return;
+  }
+  if (!flown.ok) {
+    error.textContent = flown.error;
+    error.hidden = false; summary.hidden = true; results.hidden = true;
+    renderFlownMap();
+    return;
+  }
+  error.hidden = true;
+  summary.innerHTML = flownSummaryHtml(flown);
+  summary.hidden = false;
+  results.hidden = !flown.flights.length;
+  renderFlownLegend();
+  renderFlownPlot();
+  renderFlownMap();
+}
+
+/** Every count between "what flew the pair" and "what is drawn", so the
+ *  filter can be seen working: "10 of 41" says something "10 flights" does
+ *  not, and a window OpenSky would not answer is named rather than quietly
+ *  shortening the history. */
+function flownSummaryHtml(answer) {
+  const from = flownWhen(answer.window.start);
+  const to = flownWhen(answer.window.end);
+  const parts = [
+    `<strong>${answer.flights.length}</strong> drawn of <strong>${answer.matched}</strong> flights ` +
+    `${escapeHtml(answer.departure)} → ${escapeHtml(answer.arrival)}, ${from} to ${to}.`,
+  ];
+  const dropped = [];
+  if (answer.matched - answer.candidates) dropped.push(`${answer.matched - answer.candidates} airline callsigns`);
+  if (answer.rejected_class_a) dropped.push(`${answer.rejected_class_a} into Class A`);
+  if (answer.rejected_thin) dropped.push(`${answer.rejected_thin} with no usable track`);
+  if (dropped.length) parts.push(`Left out: ${dropped.join(', ')}.`);
+  if (answer.unexamined) {
+    parts.push(`<span class="note">${answer.unexamined} older candidates not examined — the per-search request cap was reached.</span>`);
+  }
+  if (answer.failed_windows?.length) {
+    parts.push(`<span class="note">OpenSky did not answer for ${answer.failed_windows.join('; ')}, so those days are missing.</span>`);
+  }
+  if (!answer.flights.length && !answer.matched) {
+    parts.push('OpenSky lists flights a day after they land, and only where its receivers heard them; a quiet pair or a low route out of coverage shows as none.');
+  }
+  if (answer.anonymous) {
+    parts.push('Asked anonymously, on 400 OpenSky credits a day; an API client on the server raises that to 4,000.');
+  }
+  return parts.join(' ');
+}
+
+function flownWhen(iso) {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '';
+  const day = d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', timeZone: 'UTC' });
+  const hhmm = `${String(d.getUTCHours()).padStart(2, '0')}${String(d.getUTCMinutes()).padStart(2, '0')}Z`;
+  return `${day} ${hhmm}`;
+}
+
+function renderFlownLegend() {
+  const legend = $('flown-legend');
+  legend.innerHTML = '';
+  for (const f of flownFlights()) {
+    const label = document.createElement('label');
+    label.dataset.id = f.id;
+    label.className = (f.on ? '' : 'off ') + (f.id === flownHot ? 'hot' : '');
+    const tick = document.createElement('input');
+    tick.type = 'checkbox';
+    tick.checked = f.on;
+    tick.addEventListener('change', () => { f.on = tick.checked; renderFlown(); });
+    const key = document.createElement('span');
+    key.className = 'key';
+    key.style.borderColor = f.colour;
+    const name = document.createElement('span');
+    name.className = 'callsign';
+    name.textContent = f.callsign || f.icao24;
+    const meta = document.createElement('span');
+    meta.className = 'meta';
+    const top = f.max_altitude_ft == null ? 'alt ?' : `${Math.round(f.max_altitude_ft).toLocaleString()} ft max`;
+    meta.textContent = `${flownWhen(f.departed_at)} · ${Math.round(f.duration_min)} min · ${Math.round(f.length_nm)} nm · ${top}`;
+    label.append(tick, key, name, meta);
+    label.addEventListener('mouseenter', () => setFlownHot(f.id));
+    label.addEventListener('mouseleave', () => setFlownHot(null));
+    legend.appendChild(label);
+  }
+}
+
+/** One flight lifted above the rest, everywhere at once. `lngLat` is where
+ *  the map was hovered, for the callsign popup; from the legend or the plot
+ *  there is no popup, the legend row itself is the label. */
+function setFlownHot(id, lngLat = null) {
+  if (id !== flownHot) {
+    flownHot = id;
+    for (const label of document.querySelectorAll('.flown-legend label')) {
+      label.classList.toggle('hot', label.dataset.id === id);
+    }
+    const plot = $('flown-plot');
+    plot.classList.toggle('has-hot', id != null);
+    for (const trace of plot.querySelectorAll('.trace')) {
+      trace.classList.toggle('hot', trace.dataset.id === id);
+    }
+    if (map.getLayer('flown-line-hot')) {
+      map.setFilter('flown-line-hot', ['==', ['get', 'id'], id ?? '']);
+      map.getCanvas().style.cursor = id ? 'pointer' : '';
+    }
+  }
+  if (flownPopup) { flownPopup.remove(); flownPopup = null; }
+  const f = flownFlights().find((x) => x.id === id);
+  if (f && lngLat) {
+    flownPopup = new maplibregl.Popup({ closeButton: false, closeOnClick: false, offset: 8 })
+      .setLngLat(lngLat)
+      .setHTML(
+        `<strong>${escapeHtml(f.callsign || f.icao24)}</strong><br>` +
+        `${escapeHtml(flownWhen(f.departed_at))} · ${Math.round(f.duration_min)} min · ` +
+        `${f.max_altitude_ft == null ? '—' : Math.round(f.max_altitude_ft).toLocaleString()} ft max`,
+      )
+      .addTo(map);
+  }
+}
+
+function renderFlownMap() {
+  if (!map.getSource('flown')) return;
+  const features = [];
+  for (const f of flownFlights()) {
+    if (!f.on) continue;
+    // A fix without a position never reaches the browser, so every point is
+    // drawable; the line is one feature so a hover anywhere on it names it.
+    features.push({
+      type: 'Feature',
+      properties: { id: f.id, colour: f.colour, dim: flownHot != null && flownHot !== f.id },
+      geometry: { type: 'LineString', coordinates: f.points.map((p) => [p[3], p[2]]) },
+    });
+  }
+  map.getSource('flown').setData({ type: 'FeatureCollection', features });
+}
+
+function fitFlown() {
+  let bounds = null;
+  for (const f of flownFlights()) {
+    for (const p of f.points) {
+      const ll = [p[3], p[2]];
+      bounds = bounds ? bounds.extend(ll) : new maplibregl.LngLatBounds(ll, ll);
+    }
+  }
+  if (bounds) map.fitBounds(bounds, { padding: 60, maxZoom: 11, duration: 600 });
+}
+
+// --- the altitude plot ------------------------------------------------------
+//
+// Every flight on one pair of axes: altitude against distance flown, or
+// against time since the first fix. One y axis, in feet; the x axis is the
+// pilot's choice because the two answer different questions -- "how high
+// over the ridge" is a distance question, "how long was the climb" a time
+// one. The crosshair reads every visible flight at the pointer's x, so the
+// pointer never has to land on a line.
+
+const FLOWN_X = {
+  distance: { index: 1, title: 'Distance flown, nm', format: (v) => `${Math.round(v)} nm` },
+  time: { index: 0, title: 'Time since first fix, min', scale: 1 / 60, format: (v) => `${Math.round(v)} min` },
+};
+
+/** Round an axis maximum up to a clean step: 1, 2, 2.5, 5 × 10^n. */
+function niceStep(span, ticks) {
+  const raw = span / Math.max(1, ticks);
+  const power = 10 ** Math.floor(Math.log10(raw));
+  for (const m of [1, 2, 2.5, 5, 10]) if (m * power >= raw) return m * power;
+  return 10 * power;
+}
+
+let flownPlotObserver = null;
+
+function renderFlownPlot() {
+  const host = $('flown-plot');
+  host.innerHTML = '';
+  const flights = flownFlights().filter((f) => f.on);
+  if (!flownPlotObserver) {
+    flownPlotObserver = new ResizeObserver(() => { if (flown?.ok) renderFlownPlot(); });
+    flownPlotObserver.observe(host);
+  }
+  if (!flights.length) {
+    const empty = document.createElement('div');
+    empty.className = 'flown-empty';
+    empty.textContent = 'No flights to draw.';
+    host.appendChild(empty);
+    return;
+  }
+  const mode = FLOWN_X[$('flown-x').value] || FLOWN_X.distance;
+  const xScale = mode.scale ?? 1;
+  const width = Math.max(320, host.clientWidth);
+  const height = Math.max(160, host.clientHeight);
+  const m = { top: 12, right: 16, bottom: 34, left: 54 };
+  const plotW = width - m.left - m.right;
+  const plotH = height - m.top - m.bottom;
+
+  // Series: [x, alt] with nulls where the fix had no altitude, which breaks
+  // the line rather than drawing a guess across the gap.
+  const series = flights.map((f) => ({
+    f, xs: f.points.map((p) => p[mode.index] * xScale), ys: f.points.map((p) => p[4]),
+  }));
+  const xMax = Math.max(1, ...series.map((s) => s.xs[s.xs.length - 1] ?? 0));
+  const yTop = Math.max(1000, ...series.map((s) => Math.max(0, ...s.ys.filter((y) => y != null))));
+  const xStep = niceStep(xMax, 8);
+  const yStep = niceStep(yTop, 5);
+  const xEnd = Math.ceil(xMax / xStep) * xStep;
+  const yEnd = Math.ceil(yTop / yStep) * yStep;
+  const X = (v) => m.left + (v / xEnd) * plotW;
+  const Y = (v) => m.top + plotH - (v / yEnd) * plotH;
+
+  const NS = 'http://www.w3.org/2000/svg';
+  const el = (tag, attrs = {}, text = null) => {
+    const node = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(attrs)) node.setAttribute(k, v);
+    if (text != null) node.textContent = text;
+    return node;
+  };
+  const svg = el('svg', { viewBox: `0 0 ${width} ${height}`, width, height });
+
+  for (let v = 0; v <= yEnd; v += yStep) {
+    svg.appendChild(el('line', { class: v === 0 ? 'axis' : 'grid', x1: m.left, x2: m.left + plotW, y1: Y(v), y2: Y(v) }));
+    svg.appendChild(el('text', { class: 'tick', x: m.left - 6, y: Y(v) + 3, 'text-anchor': 'end' },
+      v.toLocaleString()));
+  }
+  for (let v = 0; v <= xEnd; v += xStep) {
+    svg.appendChild(el('line', { class: 'axis', x1: X(v), x2: X(v), y1: m.top + plotH, y2: m.top + plotH + 4 }));
+    svg.appendChild(el('text', { class: 'tick', x: X(v), y: m.top + plotH + 15, 'text-anchor': 'middle' },
+      Number.isInteger(v) ? v.toLocaleString() : v.toFixed(1)));
+  }
+  svg.appendChild(el('text', { class: 'axis-title', x: m.left + plotW, y: height - 4, 'text-anchor': 'end' }, mode.title));
+  svg.appendChild(el('text', { class: 'axis-title', x: m.left, y: 9, 'text-anchor': 'start' }, 'ft'));
+
+  for (const s of series) {
+    let d = '';
+    let pen = false;
+    s.xs.forEach((x, i) => {
+      const y = s.ys[i];
+      if (y == null) { pen = false; return; }
+      d += `${pen ? 'L' : 'M'}${X(x).toFixed(1)},${Y(y).toFixed(1)}`;
+      pen = true;
+    });
+    const path = el('path', { class: 'trace' + (s.f.id === flownHot ? ' hot' : ''), d, stroke: s.f.colour });
+    path.dataset.id = s.f.id;
+    svg.appendChild(path);
+  }
+  host.classList.toggle('has-hot', flownHot != null);
+
+  // The crosshair and its readout. The whole plot area is the hit target.
+  const cross = el('line', { class: 'crosshair', x1: 0, x2: 0, y1: m.top, y2: m.top + plotH, visibility: 'hidden' });
+  svg.appendChild(cross);
+  const hit = el('rect', { class: 'hit', x: m.left, y: m.top, width: plotW, height: plotH });
+  svg.appendChild(hit);
+  const tip = document.createElement('div');
+  tip.className = 'flown-tip';
+  tip.hidden = true;
+
+  hit.addEventListener('pointermove', (event) => {
+    const box = host.getBoundingClientRect();
+    const px = ((event.clientX - box.left) / box.width) * width;
+    const xValue = Math.max(0, Math.min(xEnd, ((px - m.left) / plotW) * xEnd));
+    cross.setAttribute('x1', X(xValue));
+    cross.setAttribute('x2', X(xValue));
+    cross.setAttribute('visibility', 'visible');
+    tip.innerHTML = '';
+    const at = document.createElement('div');
+    at.className = 'at';
+    at.textContent = mode.format(xValue);
+    tip.appendChild(at);
+    for (const s of series) {
+      const alt = altitudeAt(s, xValue);
+      const row = document.createElement('div');
+      row.className = 'row' + (s.f.id === flownHot ? ' hot' : '');
+      const key = document.createElement('span');
+      key.className = 'key';
+      key.style.borderColor = s.f.colour;
+      const value = document.createElement('span');
+      value.className = 'value';
+      value.textContent = alt == null ? '—' : `${Math.round(alt).toLocaleString()} ft`;
+      const name = document.createElement('span');
+      name.className = 'name';
+      name.textContent = s.f.callsign || s.f.icao24;
+      row.append(key, value, name);
+      tip.appendChild(row);
+    }
+    tip.hidden = false;
+    // Keep the readout clear of the pointer: on its right until that runs
+    // out of room, then on its left.
+    const left = (X(xValue) / width) * box.width;
+    tip.style.left = left + 170 < box.width ? `${left + 12}px` : `${left - 170}px`;
+  });
+  hit.addEventListener('pointerleave', () => {
+    cross.setAttribute('visibility', 'hidden');
+    tip.hidden = true;
+  });
+  // Hovering a trace lifts that flight; the hit rectangle sits on top, so the
+  // nearest trace at the pointer's altitude is found rather than hit-tested.
+  hit.addEventListener('pointermove', (event) => {
+    const box = host.getBoundingClientRect();
+    const px = ((event.clientX - box.left) / box.width) * width;
+    const py = ((event.clientY - box.top) / box.height) * height;
+    const xValue = ((px - m.left) / plotW) * xEnd;
+    let best = null;
+    let bestGap = 12;
+    for (const s of series) {
+      const alt = altitudeAt(s, xValue);
+      if (alt == null) continue;
+      const gap = Math.abs(Y(alt) - py);
+      if (gap < bestGap) { bestGap = gap; best = s.f.id; }
+    }
+    if (best !== flownHot) setFlownHot(best);
+  });
+  hit.addEventListener('pointerleave', () => setFlownHot(null));
+
+  host.appendChild(svg);
+  host.appendChild(tip);
+}
+
+/** A flight's altitude at an x along its track, interpolated between the
+ *  fixes either side; null before its first fix, after its last, or across a
+ *  gap with no altitude. */
+function altitudeAt(s, x) {
+  const { xs, ys } = s;
+  if (!xs.length || x < xs[0] || x > xs[xs.length - 1]) return null;
+  let lo = 0;
+  let hi = xs.length - 1;
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    if (xs[mid] <= x) lo = mid; else hi = mid;
+  }
+  const y0 = ys[lo];
+  const y1 = ys[hi];
+  if (y0 == null || y1 == null) return y0 ?? y1 ?? null;
+  const span = xs[hi] - xs[lo];
+  if (span <= 0) return y0;
+  return y0 + ((x - xs[lo]) / span) * (y1 - y0);
 }
