@@ -51,6 +51,10 @@ TAG_GEO_ASCII_PARAMS = 34737
 
 PHOTOMETRIC_PALETTE = 3
 
+# First bytes of a Git LFS pointer file, which is what a checkout holds in
+# place of a large file until `git lfs pull` runs.
+LFS_POINTER_MAGIC = b"version https://git-lfs"
+
 # Bytes per element for each TIFF field type.
 _TYPE_SIZE = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8, 11: 4, 12: 8, 16: 8}
 _TYPE_FORMAT = {1: "B", 3: "H", 4: "I", 6: "b", 8: "h", 9: "i", 11: "f", 12: "d", 16: "Q"}
@@ -95,6 +99,10 @@ class TiffError(ValueError):
 
 class NotGeoreferenced(TiffError):
     """The TIFF carries no usable georeferencing."""
+
+
+class LfsPointer(TiffError):
+    """The file is a Git LFS stub; the real chart was never fetched."""
 
 
 # --- the projection ---------------------------------------------------------
@@ -376,13 +384,26 @@ def read_header(path: Path) -> GeoTiff:
     """Parse the first IFD of a TIFF. Reads the header bytes only."""
     path = Path(path)
     with path.open("rb") as handle:
-        head = handle.read(8)
+        # More than the 8 bytes the TIFF header needs, so that a Git LFS
+        # pointer -- which begins with a 40-odd byte URL -- is recognisable
+        # below rather than just "not a TIFF".
+        head = handle.read(64)
         if len(head) < 8:
             raise TiffError(f"{path.name}: not a TIFF")
         if head[:2] == b"II":
             byte_order = "<"
         elif head[:2] == b"MM":
             byte_order = ">"
+        elif head.startswith(LFS_POINTER_MAGIC):
+            # A Git LFS pointer: the file was committed through LFS and this
+            # checkout fetched the 130-byte stub instead of the chart. Said
+            # plainly, because the alternative is a chart that silently
+            # vanishes from the layer menu on a server that never ran
+            # `git lfs pull`.
+            raise LfsPointer(
+                f"{path.name} is a Git LFS pointer, not the chart itself. "
+                f"Run `git lfs pull` to fetch it."
+            )
         else:
             raise TiffError(f"{path.name}: not a TIFF")
         (magic,) = struct.unpack_from(byte_order + "H", head, 2)

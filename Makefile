@@ -36,7 +36,11 @@ serve:
 # Source files are cached in .cache/, so re-running is cheap. Pass --refresh
 # to re-download: `$(UV) run python tools/build_airports.py --refresh`.
 
-data: airports basemap airspace
+# Everything derived from a downloaded dataset, in one command. Run this
+# after a NASR cycle or a new chart edition. Each step skips work it has
+# already done, and `charts` re-renders only the charts whose source file
+# actually changed, so re-running costs little.
+data: airports basemap airspace charts
 
 airports:
 	$(UV) run python tools/build_airports.py
@@ -50,13 +54,15 @@ airspace:
 	$(UV) run python tools/build_airspace.py
 
 # Pre-render every chart under data/charts/ into Web Mercator PNG tiles, plus
-# the manifest that describes them. This is what puts charts on the deployed
-# service: it has no GeoTIFFs, so committed tiles are the only form a chart
-# reaches it in. MAXZOOM caps the pyramid -- the top level is most of the
-# bytes, and MapLibre overzooms past whatever the manifest advertises.
+# the manifest that describes them. The tiles are not committed -- they are
+# rebuilt from the GeoTIFFs, which are. Charts whose source has not changed
+# since their tiles were built are left alone, so this is cheap to re-run;
+# a new edition of a chart is detected and re-rendered. MAXZOOM caps the
+# pyramid, and MapLibre overzooms past whatever the manifest advertises.
 #
 #     make charts              # native zoom
 #     make charts MAXZOOM=11   # smaller, softer past z11
+#     make charts --force      # re-render everything regardless
 charts:
 	$(UV) run python tools/build_charts.py $(if $(MAXZOOM),--max-zoom $(MAXZOOM),)
 

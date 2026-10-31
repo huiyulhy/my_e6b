@@ -35,6 +35,7 @@ from __future__ import annotations
 import html
 import json
 import re
+import warnings
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -113,6 +114,10 @@ class Chart:
     note: str | None = None
     # True when the tiles already exist and no renderer is involved.
     prerendered: bool = False
+    # Size of the GeoTIFF the tiles were built from. Recorded in the manifest
+    # so a re-download can be spotted: a new edition of a chart keeps its
+    # name and its slug, and nothing else about it says the pixels moved.
+    source_bytes: int | None = None
 
     @property
     def kind_label(self) -> str:
@@ -230,6 +235,11 @@ def _describe(kind: str, path: Path) -> Chart:
                 f"may be from different editions."
             )
 
+    try:
+        source_bytes = path.stat().st_size
+    except OSError:
+        source_bytes = None
+
     return Chart(
         kind=kind,
         slug=slugify(name),
@@ -244,6 +254,7 @@ def _describe(kind: str, path: Path) -> Chart:
         effective=effective,
         expires=expires,
         note=note,
+        source_bytes=source_bytes,
     )
 
 
@@ -264,6 +275,12 @@ def discover(charts_dir: Path | None = None) -> list[Chart]:
         for path in sorted(kind_dir.rglob("*.tif")) + sorted(kind_dir.rglob("*.tiff")):
             try:
                 chart = _describe(kind_dir.name, path)
+            except tr.LfsPointer as exc:
+                # Loud, unlike the skip below. This is a chart that exists and
+                # was simply not fetched, and the symptom otherwise is an
+                # empty layer menu with nothing to explain it.
+                warnings.warn(str(exc), RuntimeWarning, stacklevel=2)
+                continue
             except (tr.TiffError, OSError):
                 continue
             if chart.slug in seen:
@@ -304,6 +321,7 @@ def _manifest_entry(chart: Chart) -> dict:
         "effective": chart.effective.isoformat() if chart.effective else None,
         "expires": chart.expires.isoformat() if chart.expires else None,
         "note": chart.note,
+        "source_bytes": chart.source_bytes,
     }
 
 
@@ -327,6 +345,7 @@ def _chart_from_entry(entry: dict) -> Chart:
         expires=parse("expires"),
         note=entry.get("note"),
         prerendered=True,
+        source_bytes=entry.get("source_bytes"),
     )
 
 
@@ -380,6 +399,40 @@ def read_manifest(tiles_root: Path | None = None) -> list[Chart]:
         except (KeyError, TypeError, ValueError):
             continue
     return charts
+
+
+def stale_reason(chart: Chart, tiles_root: Path | None = None) -> str | None:
+    """Why this chart's tiles no longer match its source, or None if they do.
+
+    The FAA reissues a chart every 56 days under the same name, so a new
+    edition lands at the same path with the same slug and the same tile
+    filenames. `make charts` keeps whatever tiles it finds -- that is what
+    makes re-running it cheap -- which without this check would leave the
+    previous edition's pixels on screen under the new edition's dates. On a
+    chart that is exactly the wrong way round to be wrong.
+
+    Compared against the manifest written beside the tiles, which is the only
+    record of what they were built from. Both the edition date and the file
+    size have to match: a chart with no `.htm` has no date to compare, and a
+    corrected reissue can carry the same date as the chart it replaces.
+    """
+    if rendered_zooms(chart, tiles_root) is None:
+        return None  # nothing built yet, so nothing to invalidate
+
+    built = {entry.key: entry for entry in read_manifest(tiles_root)}.get(chart.key)
+    if built is None:
+        return "no manifest entry; cannot tell what these tiles were built from"
+    if built.effective != chart.effective:
+        return (
+            f"edition changed: tiles built from {built.effective or 'an undated chart'}, "
+            f"source is now {chart.effective or 'undated'}"
+        )
+    if built.source_bytes != chart.source_bytes:
+        return (
+            f"source file changed: {built.source_bytes} bytes when built, "
+            f"{chart.source_bytes} now"
+        )
+    return None
 
 
 def available(charts_dir: Path | None = None, tiles_root: Path | None = None) -> list[Chart]:

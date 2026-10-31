@@ -26,7 +26,11 @@ changing how a tile is drawn.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
+import errno
+import fcntl
+import os
 import shutil
 import sys
 import time
@@ -53,6 +57,47 @@ def _tile_bytes(directory: Path) -> int:
     return sum(path.stat().st_size for path in directory.rglob("*.png"))
 
 
+@contextlib.contextmanager
+def _only_one_build():
+    """Refuse to start if another build is already running.
+
+    Two builds over one tile tree corrupt each other: the second deletes a
+    chart's directory to re-render it while the first is still writing into
+    it, and the delete fails half way with `Directory not empty`, leaving a
+    tree that is neither edition. Cheap to prevent, confusing to debug.
+    """
+    charts.TILES_DIR.mkdir(parents=True, exist_ok=True)
+    lock_path = charts.TILES_DIR / ".build.lock"
+    handle = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                raise
+            raise SystemExit(
+                f"another chart build is already running (lock: {lock_path}).\n"
+                f"Wait for it to finish, or stop it, then run this again."
+            ) from exc
+        yield
+    finally:
+        os.close(handle)
+
+
+def _clear(directory: Path) -> None:
+    """Delete a chart's tiles, tolerating a file appearing mid-walk."""
+    for attempt in range(3):
+        try:
+            shutil.rmtree(directory)
+            return
+        except FileNotFoundError:
+            return
+        except OSError:
+            if attempt == 2:
+                raise
+            time.sleep(0.2)
+
+
 def main(argv: list[str]) -> int:
     force = "--force" in argv
     cap = _flag_value(argv, "--max-zoom")
@@ -67,7 +112,10 @@ def main(argv: list[str]) -> int:
         matching = f" matching {sorted(wanted)}" if wanted else ""
         print(f"no charts under {charts.CHARTS_DIR}{matching}")
         print("See data/charts/README.txt for where to get them.")
-        return 1
+        # Only an error if a specific chart was asked for. With none
+        # downloaded at all this is a dataset rebuild on a checkout that has
+        # no charts yet, which is a normal state, not a failure.
+        return 1 if wanted else 0
 
     # The manifest must describe what is actually on disk, so a capped chart
     # is capped here, before anything is written. A source that advertises a
@@ -81,8 +129,14 @@ def main(argv: list[str]) -> int:
     started = time.time()
     for chart in found:
         tiles_dir = chart.tiles_dir()
-        if force and tiles_dir.exists():
-            shutil.rmtree(tiles_dir)
+        # A new edition lands at the same path with the same tile filenames,
+        # and tiles already on disk are kept -- so without this the previous
+        # edition's pixels would survive under the new edition's dates.
+        stale = charts.stale_reason(chart)
+        if stale:
+            print(f"{chart.key}: re-rendering, {stale}", flush=True)
+        if (force or stale) and tiles_dir.exists():
+            _clear(tiles_dir)
         expected = sum(
             (x1 - x0 + 1) * (y1 - y0 + 1)
             for x0, y0, x1, y1 in (
@@ -129,4 +183,5 @@ def main(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[1:]))
+    with _only_one_build():
+        raise SystemExit(main(sys.argv[1:]))

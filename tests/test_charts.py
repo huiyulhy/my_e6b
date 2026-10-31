@@ -245,3 +245,80 @@ def test_a_manifest_chart_has_no_store_of_either_kind(geotiff, tmp_path):
     (restored,) = charts.read_manifest(tmp_path / "tiles")
     with pytest.raises(charts.NoChartFile):
         restored.on_demand_store(tmp_path / "tiles", tmp_path / "cache")
+
+
+# --- a new edition ------------------------------------------------------------
+#
+# The FAA reissues each chart every 56 days under the same name, so a new
+# edition arrives at the same path with the same slug and the same tile
+# filenames. `make charts` keeps tiles it finds, which is what makes it cheap
+# to re-run and is exactly what would leave stale pixels under fresh dates.
+
+
+def _build(chart, tiles):
+    chart.store(tiles).render_all(chart.bounds, chart.min_zoom, chart.min_zoom)
+    charts.write_manifest([chart], tiles)
+
+
+def test_unchanged_tiles_are_not_stale(geotiff, tmp_path):
+    geotiff("tac", "Test TAC")
+    (chart,) = charts.discover(geotiff.root)
+    tiles = tmp_path / "tiles"
+    _build(chart, tiles)
+    assert charts.stale_reason(chart, tiles) is None
+
+
+def test_tiles_that_were_never_built_are_not_stale(geotiff, tmp_path):
+    geotiff("tac", "Test TAC")
+    (chart,) = charts.discover(geotiff.root)
+    # Nothing to invalidate; the build renders it anyway.
+    assert charts.stale_reason(chart, tmp_path / "tiles") is None
+
+
+def test_a_new_edition_makes_the_tiles_stale(geotiff, tmp_path):
+    path = geotiff("tac", "Test TAC")
+    (chart,) = charts.discover(geotiff.root)
+    tiles = tmp_path / "tiles"
+    _build(chart, tiles)
+
+    # The next cycle: same file name, same slug, new dates.
+    write_fgdc(path.with_suffix(".htm"), begins="20261029", ends="20261224")
+    (reissued,) = charts.discover(geotiff.root)
+    assert reissued.slug == chart.slug
+    assert "edition changed" in charts.stale_reason(reissued, tiles)
+
+
+def test_a_changed_file_of_the_same_edition_is_stale(geotiff, tmp_path):
+    path = geotiff("tac", "Test TAC")
+    (chart,) = charts.discover(geotiff.root)
+    tiles = tmp_path / "tiles"
+    _build(chart, tiles)
+
+    # A corrected reissue can carry the dates of the chart it replaces, so
+    # the file itself has to be compared too.
+    write_geotiff(path, width=96, height=64)
+    (corrected,) = charts.discover(geotiff.root)
+    assert "source file changed" in charts.stale_reason(corrected, tiles)
+
+
+def test_tiles_with_no_manifest_behind_them_are_stale(geotiff, tmp_path):
+    geotiff("tac", "Test TAC")
+    (chart,) = charts.discover(geotiff.root)
+    tiles = tmp_path / "tiles"
+    chart.store(tiles).render_all(chart.bounds, chart.min_zoom, chart.min_zoom)
+    assert "no manifest entry" in charts.stale_reason(chart, tiles)
+
+
+def test_an_unfetched_lfs_chart_warns_rather_than_vanishing(geotiff):
+    geotiff("tac", "Test TAC")
+    pointer = geotiff.root / "sectional" / "Stub" / "Stub SEC.tif"
+    pointer.parent.mkdir(parents=True)
+    pointer.write_bytes(
+        b"version https://git-lfs.github.com/spec/v1\n"
+        b"oid sha256:0000000000000000000000000000000000000000000000000000000000000000\n"
+        b"size 79736973\n"
+    )
+    with pytest.warns(RuntimeWarning, match="git lfs pull"):
+        found = charts.discover(geotiff.root)
+    # The readable chart still comes through; only the stub is dropped.
+    assert [c.slug for c in found] == ["test_tac"]
