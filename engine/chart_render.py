@@ -285,11 +285,23 @@ class TileStore:
     The decoded chart is loaded the first time a tile has to be rendered,
     and not at all if every tile asked for is already on disk -- so a
     pre-rendered bundle never pays the decode.
+
+    Two roots, because tiles arrive two ways and only one of them belongs in
+    the repository. `shipped` is the committed pyramid `make charts` wrote:
+    read first, never written to. `root` is where anything missing is
+    rendered, which while developing is a scratch directory outside `data/`.
+
+    Keeping them apart is not tidiness. Panning the map at a zoom past the
+    committed cap renders thousands of tiles, and with one directory for both
+    they are indistinguishable from the build output -- git sees only a flood
+    of untracked PNGs next to the tracked ones, and the next `git add` of that
+    folder commits whatever the last browsing session happened to look at.
     """
 
-    def __init__(self, chart_path: Path, root: Path) -> None:
+    def __init__(self, chart_path: Path, root: Path, shipped: Path | None = None) -> None:
         self.chart_path = Path(chart_path)
         self.root = Path(root)
+        self.shipped = Path(shipped) if shipped is not None else None
         self._raster: ChartRaster | None = None
         self._lock = threading.Lock()
 
@@ -301,15 +313,24 @@ class TileStore:
             return self._raster
 
     def tile_path(self, zoom: int, x: int, y: int) -> Path:
+        """Where this tile is written. Reads may come from `shipped` instead."""
         return self.root / str(zoom) / str(x) / f"{y}.png"
 
+    def shipped_path(self, zoom: int, x: int, y: int) -> Path | None:
+        if self.shipped is None:
+            return None
+        return self.shipped / str(zoom) / str(x) / f"{y}.png"
+
     def get(self, zoom: int, x: int, y: int) -> bytes:
-        """The tile's PNG bytes, from disk if it is there, else rendered and kept."""
+        """The tile's PNG bytes: committed, else cached, else rendered and kept."""
+        for candidate in (self.shipped_path(zoom, x, y), self.tile_path(zoom, x, y)):
+            if candidate is None:
+                continue
+            try:
+                return candidate.read_bytes()
+            except OSError:
+                continue
         path = self.tile_path(zoom, x, y)
-        try:
-            return path.read_bytes()
-        except OSError:
-            pass
         rgba = self.raster.render_tile(zoom, x, y)
         data = EMPTY_TILE_PNG if rgba is None else png_bytes(rgba)
         path.parent.mkdir(parents=True, exist_ok=True)

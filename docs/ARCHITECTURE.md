@@ -879,9 +879,9 @@ Three modules, one job each:
   and the nearest one taken — vectorised, a few milliseconds a tile. Zoomed out, tiles
   sample a box-filtered pyramid built lazily so thin lines do not alias away. Outside the
   image is transparent, so the basemap shows past the chart's edge. `TileStore` keeps
-  tiles as PNG under `data/charts/tiles/`; the dev server fills it on demand
-  (`/api/charts/tiles/…`), `make charts` fills all of it for the offline bundle, and
-  neither renders a tile twice.
+  tiles as PNG under `data/charts/tiles/`; `make charts` fills it for the offline bundle,
+  the dev server renders anything missing on demand (`/api/charts/tiles/…`), and neither
+  renders a tile twice.
 
 The choice that matters: **tiles are rendered outside the browser.** Decoding a
 200-megapixel TIFF and reprojecting it in JavaScript would hold several hundred megabytes
@@ -923,6 +923,14 @@ Each level has four times the tiles of the one below, so the top one or two are 
 bytes — for the Bay Area set, the full pyramid is 93 MB and two levels off the top is 33 MB.
 MapLibre overzooms past whatever the manifest advertises, so a capped chart goes soft rather
 than blank, and `make charts MAXZOOM=` is what sets the cap.
+
+**The committed tiles and the on-demand ones are different directories**, which is a git
+constraint rather than an aesthetic one. `make charts` writes `data/charts/tiles/` and that
+is committed. The dev server writes `.cache/chart-tiles/` and that is ignored, because
+panning at a zoom past the committed cap renders thousands of tiles — 5,700 of them, 75 MB,
+the first time this was not separated — and beside the build output git cannot tell which
+were deliberate. `TileStore` reads the committed root first and writes only to the other, so
+a tile `make charts` built is never re-rendered or rewritten.
 
 What is committed now is the sectional to z10 and the terminal area charts to z12. The
 sectional is crisp at the zoom a route is actually planned at and blocky if you push past it;

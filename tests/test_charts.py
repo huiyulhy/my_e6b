@@ -211,3 +211,37 @@ def test_currency_reads_the_manifest_when_there_are_no_files(geotiff, tmp_path):
     ]
     assert dataset.effective == date(2026, 9, 3)
     assert dataset.expires == date(2026, 10, 28)
+
+
+def test_the_build_store_writes_where_make_charts_commits(geotiff, tmp_path):
+    geotiff("tac", "Test TAC")
+    (chart,) = charts.discover(geotiff.root)
+    store = chart.store(tmp_path / "tiles")
+    assert store.root == tmp_path / "tiles" / "tac" / "test_tac"
+    assert store.shipped is None
+
+
+def test_the_on_demand_store_keeps_the_two_apart(geotiff, tmp_path):
+    geotiff("tac", "Test TAC")
+    (chart,) = charts.discover(geotiff.root)
+    store = chart.on_demand_store(tmp_path / "tiles", tmp_path / "cache")
+    # Reads the committed pyramid, writes anything else outside it.
+    assert store.shipped == tmp_path / "tiles" / "tac" / "test_tac"
+    assert store.root == tmp_path / "cache" / "tac" / "test_tac"
+
+
+def test_the_cache_defaults_outside_the_data_directory(geotiff):
+    geotiff("tac", "Test TAC")
+    (chart,) = charts.discover(geotiff.root)
+    # Anything under data/charts/ would land beside the committed tiles and
+    # be indistinguishable from them in git.
+    assert charts.DATA_DIR not in charts.CACHE_TILES_DIR.parents
+    assert chart.cache_dir().is_relative_to(charts.CACHE_TILES_DIR)
+
+
+def test_a_manifest_chart_has_no_store_of_either_kind(geotiff, tmp_path):
+    geotiff("tac", "Test TAC")
+    charts.write_manifest(charts.discover(geotiff.root), tmp_path / "tiles")
+    (restored,) = charts.read_manifest(tmp_path / "tiles")
+    with pytest.raises(charts.NoChartFile):
+        restored.on_demand_store(tmp_path / "tiles", tmp_path / "cache")

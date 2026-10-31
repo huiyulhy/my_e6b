@@ -48,6 +48,11 @@ CHARTS_DIR = DATA_DIR / "charts"
 # these *are* committed: they are the only form in which a deployed server,
 # which has no GeoTIFFs, can serve a chart. `make charts` writes them.
 TILES_DIR = CHARTS_DIR / "tiles"
+# Where tiles rendered on demand go instead. Under .cache/, which is already
+# ignored, with the build output left alone -- panning the map at a zoom past
+# the committed cap renders thousands of tiles, and mixed into TILES_DIR they
+# are indistinguishable from what `make charts` deliberately built.
+CACHE_TILES_DIR = DATA_DIR.parent / ".cache" / "chart-tiles"
 MANIFEST_NAME = "manifest.json"
 # Bumped if the manifest's shape changes; an older file is then ignored
 # rather than half-read.
@@ -120,13 +125,39 @@ class Chart:
     def tiles_dir(self, tiles_root: Path | None = None) -> Path:
         return (tiles_root or TILES_DIR) / self.kind / self.slug
 
-    def store(self, tiles_root: Path | None = None) -> render.TileStore:
+    def cache_dir(self, cache_root: Path | None = None) -> Path:
+        return (cache_root or CACHE_TILES_DIR) / self.kind / self.slug
+
+    def _require_file(self) -> Path:
         if self.path is None:
             raise NoChartFile(
                 f"{self.key} was read from the tile manifest; its GeoTIFF is not on "
                 f"this machine, so its tiles can only be served, not rendered."
             )
-        return render.TileStore(self.path, self.tiles_dir(tiles_root))
+        return self.path
+
+    def store(self, tiles_root: Path | None = None) -> render.TileStore:
+        """The build store: reads and writes the committed pyramid.
+
+        What `make charts` fills, and the only thing that should ever write
+        into `data/charts/tiles/`.
+        """
+        return render.TileStore(self._require_file(), self.tiles_dir(tiles_root))
+
+    def on_demand_store(
+        self, tiles_root: Path | None = None, cache_root: Path | None = None
+    ) -> render.TileStore:
+        """The serving store: committed tiles first, anything else cached aside.
+
+        What the dev server hands the map. A tile `make charts` already built
+        is read straight off disk; a zoom past the committed cap is rendered
+        into `.cache/`, where it stays out of the repository.
+        """
+        return render.TileStore(
+            self._require_file(),
+            self.cache_dir(cache_root),
+            shipped=self.tiles_dir(tiles_root),
+        )
 
 
 def slugify(name: str) -> str:

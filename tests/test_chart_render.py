@@ -198,3 +198,54 @@ def test_palette_tiles_are_much_smaller_than_rgba(raster):
     buffer = BytesIO()
     Image.fromarray(tile, "RGBA").save(buffer, format="PNG", compress_level=6)
     assert len(cr.png_bytes(tile)) < len(buffer.getvalue())
+
+
+# --- the two tile roots -------------------------------------------------------------
+#
+# Committed build output and tiles rendered while panning live in different
+# directories, so that git can tell them apart. See engine/charts.py.
+
+
+def test_a_committed_tile_is_read_and_never_rewritten(tmp_path):
+    chart = write_geotiff(tmp_path / "Test TAC.tif")
+    shipped, cache = tmp_path / "tiles", tmp_path / "cache"
+    z, (x, y) = 9, cr.tile_at(-122.25, 37.6, 9)
+
+    built = cr.TileStore(chart, shipped)
+    built.get(z, x, y)
+
+    serving = cr.TileStore(chart, cache, shipped=shipped)
+    assert serving.get(z, x, y) == built.tile_path(z, x, y).read_bytes()
+    # Nothing was written into the cache: the committed tile answered.
+    assert not cache.exists()
+
+
+def test_a_tile_past_the_committed_set_is_cached_aside(tmp_path):
+    chart = write_geotiff(tmp_path / "Test TAC.tif")
+    shipped, cache = tmp_path / "tiles", tmp_path / "cache"
+    shipped.mkdir()
+    z, (x, y) = 9, cr.tile_at(-122.25, 37.6, 9)
+
+    serving = cr.TileStore(chart, cache, shipped=shipped)
+    data = serving.get(z, x, y)
+
+    assert serving.tile_path(z, x, y).read_bytes() == data
+    # The committed tree is untouched, which is the whole point.
+    assert list(shipped.rglob("*.png")) == []
+
+
+def test_the_cache_answers_on_the_second_ask(tmp_path):
+    chart = write_geotiff(tmp_path / "Test TAC.tif")
+    serving = cr.TileStore(chart, tmp_path / "cache", shipped=tmp_path / "tiles")
+    z, (x, y) = 9, cr.tile_at(-122.25, 37.6, 9)
+    serving.get(z, x, y)
+    serving.tile_path(z, x, y).write_bytes(b"cached")
+    assert serving.get(z, x, y) == b"cached"
+
+
+def test_with_no_shipped_root_it_behaves_as_before(tmp_path):
+    chart = write_geotiff(tmp_path / "Test TAC.tif")
+    store = cr.TileStore(chart, tmp_path / "tiles")
+    z, (x, y) = 9, cr.tile_at(-122.25, 37.6, 9)
+    assert store.shipped_path(z, x, y) is None
+    assert store.get(z, x, y) == store.tile_path(z, x, y).read_bytes()

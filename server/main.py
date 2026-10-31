@@ -1791,7 +1791,10 @@ def _store_for(kind: str, slug: str) -> render.TileStore:
             if chart is None:
                 raise HTTPException(status_code=404, detail=f"no chart {key}")
             try:
-                store = _tile_stores[key] = chart.store()
+                # On demand, not the build store: a zoom past the committed
+                # cap is rendered into .cache/ rather than into the tree that
+                # gets committed. See engine/charts.py.
+                store = _tile_stores[key] = chart.on_demand_store()
             except ch.NoChartFile as exc:
                 # Pre-rendered tiles are served from /data; nothing to render.
                 raise HTTPException(status_code=404, detail=str(exc)) from exc

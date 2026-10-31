@@ -32,4 +32,10 @@ data/charts/*/
 # ships with. A deployed instance has no GeoTIFFs and not enough memory to
 # decode one, so pre-rendered tiles are the only form in which a chart
 # reaches the browser there. Rebuild with `make charts`.
+#
+# Only `make charts` writes here. Tiles the dev server renders as you pan --
+# thousands of them, at zooms past the committed cap -- go to
+# .cache/chart-tiles/ instead, ignored by the .cache/ rule above. Were both
+# kinds in this folder git could not tell them apart, and `git add` of it
+# would commit whatever the last browsing session happened to look at.
 !data/charts/tiles/

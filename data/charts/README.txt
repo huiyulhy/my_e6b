@@ -15,9 +15,16 @@ and is where the chart's effective and expiry dates come from; without it
 the chart still draws, but the currency list cannot say when it lapses.
 VFR charts are reissued every 56 days.
 
-Tiles rendered from the charts land in data/charts/tiles/. The dev server
-fills that on demand as you pan; `make charts` fills all of it and writes
-manifest.json beside it.
+Tiles rendered from the charts land in two places, and the difference
+matters to git:
+
+  data/charts/tiles/     what `make charts` built. Committed.
+  .cache/chart-tiles/    what the dev server rendered as you panned past
+                         the committed zoom cap. Ignored, delete any time.
+
+Only `make charts` writes the first one. Panning the map at a high zoom
+renders thousands of tiles, and if those landed beside the build output
+git could not tell them apart.
 
 Unlike the charts, the tiles ARE committed. A deployed instance has no
 GeoTIFFs on it and not enough memory to decode one, so committed tiles are
