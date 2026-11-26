@@ -263,3 +263,77 @@ class TestTheTwoListsAgree:
         assert len(solved.weather) == 2
         assert all(entry.has_forecast for entry in solved.weather)
         assert all(r.wind_speed_kt > 0 for r in flying(solved.navlog))
+
+
+class TestCheckrideMode:
+    """One wind per leg: the end waypoint's forecast, at the altitude and hour
+    the end is reached, used for every row of the leg."""
+
+    # Light at the surface, strong at cruise: the altitude it is read at shows.
+    SHEARED = nl.WindsAloft(((0.0, nl.Wind(90.0, 10.0)), (6500.0, nl.Wind(90.0, 40.0))))
+
+    def end(self, start, finish, winds=None, **kwargs):
+        """The forecast over one leg's end waypoint."""
+        return pw.PointForecast(
+            name=f"{start.name}-{finish.name}",
+            position=finish.position,
+            hours=() if winds is None else hours(winds, **kwargs),
+        )
+
+    def test_every_row_of_a_leg_is_flown_in_one_wind(self):
+        route = [KSQL, KLVK, KMOD]
+        solved = solve(
+            route,
+            [self.end(KSQL, KLVK, self.SHEARED), self.end(KLVK, KMOD, self.SHEARED)],
+            checkride=True,
+        )
+        rows = rows_of(solved, route)
+        for entry in solved.weather:
+            leg_rows = rows[entry.leg]
+            assert len({round(r.wind_speed_kt, 6) for r in leg_rows}) == 1
+            assert {r.phase for r in rows[1]} >= {"cruise", "descent"}
+
+    def test_the_wind_is_read_at_the_altitude_the_end_is_reached(self):
+        """The last leg ends in the pattern at KMOD, so its one wind is the
+        column's near the bottom -- not the cruise altitude's 40 kt."""
+        route = [KSQL, KLVK, KMOD]
+        solved = solve(
+            route,
+            [self.end(KSQL, KLVK, self.SHEARED), self.end(KLVK, KMOD, self.SHEARED)],
+            checkride=True,
+        )
+        rows = rows_of(solved, route)
+        for entry in solved.weather:
+            end_altitude = rows[entry.leg][-1].exit_altitude_ft
+            assert entry.read_altitude_ft == pytest.approx(end_altitude, abs=1.0)
+            expected = self.SHEARED.at(end_altitude).speed_kt
+            assert all(r.wind_speed_kt == pytest.approx(expected, abs=0.1) for r in rows[entry.leg])
+        last = solved.weather[-1]
+        assert last.read_altitude_ft < 2000
+        assert last.wind.speed_kt < 20
+
+    def test_the_forecast_is_read_at_the_hour_the_end_is_reached(self):
+        solved = solve(
+            [KSQL, KMOD],
+            [self.end(KSQL, KMOD, HEADWIND, count=18, step=timedelta(minutes=10))],
+            checkride=True,
+        )
+        arrival = OFF_BLOCKS + timedelta(
+            minutes=next(r for r in solved.navlog.legs if r.to_name == "KMOD").cumulative_ete_min
+        )
+        assert abs(solved.weather[0].valid_time - arrival) <= timedelta(minutes=5)
+
+    def test_it_settles(self):
+        solved = solve(
+            [KSQL, KLVK, KMOD],
+            [self.end(KSQL, KLVK, self.SHEARED), self.end(KLVK, KMOD, self.SHEARED)],
+            checkride=True,
+        )
+        assert solved.settled
+
+    def test_off_by_default_the_rows_read_their_own_altitudes(self):
+        route = [KSQL, KMOD]
+        solved = solve(route, [leg(KSQL, KMOD, self.SHEARED)])
+        assert solved.weather[0].read_altitude_ft is None
+        speeds = {round(r.wind_speed_kt, 1) for r in rows_of(solved, route)[0]}
+        assert len(speeds) > 1

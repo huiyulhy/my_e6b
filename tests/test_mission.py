@@ -92,6 +92,17 @@ class TestRoundTrip:
         assert mission["waypoints"][1]["events"] == [e.model_dump() for e in req.waypoints[1].events]
         assert mission["segment_overrides"] == [o.model_dump(mode="json") for o in req.segment_overrides]
         assert mission["forecasts"] == []
+        assert mission["checkride"] is False
+
+    def test_checkride_mode_is_kept_with_the_mission(self):
+        """How the pilot chose to plan, not something observed on the day."""
+        mission = imported(exported(request(checkride=True)))["mission"]
+        assert mission["checkride"] is True
+
+    def test_a_mission_saved_before_checkride_mode_existed_loads_without_it(self):
+        body = request().model_dump(mode="json")
+        del body["checkride"]
+        assert PlanRequest.model_validate(body).checkride is False
 
     def test_it_plans_again_the_same_in_the_same_weather(self):
         """The same plan, once the day's observations are taken off both:

@@ -23,6 +23,14 @@ is not known until the plan is built -- and the plan is built in the weather:
 2. Read each leg's forecast at the hour its midpoint is passed.
 3. Plan again on that weather, which moves the times -- and the tops of climb.
 4. Re-read. If no leg's hour changed, the two lists agree and it is done.
+
+**Checkride mode** plans the way a navlog is worked by hand for a checkride:
+one wind per leg, taken from the forecast over the leg's *end* waypoint, at the
+altitude and the hour the aeroplane reaches it, and used for every row of the
+leg -- climb, cruise and descent alike. The forecasts are then fetched over the
+end waypoints rather than the midpoints (the caller's choice; the list is still
+one per leg), and the end altitude joins the hour in what has to settle.
+Temperatures are still read off that column by altitude.
 """
 
 from __future__ import annotations
@@ -116,6 +124,9 @@ class LegWeather:
     # A wind no heading can hold the course in. Recorded rather than planned
     # on; see `_read_leg`.
     unflyable: bool = False
+    # Checkride mode only: the altitude the one wind for the whole leg was
+    # read at -- the aeroplane's altitude at the leg's end waypoint.
+    read_altitude_ft: float | None = None
     note: str = ""
 
     @property
@@ -127,10 +138,15 @@ class LegWeather:
     def key(self) -> tuple:
         """What has to stop changing before the two lists have settled.
 
-        Which hour was read, and whether it could be planned on: both are
-        discrete, so this either changes on a pass or it does not.
+        Which hour was read, whether it could be planned on, and in checkride
+        mode the altitude the leg's wind was read at, to the nearest 100 ft.
+        The altitude is the one continuous thing here, so it is rounded to
+        keep settling a real event rather than a tolerance.
         """
-        return (self.has_forecast, self.valid_time)
+        altitude = (
+            None if self.read_altitude_ft is None else round(self.read_altitude_ft, -2)
+        )
+        return (self.has_forecast, self.valid_time, altitude)
 
 
 @dataclass(frozen=True)
@@ -173,15 +189,19 @@ def solve(
     planning_mode: str = "manual",
     max_passes: int = MAX_PASSES,
     segment_overrides: nl.SegmentOverrides | None = None,
+    checkride: bool = False,
 ) -> SolvedPlan:
     """Build a navlog and the weather list it agrees with.
 
-    `forecasts` is one series per leg the pilot drew, fetched over the leg's
-    midpoint, in route order -- one fewer than the route with its generated
-    points removed. A short list, or one with empty series in it, is not an
-    error: the legs it cannot cover are planned on whatever was typed on their
-    rows, and on calm below that, which is what a plan with no weather on it
-    has always meant.
+    `forecasts` is one series per leg the pilot drew, in route order -- one
+    fewer than the route with its generated points removed -- fetched over the
+    leg's midpoint, or over its end waypoint with `checkride`. A short list,
+    or one with empty series in it, is not an error: the legs it cannot cover
+    are planned on whatever was typed on their rows, and on calm below that,
+    which is what a plan with no weather on it has always meant.
+
+    `checkride` flies each leg in one wind: its forecast read at the hour and
+    altitude the leg's end waypoint is reached (see the module docstring).
 
     With no forecasts at all this is `build_navlog`, and it returns on the
     first pass.
@@ -209,7 +229,10 @@ def solve(
         return SolvedPlan(navlog=navlog, weather=(), passes=1, settled=True)
 
     for attempt in range(1, max_passes + 1):
-        read = _read(drawn, navlog, forecasts, off_blocks)
+        read = _read(
+            drawn, navlog, forecasts, off_blocks,
+            checkride=checkride, cruise_altitude_ft=cruise_altitude_ft,
+        )
         if _same(read, weather):
             # The hours survived the plan they produced. The two lists agree.
             return SolvedPlan(
@@ -234,25 +257,39 @@ def _read(
     navlog: nl.Navlog,
     forecasts: tuple[PointForecast, ...],
     off_blocks: datetime | None,
+    *,
+    checkride: bool = False,
+    cruise_altitude_ft: float = 0.0,
 ) -> tuple[LegWeather, ...]:
     """The weather list for one pass, read off the navlog of the pass before.
 
-    The navlog supplies two things: when each leg's midpoint is passed, which
-    picks the forecast hour, and the leg's rows, which the forecast's wind is
-    checked against.
+    The navlog supplies when each leg is flown, which picks the forecast hour
+    -- its midpoint's time, or in checkride mode its end's -- and the leg's
+    rows, which the forecast's wind is checked against and, in checkride mode,
+    whose last altitude the leg's one wind is read at.
     """
-    times = _midpoint_times(navlog, drawn, off_blocks)
+    times = (
+        _arrival_times(navlog, drawn, off_blocks)[1:]
+        if checkride
+        else _midpoint_times(navlog, drawn, off_blocks)
+    )
     rows = nl.rows_by_drawn_leg(navlog.legs, drawn)
     read: list[LegWeather] = []
     for index in range(len(drawn) - 1):
         series = _series(forecasts, index)
+        leg_rows = rows.get(index, [])
         read.append(
             _read_leg(
                 index=index,
                 from_name=drawn[index].name,
                 to_name=drawn[index + 1].name,
-                rows=rows.get(index, []),
+                rows=leg_rows,
                 hour=None if series is None else series.at(times[index]),
+                one_wind_at=(
+                    (leg_rows[-1].exit_altitude_ft if leg_rows else cruise_altitude_ft)
+                    if checkride
+                    else None
+                ),
             )
         )
     return tuple(read)
@@ -265,8 +302,13 @@ def _read_leg(
     to_name: str,
     rows: list[nl.Leg],
     hour: ForecastHour | None,
+    one_wind_at: float | None = None,
 ) -> LegWeather:
-    """One leg, in the forecast over its midpoint.
+    """One leg, in its forecast.
+
+    With `one_wind_at` -- checkride mode -- the column is read once, at that
+    altitude, and the leg is flown in that one wind at every altitude. Its
+    temperatures are still the column's, read by altitude.
 
     A wind no heading can hold the course in is not planned on. Planning on it
     would make the route unbuildable and leave the pilot looking at an error
@@ -278,11 +320,16 @@ def _read_leg(
     if hour is None:
         return LegWeather(**identity, note="no forecast over this leg")
 
+    winds = hour.winds
+    if one_wind_at is not None:
+        wind = hour.winds.at(one_wind_at)
+        winds = nl.WindsAloft.uniform(wind.from_deg, wind.speed_kt)
     found = {
         "valid_time": hour.valid_time,
-        "wind": _wind_over(rows, hour.winds),
+        "wind": _wind_over(rows, winds),
+        "read_altitude_ft": one_wind_at,
     }
-    if not _flyable(rows, hour.winds):
+    if not _flyable(rows, winds):
         return LegWeather(
             **identity,
             **found,
@@ -295,7 +342,7 @@ def _read_leg(
             ),
         )
     return LegWeather(
-        **identity, **found, winds=hour.winds, temperatures=hour.temperatures
+        **identity, **found, winds=winds, temperatures=hour.temperatures
     )
 
 

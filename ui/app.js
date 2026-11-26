@@ -1785,6 +1785,12 @@ const editKey = (segment, phase) => `${segment}|${phase || ''}`;
  *  the climb and the cruise are flown in different air at different speeds. */
 let windScope = 'leg';
 
+/** Checkride mode: each leg flown in one wind, the forecast over its end
+ *  waypoint at the altitude and time it is reached -- the way a navlog is
+ *  worked by hand. It changes where the forecasts are fetched, so toggling it
+ *  fetches them again. Saved with the mission. */
+let checkrideMode = false;
+
 function scopeOf(field) {
   if (field === 'wind_from_deg' || field === 'wind_speed_kt') return windScope;
   return field === 'altitude_ft' ? 'leg' : 'phase';
@@ -2000,6 +2006,7 @@ function planBody() {
     altimeter_inhg: +$('altimeter').value,
     isa_deviation_c: +$('isadev').value,
     night: $('night').checked,
+    checkride: checkrideMode,
     // No route-wide wind: it is typed on the leg it applies to, and travels
     // to the engine in `segment_overrides`.
   };
@@ -2813,12 +2820,17 @@ function renderSummary(plan) {
     div.className = 'alert model';
     const missed = forecastWx.of - forecastWx.points;
     const passes = plan.weather_passes;
+    const legCount = `${forecastWx.points} leg${forecastWx.points === 1 ? '' : 's'}`;
     div.textContent =
-      `Winds and temperatures aloft: model forecast over the midpoint of `
-      + `${forecastWx.points} leg${forecastWx.points === 1 ? '' : 's'}, `
+      (forecastWx.checkride
+        ? `Winds and temperatures aloft: model forecast over the end waypoint of ${legCount}, `
+        : `Winds and temperatures aloft: model forecast over the midpoint of ${legCount}, `)
       + `${forecastWx.hours} hour${forecastWx.hours === 1 ? '' : 's'} each. `
-      + `Each leg is planned in its midpoint's forecast at the hour it is flown, `
-      + `read at each row's altitude`
+      + (forecastWx.checkride
+        ? `Checkride winds: each leg is flown in one wind, its end waypoint's forecast `
+          + `at the altitude and time you reach it`
+        : `Each leg is planned in its midpoint's forecast at the hour it is flown, `
+          + `read at each row's altitude`)
       + (passes ? `; settled in ${passes} pass${passes === 1 ? '' : 'es'}` : '')
       + (missed ? `; ${missed} leg(s) unavailable` : '')
       + '. A forecast, not an observation — and no substitute for a briefing.';
@@ -3135,6 +3147,8 @@ async function getWeather() {
  *  The midpoint rather than the ends: a leg is planned in one column, and
  *  the model asked at the middle of the leg beats an average of its ends,
  *  which is air that was forecast nowhere. Still one request for the route.
+ *  Checkride mode asks over each leg's end waypoint instead (see
+ *  `checkrideMode`).
  *
  *  A window rather than a single hour. The engine settles the weather list
  *  and the navlog against each other -- the wind moves the times, the times
@@ -3150,9 +3164,12 @@ async function getWeather() {
 async function getForecasts(arrivals) {
   const drawn = route.filter((w) => !w.generated);
   if (drawn.length < 2) return 0;
+  // Over each leg's midpoint, or in checkride mode its end waypoint -- one
+  // per leg either way, which is what the engine reads the list as.
   const legs = drawn.slice(1).map((to, n) => {
     const from = drawn[n];
-    return { name: `${from.name}–${to.name}`, ...greatCircleMidpoint(from, to) };
+    const at = checkrideMode ? { lat: to.lat, lon: to.lon } : greatCircleMidpoint(from, to);
+    return { name: `${from.name}–${to.name}`, ...at };
   });
 
   const start = offBlocksUtc();
@@ -3191,7 +3208,7 @@ async function getForecasts(arrivals) {
   });
 
   forecastWx = got
-    ? { points: got, of: legs.length, hours, notes: [...notes] }
+    ? { points: got, of: legs.length, hours, notes: [...notes], checkride: checkrideMode }
     : null;
   if (!got) forecasts = [];
   return got;
@@ -3703,6 +3720,7 @@ function renderImportPreview(result) {
     li.textContent = `Saved mission: ${m.planning_mode === 'manual' ? 'user-driven' : 'hybrid'}, `
       + `${m.cruise_altitude_ft} ft, ${events} leg event${events === 1 ? '' : 's'}, `
       + `${m.segment_overrides.length} leg edit${m.segment_overrides.length === 1 ? '' : 's'}`
+      + (m.checkride ? ', checkride winds' : '')
       + (result.snapshot?.solved_at ? `, last solved ${zuluDate(result.snapshot.solved_at)}` : '')
       + '. Loading restores it and re-plans it in today\'s weather.';
     preview.appendChild(li);
@@ -3840,6 +3858,8 @@ function restoreMission(mission, snapshot) {
     if (mission[key] != null) $(id).value = mission[key];
   }
   $('night').checked = !!mission.night;
+  checkrideMode = !!mission.checkride;
+  $('checkride').checked = checkrideMode;
   if (mission.runway_margin != null) $('runway-margin').value = Math.round(mission.runway_margin * 100);
   if (mission.fuel_margin != null) $('fuel-margin').value = Math.round(mission.fuel_margin * 100);
   // The departure time is left as the pilot has it now: the saved one is
@@ -4283,6 +4303,12 @@ $('e6b-toggle').addEventListener('click', () => {
 });
 
 $('wind-scope').addEventListener('change', () => { windScope = $('wind-scope').value; });
+$('checkride').addEventListener('change', async () => {
+  checkrideMode = $('checkride').checked;
+  // The forecasts in hand were fetched over the other set of points.
+  if (forecastWx) await getForecasts(plannedArrivals());
+  requestPlan();
+});
 
 // --- the navigation log's height ----------------------------------------
 //

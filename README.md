@@ -26,7 +26,8 @@ current METAR — or, for a departure hours away, from the TAF and a forecast mo
 and landing distances are computed on the air that will actually be there. Between them, the
 winds and temperatures aloft come from a model forecast (HRRR, then GFS beyond about two days)
 over the midpoint of each leg, read at the hour that leg is flown and at each row's altitude.
-Without a connection you type them in, as before, and everything else works unchanged.
+**Checkride winds** switches to the hand-worked way instead: one wind per leg, the forecast over
+the leg's end waypoint at the altitude and time you reach it. Without a connection you type them in, as before, and everything else works unchanged.
 
 NOTAMs need one extra thing: a SkyLink licence (1,000 queries). Without it every other
 feature works and **Get NOTAMs** says what is missing rather
@@ -81,7 +82,7 @@ make altimeter-trend   # how far the altimeter setting really moves in a day, an
 
 ## Status
 
-Built, with 1,132 tests:
+Built, with 1,242 tests:
 
 - [engine/atmosphere.py](engine/atmosphere.py) — ISA, pressure and density altitude, TAS
 - [engine/performance.py](engine/performance.py) — POH Section 5 tables and interpolation

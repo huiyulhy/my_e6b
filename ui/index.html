@@ -265,6 +265,10 @@
             <option value="phase">that phase</option>
           </select>
         </label>
+        <label title="Plan each leg in one wind, the way a navlog is worked by hand for a checkride: the forecast over the leg's end waypoint, at the altitude and time you reach it, used for the whole leg — climb, cruise and descent. Off: each leg's forecast is taken over its midpoint and read at each row's own altitude. Saved with the mission.">
+          <input id="checkride" type="checkbox">
+          Checkride winds
+        </label>
         <!-- Beside the button that uses it, not in the sidebar with the other
              conditions: it is an argument to "Get weather" and means nothing
              on its own. Blank fetches the current weather, which is the

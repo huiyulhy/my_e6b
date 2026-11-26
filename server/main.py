@@ -172,12 +172,12 @@ class ForecastHourIn(BaseModel):
 
 
 class PointForecastIn(BaseModel):
-    """Every hour fetched over one leg's midpoint.
+    """Every hour fetched over one leg's midpoint, or its end in checkride mode.
 
     One of these per leg the pilot drew, in route order. A window rather than
     a single hour because `engine/planwx` re-reads it as the times move: a
-    leg's weather is read at the hour its midpoint is passed, and that hour is
-    not known until the plan is built.
+    leg's weather is read at the hour its midpoint (or end) is passed, and
+    that hour is not known until the plan is built.
     """
 
     name: str = ""
@@ -246,13 +246,18 @@ class PlanRequest(BaseModel):
     altimeter_inhg: float = 29.92
     isa_deviation_c: float = 0.0
     night: bool = False
+    # Checkride mode: each leg flown in one wind, its end waypoint's forecast
+    # at the altitude and hour it is reached (see engine/planwx). The UI then
+    # fetches `forecasts` over the end waypoints instead of the midpoints.
+    # Kept with the mission: it is how the pilot chose to plan.
+    checkride: bool = False
     flight_date: date | None = None
     overrides: list[LegOverrideIn] = Field(default_factory=list)
     # Edits filed under the leg they were typed on. What the UI sends; the
     # row-indexed `overrides` above remain for callers that want one row.
     segment_overrides: list[SegmentOverrideIn] = Field(default_factory=list)
-    # One forecast series per leg the pilot drew, fetched over its midpoint,
-    # in route order, from "Get weather". Empty is the ordinary case and means
+    # One forecast series per leg the pilot drew, fetched over its midpoint
+    # (its end waypoint with `checkride`), in route order, from "Get weather". Empty is the ordinary case and means
     # every leg reads the wind typed on its row, or calm -- which is what a
     # plan with nothing entered has always meant.
     forecasts: list[PointForecastIn] = Field(default_factory=list)
@@ -793,6 +798,7 @@ def _build_from_request(request: PlanRequest):
         margins=margins,
         planning_mode=request.planning_mode,
         segment_overrides=segment_overrides,
+        checkride=request.checkride,
     )
     return solved, aircraft, conditions
 
@@ -1355,6 +1361,8 @@ def _leg_weather_json(entry: pw.LegWeather) -> dict:
         # The forecast's wind at the altitude the leg is mostly flown at.
         "wind": wind(entry.wind),
         "unflyable": entry.unflyable,
+        # Checkride mode: the altitude the leg's one wind was read at.
+        "read_altitude_ft": entry.read_altitude_ft,
         "note": entry.note,
     }
 

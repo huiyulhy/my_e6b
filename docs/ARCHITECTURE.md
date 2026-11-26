@@ -686,6 +686,17 @@ The column is taken **whole**, its wind and its temperature together. Half of on
 half of another describes air neither of them reported — the same objection `resolve_surface`
 makes about mixing a METAR's ceiling with a TAF's cover.
 
+**Checkride mode** is the hand-worked alternative, for a navlog that has to match one done on paper.
+Each leg is flown in **one wind**: the forecast over the leg's *end* waypoint, read at the altitude
+and the hour the aeroplane reaches that waypoint, and used for every row of the leg — climb,
+cruise and descent. The UI fetches over the end waypoints instead of the midpoints, still one
+series per leg, so the engine's list is the same shape either way; `solve(checkride=True)` reads
+it at the end's time and collapses each column to one wind at the leg's last altitude
+(`LegWeather.read_altitude_ft`), which joins the forecast hour in what has to settle. Temperatures
+are still read off that column by altitude. One consequence is deliberate and worth knowing: the
+last leg ends in the destination's pattern, so its whole length — cruise included — is planned in
+the pattern-altitude wind. The mode is a `PlanRequest` field and is kept with the mission.
+
 **Why it has to loop.** The weather a leg is flown in depends on when the leg is reached; when the
 leg is reached depends on the wind it is flown in. Planning once on the departure hour is the
 error the whole tier exists to remove — a three-hour leg planned on the 1300Z forecast is not the
